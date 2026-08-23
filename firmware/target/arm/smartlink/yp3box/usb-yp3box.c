@@ -26,6 +26,7 @@
 #include "usb.h"
 #include "power.h"
 #include "storage.h"
+#include "kernel.h"
 #include "sdmmc.h"
 #include <string.h>
 #include "sl6801-regs.h"
@@ -367,6 +368,19 @@ void usb_attach(void)
  * connection until the host fails to enumerate. */
 int usb_detect(void)
 {
-    return (power_input_status() != POWER_INPUT_NONE)
-        ? USB_INSERTED : USB_EXTRACTED;
+    /* usb_tick() calls this every tick, from the tick interrupt, and each
+     * call is a PMU mailbox transaction. At HZ that is 100 transactions a
+     * second taken out of an interrupt, contending with the power thread for
+     * one register pair. Sample at 10 Hz and hand back the last answer in
+     * between; usb.c debounces over 200 ms anyway. */
+    static long next_poll;
+    static int detected = USB_EXTRACTED;
+
+    if (TIME_AFTER(current_tick, next_poll)) {
+        next_poll = current_tick + HZ / 10;
+        detected = (power_input_status() != POWER_INPUT_NONE)
+                 ? USB_INSERTED : USB_EXTRACTED;
+    }
+
+    return detected;
 }

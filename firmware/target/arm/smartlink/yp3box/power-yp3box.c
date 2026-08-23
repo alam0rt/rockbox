@@ -47,29 +47,44 @@
 #define PMU_ERROR_MASK  0x0000f000u
 #define PMU_POLL_LIMIT  1000000u
 
-/* The mailbox is synchronous, but a broken PMU must not wedge the Rockbox
+/* The mailbox has one command register pair and several users: the power
+ * thread reads the battery once a second, usb_detect() reads VBUS, and
+ * usb_detect() is called from usb_tick() - the TICK INTERRUPT. Two
+ * transactions interleaved on one register pair return each other's data, or
+ * hang waiting for a GO bit the other side already cleared. The vendor takes
+ * a mutex here ("creat pmu_bus_mutex fail", FIRM 0xcf71c0); a mutex is no use
+ * to an interrupt, and a transaction is a handful of microseconds, so mask
+ * interrupts around it instead.
+ *
+ * The mailbox is synchronous, but a broken PMU must not wedge the Rockbox
  * power thread or the shutdown path forever. */
 bool __attribute__((section(".icode"), noinline))
 yp3_pmu_read(unsigned reg, uint8_t *value)
 {
     unsigned i;
+    int oldlevel = disable_irq_save();
+    bool ok;
 
     PMU_REG(PMU_MB_CMD) = PMU_OP_READ | (reg << 8);
     PMU_REG(PMU_MB_CMD) |= PMU_GO;
     for (i = 0; i < PMU_POLL_LIMIT && (PMU_REG(PMU_MB_CMD) & PMU_GO); i++)
         ;
 
-    if ((PMU_REG(PMU_MB_CMD) & PMU_GO) || (PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK))
-        return false;
+    ok = !(PMU_REG(PMU_MB_CMD) & PMU_GO)
+      && !(PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK);
+    if (ok)
+        *value = (uint8_t)PMU_REG(PMU_MB_RDATA);
 
-    *value = (uint8_t)PMU_REG(PMU_MB_RDATA);
-    return true;
+    restore_irq(oldlevel);
+    return ok;
 }
 
 bool __attribute__((section(".icode"), noinline))
 yp3_pmu_write(unsigned reg, uint8_t value)
 {
     unsigned i;
+    int oldlevel = disable_irq_save();
+    bool ok;
 
     PMU_REG(PMU_MB_WDATA) = value;
     PMU_REG(PMU_MB_CMD) = PMU_OP_WRITE | (reg << 8);
@@ -77,7 +92,10 @@ yp3_pmu_write(unsigned reg, uint8_t value)
     for (i = 0; i < PMU_POLL_LIMIT && (PMU_REG(PMU_MB_CMD) & PMU_GO); i++)
         ;
 
-    return !(PMU_REG(PMU_MB_CMD) & PMU_GO) && !(PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK);
+    ok = !(PMU_REG(PMU_MB_CMD) & PMU_GO)
+      && !(PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK);
+    restore_irq(oldlevel);
+    return ok;
 }
 
 /* Enable the PMU's voltage measurement.
