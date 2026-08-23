@@ -226,13 +226,13 @@ static void skin_load(enum skinnable_screens skin, enum screen_type screen,
     BC_SLOT(69) = 2;
 
     if (filename && *filename)
-        loaded = skin_data_load(screen, &skins[skin][screen].data,
+        loaded = skin_data_load(skin, screen, &skins[skin][screen].data,
                                 filename, true, &skins[skin][screen].stats);
 
     BC_SLOT(69) = 3;
     if (!loaded && skin_helpers[skin]->default_skin)
     {
-        loaded = skin_data_load(screen, &skins[skin][screen].data,
+        loaded = skin_data_load(skin, screen, &skins[skin][screen].data,
                                 skin_helpers[skin]->default_skin(screen),
                                 false, &skins[skin][screen].stats);
         skins[skin][screen].failsafe_loaded = loaded;
