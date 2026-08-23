@@ -148,6 +148,7 @@ void power_off(void)
     yp3_power_down();
 }
 
+#if CONFIG_CHARGING
 bool charging_state(void)
 {
     return false;   /* PMU status is not available on this target. */
@@ -157,3 +158,4 @@ unsigned int power_input_status(void)
 {
     return POWER_INPUT_NONE;  /* PMU status is not available. */
 }
+#endif

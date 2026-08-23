@@ -130,6 +130,12 @@ OUTPUT_FORMAT(elf32-littlemips)
 #define DRAMORIG STM32_SDRAM1_BASE
 #define DRAMSIZE (MEMORYSIZE * 0x100000) - PLUGIN_BUFFER_SIZE - CODEC_SIZE
 
+#elif CONFIG_CPU == SL6801
+/* YP3Box keeps 0x00800000-0x00806000 for the boot ROM. Keep codec and plugin
+ * origins aligned with the XIP application linker script. */
+#define DRAMORIG 0x00806000
+#define DRAMSIZE (512 * 1024) - 0x6000 - PLUGIN_BUFFER_SIZE - CODEC_SIZE
+
 #else
 # error "DRAM/IRAM memory map not defined!"
 #endif

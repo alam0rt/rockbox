@@ -20,7 +20,7 @@ OUTPUT_FORMAT(elf32-littlearm)
 OUTPUT_ARCH(arm)
 
 /* 0x00800000-0x00806000 is reserved by the boot ROM. Keep Rockbox data above
- * it because this port continues calling ROM clock, GPIO and flash functions.
+ * it because this port continues calling ROM clock, GPIO and flash functions. */
 #define SRAM_ORIG   0x00806000
 #define SRAM_END    0x00880000
 /* Reserve the top of SRAM for the codec and plugin buffers. */

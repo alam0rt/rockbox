@@ -67,7 +67,6 @@ static void __attribute__((section(".icode"), noinline)) yp3_clock_init(void)
     ROM_CLK_APPLY2(NORF_CLOCK);
     for (d = 0; d < 100000u; d++) ;
 #endif
-#endif
 
     /* The clock tree is now configured for the 192 MHz core clock used by
      * udelay(). */
