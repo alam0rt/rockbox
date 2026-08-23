@@ -163,6 +163,14 @@
  * load. LOGF_ENABLE_PLAYBACK turns on the playback, buffering and codec-thread
  * log groups together, which is the set that says why a track failed to
  * start. */
+/* The black box. The log ring, the panic message and the fault registers live
+ * in a linker region nothing clears, so they survive a panic, a hard fault, a
+ * hang plus pinhole reset, and a watchdog reset; the next boot writes them to
+ * /.rockbox/blackbox.txt before the UI comes up. Debug -> Dump Log File needs
+ * a working UI and keypad, which is exactly what those failures take away.
+ * See firmware/target/arm/smartlink/yp3box/blackbox-yp3box.c. */
+#define HAVE_BLACKBOX
+
 #ifdef ROCKBOX_HAS_LOGF
 #define MAX_LOGF_SIZE       6144
 #define LOGF_ENABLE_PLAYBACK

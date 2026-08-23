@@ -83,9 +83,33 @@ SECTIONS
     .bss (NOLOAD) :
     {
         _bssbegin = .;
-        *(.bss*);
-        *(COMMON);
+        /* logf.o is excluded: its ring, index and wrap flag go into .persist
+           below so they survive a reset. crt0 clears _bssbegin.._bssend. */
+        *(EXCLUDE_FILE (*logf.o) .bss*);
+        *(EXCLUDE_FILE (*logf.o) COMMON);
         _bssend = .;
+    } > SRAM
+
+    /* --- the black box -----------------------------------------------------
+     *
+     * SRAM that NOTHING clears: it is outside _bssbegin.._bssend so crt0's
+     * clear skips it, outside _datastart.._dataend so the .data copy skips
+     * it, and the boot ROM only initialises 0x800000-0x806000, so it also
+     * survives a pinhole reset and a SYSRESETREQ.
+     *
+     * That is the whole point. A log you can only reach through Debug ->
+     * Dump Log File is worthless for the failures worth logging: a hang, a
+     * hard fault, or a dead keypad leave no way to drive the menu. Here the
+     * log outlives the crash, and the next boot writes it to the card before
+     * anything else can go wrong.
+     */
+    .persist (NOLOAD) : ALIGN(8)
+    {
+        _persistbegin = .;
+        yp3_blackbox = .;
+        . += 128;                       /* struct yp3_blackbox */
+        *logf.o(.bss* COMMON);
+        _persistend = .;
     } > SRAM
 
 

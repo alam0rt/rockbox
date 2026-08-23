@@ -29,6 +29,7 @@
 #include "led.h"
 #include "power.h"
 #include "system.h"
+#include "blackbox.h"
 #include "logf.h"
 #include "rbversion.h"
 
@@ -128,6 +129,10 @@ void panicf( const char *fmt, ...)
 
     lcd_update();
     DEBUGF("%s", panic_buf);
+
+    /* The panel cannot be scrolled and may itself be what failed. Hand the
+     * message to the black box, which system_exception_wait() writes out. */
+    blackbox_record_panic(panic_buf);
 
 #ifdef HAVE_ADJUSTABLE_CPU_FREQ
     if (cpu_boost_lock())

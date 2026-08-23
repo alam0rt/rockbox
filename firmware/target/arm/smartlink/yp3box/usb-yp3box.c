@@ -341,6 +341,7 @@ void usb_init_device(void)
  * is worth knowing but is not in play here: nothing plays during USB mode. */
 #define USBC(o)             REG8(0x40040000u + (o))
 
+#ifdef ROCKBOX_HAS_LOGF
 static void usb_log_state(const char *when)
 {
     logf("usb %s: mod23=%d clk sys40000000=%08lx", when,
@@ -364,6 +365,12 @@ static void usb_probe_regs(void)
     logf("usb probe: wrote 2a to 0e, read %02x", USBC(0x0e));
     USBC(0x0e) = saved;
 }
+#else
+/* Both exist only to feed the log; without it they would be register pokes
+ * for nothing. */
+static inline void usb_log_state(const char *when) { (void)when; }
+static inline void usb_probe_regs(void) { }
+#endif
 
 void usb_enable(bool on)
 {

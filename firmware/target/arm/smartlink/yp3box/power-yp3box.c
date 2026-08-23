@@ -127,8 +127,9 @@ void power_init(void)
 
     logf("pmu 0x47: %02x -> %02x", before, after);
 
+#ifdef ROCKBOX_HAS_LOGF
     /* One line that characterises the block, so a single dump can rule the
-     * rest of the vendor's init in or out. */
+     * rest of the vendor's init in or out. Exists only to feed the log. */
     {
         static const uint8_t regs[] = { 0x13, 0x17, 0x1c, 0x2a, 0x2e };
         unsigned i;
@@ -139,6 +140,7 @@ void power_init(void)
             logf("pmu %02x = %02x%s", regs[i], v, ok ? "" : " (failed)");
         }
     }
+#endif
 }
 
 /* Arm the PMU sleep sequencer - vendor 0xcf7fa0, the tail of "enter poweroff

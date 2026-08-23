@@ -1,4 +1,5 @@
 #include "system.h"
+#include "blackbox.h"
 #include "system-target.h"
 #include "sl6801-regs.h"
 /* Configure the clock tree used by the XIP image. This sequence is transcribed
@@ -76,6 +77,10 @@ static void __attribute__((section(".icode"), noinline)) yp3_clock_init(void)
 void system_init(void)
 {
 
+    /* Before anything logs: decide whether the black box holds a record from
+     * the last run, or is cold and needs clearing. */
+    blackbox_init();
+
     /* Configure the clocks before any device driver accesses hardware. */
 
 #if YP3_CLOCK_INIT
@@ -101,7 +106,16 @@ void system_reboot(void)
     while (1) ;
 }
 
-void system_exception_wait(void) { while (1) ; }
+/* panicf() ends here. It has already painted the panel; write the black box
+ * to the card as well, because the panel cannot be scrolled, photographed
+ * accurately at 128x160, or read at all if the panic came from the display
+ * path. If the write itself wedges - a panic while the filesystem lock is
+ * held would do it - the record is still in SRAM, and a reset recovers it. */
+void system_exception_wait(void)
+{
+    blackbox_dump();
+    while (1) ;
+}
 
 /* MUST run from SRAM (.icode). A calibrated delay loop executing from XIP flash
  * is not calibrated because every iteration waits on a SPI fetch. */

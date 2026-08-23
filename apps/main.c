@@ -23,6 +23,7 @@
 #include "version.h"
 #include "gcc_extensions.h"
 #include "storage.h"
+#include "blackbox.h"
 #include "disk.h"
 #include "file_internal.h"
 #include "lcd.h"
@@ -711,6 +712,12 @@ static void init(void)
     CHART(">settings_load");
     settings_load();
     CHART("<settings_load");
+
+    /* First point past every mount path - including the one that boots
+       straight into USB mode - where a file can be written. If the last run
+       panicked, faulted, or was reset out of a hang, this is where its record
+       reaches the card. No UI and no keypad required, which is the point. */
+    blackbox_boot_dump();
 
 #if defined(BUTTON_REC) || \
     (CONFIG_KEYPAD == GIGABEAT_PAD) || \
