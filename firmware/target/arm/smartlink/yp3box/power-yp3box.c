@@ -34,23 +34,40 @@
 #define PMU_OP_WRITE    0x40000060u
 #define PMU_OP_READ     0x40000061u
 #define PMU_GO          0x80000000u
+#define PMU_ERROR_MASK  0x0000f000u
+#define PMU_POLL_LIMIT  1000000u
 
-static uint8_t __attribute__((section(".icode"), noinline))
-pmu_read(unsigned reg)
+/* The mailbox is synchronous, but a broken PMU must not wedge the Rockbox
+ * power thread or the shutdown path forever. */
+bool __attribute__((section(".icode"), noinline))
+yp3_pmu_read(unsigned reg, uint8_t *value)
 {
+    unsigned i;
+
     CLK(PMU_CMD) = PMU_OP_READ | (reg << 8);
     CLK(PMU_CMD) |= PMU_GO;
-    while (CLK(PMU_CMD) & PMU_GO) ;
-    return (uint8_t)CLK(PMU_RDATA);
+    for (i = 0; i < PMU_POLL_LIMIT && (CLK(PMU_CMD) & PMU_GO); i++)
+        ;
+
+    if ((CLK(PMU_CMD) & PMU_GO) || (CLK(PMU_STATUS) & PMU_ERROR_MASK))
+        return false;
+
+    *value = (uint8_t)CLK(PMU_RDATA);
+    return true;
 }
 
-static void __attribute__((section(".icode"), noinline))
-pmu_write(unsigned reg, uint8_t val)
+bool __attribute__((section(".icode"), noinline))
+yp3_pmu_write(unsigned reg, uint8_t value)
 {
-    CLK(PMU_WDATA) = val;
+    unsigned i;
+
+    CLK(PMU_WDATA) = value;
     CLK(PMU_CMD) = PMU_OP_WRITE | (reg << 8);
     CLK(PMU_CMD) |= PMU_GO;
-    while (CLK(PMU_CMD) & PMU_GO) ;
+    for (i = 0; i < PMU_POLL_LIMIT && (CLK(PMU_CMD) & PMU_GO); i++)
+        ;
+
+    return !(CLK(PMU_CMD) & PMU_GO) && !(CLK(PMU_STATUS) & PMU_ERROR_MASK);
 }
 
 void power_init(void)
@@ -71,10 +88,13 @@ void power_init(void)
  * branch, [12] = 1 selects the extra wake-source enable in PMU register 0.
  * A device with different bytes would need the other branches at 0xcf8016 and
  * 0xcf801c. */
-static void __attribute__((section(".icode"), noinline))
+static bool __attribute__((section(".icode"), noinline))
 yp3_pmu_arm_sleep(void)
 {
-    uint8_t v = pmu_read(0x21);
+    uint8_t v;
+
+    if (!yp3_pmu_read(0x21, &v))
+        return false;
 
     CLK(0xb0) = (uint32_t)((v | 3) & 0xff) << 8 | 0x21;
     CLK(0xd0) |= 1;
@@ -83,8 +103,11 @@ yp3_pmu_arm_sleep(void)
     CLK(0xb8) = ((uint32_t)v << 16) | 0x21
               | ((uint32_t)(v & 0xfb) << 24);   /* applied on the way down */
 
-    pmu_write(0, (uint8_t)(pmu_read(0) | 8));
+    if (!yp3_pmu_read(0, &v)
+            || !yp3_pmu_write(0, (uint8_t)(v | 8)))
+        return false;
     CLK(0xd0) |= 8;
+    return true;
 }
 
 /* MUST run from SRAM: it stops the clock the CPU fetches instructions through.
@@ -127,9 +150,12 @@ yp3_power_down(void)
 
     CLK(0x60) = 1;                                  /* vendor 0xcf7d10 */
     CLK(0xd8) &= ~6u;
-
     /* vendor 0xcf7cf0(0): clear the two-bit field at PMU reg 0 bits 6-7 */
-    pmu_write(0, (uint8_t)(pmu_read(0) & ~0xc0u));
+    {
+        uint8_t v;
+        if (yp3_pmu_read(0, &v))
+            (void)yp3_pmu_write(0, (uint8_t)(v & ~0xc0u));
+    }
 
     yp3_mask_all_irqs();  /* vendor 0x80d1b4/0x80d1e0 */
     yp3_pmu_arm_sleep();
@@ -151,11 +177,21 @@ void power_off(void)
 #if CONFIG_CHARGING
 bool charging_state(void)
 {
-    return false;   /* PMU status is not available on this target. */
+    uint8_t status;
+
+    return yp3_pmu_read(PMU_REG_STATUS, &status)
+        && (status & PMU_STATUS_CHARGING) != 0;
 }
 
 unsigned int power_input_status(void)
 {
-    return POWER_INPUT_NONE;  /* PMU status is not available. */
+    uint8_t status;
+
+    if (!yp3_pmu_read(PMU_REG_STATUS, &status)
+            || !(status & PMU_STATUS_POWER_INPUT))
+        return POWER_INPUT_NONE;
+
+    /* YP3 exposes one undifferentiated USB charging input. */
+    return POWER_INPUT_MAIN_CHARGER;
 }
 #endif

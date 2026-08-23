@@ -1986,6 +1986,7 @@ target/arm/smartlink/yp3box/lcd-yp3box.c
 target/arm/smartlink/yp3box/button-yp3box.c
 target/arm/smartlink/yp3box/backlight-yp3box.c
 target/arm/smartlink/yp3box/power-yp3box.c
+target/arm/smartlink/yp3box/powermgmt-yp3box.c
 #ifndef BOOTLOADER
 target/arm/smartlink/yp3box/pcm-yp3box.c
 #endif

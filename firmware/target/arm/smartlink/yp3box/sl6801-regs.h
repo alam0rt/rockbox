@@ -2,6 +2,7 @@
 #ifndef __SL6801_H__
 #define __SL6801_H__
 #include <stdint.h>
+#include <stdbool.h>
 
 #define REG32(a) (*(volatile uint32_t *)(a))
 #define REG16(a) (*(volatile uint16_t *)(a))
@@ -58,6 +59,16 @@
  * /dev/kadc_ch0 through /dev/kadc_ch9. The per-channel MODE nibble lives in
  * ADC(0x10) for channels 0-7 and in ADC(0x18) for 8 and 9 (0xd7dfc2). */
 #define ADC_NCHAN       10
+
+/* PMU mailbox and status registers recovered from the vendor FIRM. */
+#define PMU_REG_STATUS             0x2a
+#define PMU_REG_BATTERY_VOLTAGE    0x2e
+#define PMU_REG_VOLTAGE_CONFIG     0x47
+#define PMU_STATUS_CHARGING        0x04
+#define PMU_STATUS_POWER_INPUT     0x44
+
+bool yp3_pmu_read(unsigned reg, uint8_t *value);
+bool yp3_pmu_write(unsigned reg, uint8_t value);
 
 /* Boot ROM entry points. These live here rather than in one driver because
  * duplicated magic addresses drift: the LCD driver had its own copies and the
