@@ -24,6 +24,8 @@ DOOMCORE_SRC := $(call preprocess, $(DOOMCORE_DIR)/SOURCES) \
                 $(APPSDIR)/plugins/lib/helper.c \
                 $(DOOMCORE_DIR)/doom_builtin.c
 DOOMCORE_OBJ := $(call c2obj, $(DOOMCORE_SRC))
+DOOMCORE_HELPER_HDR := $(BUILDDIR)/lib/helper.h
+
 
 INCLUDES += -I$(DOOMCORE_DIR)
 OTHER_SRC += $(DOOMCORE_SRC)
@@ -42,6 +44,10 @@ DOOMCORE_FLAGS = $(CFLAGS) -I$(APPSDIR) -I$(APPSDIR)/gui -I$(APPSDIR)/recorder \
 $(DOOMCORE_OBJ): $(BUILDDIR)/%.o: $(ROOTDIR)/%.c
 	$(SILENT)mkdir -p $(dir $@)
 	$(call PRINTS,CC $(subst $(ROOTDIR)/,,$<))$(CC) $(DOOMCORE_FLAGS) -c $< -o $@
+$(DOOMCORE_HELPER_HDR): $(APPSDIR)/plugins/lib/helper.h
+	$(SILENT)mkdir -p $(dir $@)
+	$(SILENT)cp $< $@
+
 
 $(DOOMCORELIB): $(DOOMCORE_OBJ)
 	$(SILENT)$(shell rm -f $@)
