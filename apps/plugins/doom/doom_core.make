@@ -47,6 +47,8 @@ DOOMSTUB_CRT0 := $(BUILDDIR)/apps/plugins/plugin_crt0.o
 DOOMSTUB_LDS := $(BUILDDIR)/apps/plugins/plugin.link
 DOOMSTUB_FLAGS = $(CFLAGS) -DPLUGIN -I$(APPSDIR) -I$(APPSDIR)/gui \
                  -I$(APPSDIR)/recorder -I$(APPSDIR)/plugins
+$(DOOMSTUB_OBJ) $(DOOMSTUB_CRT0): $(BUILDDIR)/sysfont.h $(BUILDDIR)/lang/lang.h
+
 
 # The target disables the general plugin suite, but the browser still needs the
 # small standard .rock launcher for built-in Doom. Keep this path independent of
