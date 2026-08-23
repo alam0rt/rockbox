@@ -1,3 +1,15 @@
+/* MAX_LANGUAGE_SIZE is computed from the LARGEST .lng this build produces
+ * (apps/lang/lang.make), and language_buffer in apps/language.c is a static
+ * array of exactly that size. Building all 47 translations therefore costs
+ * this target 27,759 bytes of SRAM to hold a language it will never load.
+ *
+ * yp3box is the only 512 KB target in the tree and needs that memory for the
+ * PCM ring, so it builds English only. Every other target is unaffected -
+ * this list is preprocessed with the target defines, and only YP3BOX takes
+ * the reduced branch. Loading a .lng from the card still works; there just
+ * are not any others shipped in the zip. */
+english.lang
+#ifndef YP3BOX
 basque.lang
 bulgarian.lang
 catala.lang
@@ -5,7 +17,6 @@ czech.lang
 dansk.lang
 deutsch.lang
 eesti.lang
-english.lang
 english-us.lang
 espanol.lang
 esperanto.lang
@@ -46,3 +57,4 @@ japanese.lang
 korean.lang
 thai.lang
 vietnamese.lang
+#endif

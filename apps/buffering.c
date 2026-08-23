@@ -701,6 +701,14 @@ static bool buffer_handle(int handle_id, size_t to_buffer)
                 break;
             }
 
+            /* rc distinguishes the two ways this happens: 0 is the file
+             * layer reporting a clean end short of filesize (a FAT chain
+             * that stopped early), negative is a failed read. The SD driver
+             * logs its own failures, so a negative rc with nothing from
+             * "sd:" puts the fault in the filesystem, not the card. */
+            logf("read fail rc=%ld fd=%d want=%ld at=%ld/%ld",
+                 (long)rc, h->fd, (long)copy_n,
+                 (long)h->end, (long)h->filesize);
             logf("File ended %lu bytes early\n",
                  (unsigned long)(h->filesize - h->end));
             h->filesize = h->end;

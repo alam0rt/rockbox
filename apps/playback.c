@@ -2510,7 +2510,18 @@ static int audio_fill_file_buffer(void)
 static int audio_reset_and_rebuffer(
     enum track_clear_action action, int peek_offset)
 {
-    logf("Forcing rebuffer: 0x%X, %d", action, peek_offset);
+    /* Rate-limited: this path can livelock (auto-skip finds no next track,
+     * clears the list, rebuffers, fails, repeats) and at ~14 lines an
+     * iteration it overwrites the whole 6 KB logf ring in seconds - taking
+     * the start of playback, which is the part worth reading, with it.
+     * Keep the first few and then count. */
+    {
+        static unsigned rebuffers;
+        if (rebuffers < 3 || (rebuffers % 200) == 0)
+            logf("Forcing rebuffer: 0x%X, %d (#%u)", action, peek_offset,
+                 rebuffers);
+        rebuffers++;
+    }
 
     id3_write_locked(UNBUFFERED_ID3, NULL);
 
@@ -3748,7 +3759,12 @@ void audio_playback_handler(struct queue_event *ev)
 /* Called when fullness is below the watermark level */
 static void buffer_event_buffer_low_callback(unsigned short id, void *ev_data, void *user_data)
 {
-    logf("low buffer callback");
+    {   /* Same livelock, same reason - see audio_reset_and_rebuffer. */
+        static unsigned lows;
+        if (lows < 3 || (lows % 200) == 0)
+            logf("low buffer callback (#%u)", lows);
+        lows++;
+    }
     LOGFQUEUE("buffering > audio Q_AUDIO_BUFFERING: buffer low");
     audio_queue_post(Q_AUDIO_BUFFERING, BUFFER_EVENT_BUFFER_LOW);
     (void)id;

@@ -24,6 +24,10 @@
 #include "file.h"
 #include "debug.h"
 #include "load_code.h"
+#ifdef ROCKBOX_HAS_LOGF
+#define LOGF_ENABLE
+#endif
+#include "logf.h"
 
 /* load binary blob from disk to memory, returning a handle */
 void * lc_open(const char *filename, unsigned char *buf, size_t buf_size)
@@ -37,6 +41,7 @@ void * lc_open(const char *filename, unsigned char *buf, size_t buf_size)
     if (fd < 0)
     {
         DEBUGF("Could not open file");
+        logf("lc_open: open %s -> %d", filename, fd);
         goto error;
     }
 
@@ -54,6 +59,7 @@ void * lc_open(const char *filename, unsigned char *buf, size_t buf_size)
     if (read_size < 0)
     {
         DEBUGF("Could not read from file");
+        logf("lc_open: %s header read -> %ld", filename, (long)read_size);
         goto error_fd;
     }
 
@@ -65,6 +71,9 @@ void * lc_open(const char *filename, unsigned char *buf, size_t buf_size)
     if (hdr.load_addr < buf || (hdr.load_addr+copy_size) > buf_end)
     {
         DEBUGF("Binary doesn't fit into memory");
+        logf("lc_open: %s %08lX+%lX outside %08lX..%08lX", filename,
+             (unsigned long)hdr.load_addr, (unsigned long)copy_size,
+             (unsigned long)buf, (unsigned long)buf_end);
         goto error_fd;
     }
 
@@ -72,6 +81,7 @@ void * lc_open(const char *filename, unsigned char *buf, size_t buf_size)
     if (lseek(fd, 0, SEEK_SET) < 0)
     {
         DEBUGF("lseek failed");
+        logf("lc_open: %s lseek failed", filename);
         goto error_fd;
     }
 
@@ -82,6 +92,8 @@ void * lc_open(const char *filename, unsigned char *buf, size_t buf_size)
     if (read_size < 0)
     {
         DEBUGF("Could not read from file");
+        logf("lc_open: %s body read %ld -> %ld", filename,
+             (long)copy_size, (long)read_size);
         goto error;
     }
 

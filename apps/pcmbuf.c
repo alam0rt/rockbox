@@ -86,13 +86,29 @@ static inline unsigned int data_level(int quarter_secs)
 #define MIN_BUFFER_SIZE     (BYTERATE * 3)
 /* 1 seconds of buffer is low data */
 #define LOW_DATA            data_level(4)
-#else
+#elif MEMORYSIZE > 1
 #define PCMBUF_WATERMARK    (BYTERATE / 4)  /* 0.25 seconds */
-#ifdef PCM_MIN_BUFFER_DIVISOR
-#define MIN_BUFFER_SIZE     (BYTERATE / PCM_MIN_BUFFER_DIVISOR)
-#else
 #define MIN_BUFFER_SIZE     (BYTERATE * 1)
-#endif
+/* under watermark is low data */
+#define LOW_DATA            pcmbuf_watermark
+#else
+/* 512 KB targets. This ring is decoded-PCM LOOKAHEAD, not a buffer the
+ * hardware needs: the DMA plays from pcm_dbl_buf, two 4 KB chunks. A second
+ * of lookahead lets the codec run ahead and the disk rest, and on a 512 KB
+ * device it simply does not fit - the whole audio arena is about 160 KB and
+ * one second of 44.1 kHz stereo is 172 KB of ring before any file buffer.
+ *
+ * Half a second, and the watermark DERIVED from the ring rather than stated
+ * separately. That derivation is the point. These two constants have to stay
+ * in proportion - playback only begins when unplayed data passes the
+ * watermark, so a watermark larger than the ring means playback can never
+ * begin at all - and when they were independent this target got it wrong
+ * twice: a ring of two chunks that could never close one, then a ring of five
+ * against a watermark still sized for the full-rate one. Writing the
+ * watermark as a fraction of MIN_BUFFER_SIZE makes that class of mistake
+ * unrepresentable. */
+#define MIN_BUFFER_SIZE     (BYTERATE / 2)          /* ~10 chunks */
+#define PCMBUF_WATERMARK    (MIN_BUFFER_SIZE / 4)   /* a quarter of the ring */
 /* under watermark is low data */
 #define LOW_DATA            pcmbuf_watermark
 #endif
@@ -448,6 +464,16 @@ static void * get_write_buffer(size_t *size)
 /* Commit outstanding data leaving less than a chunk size remaining */
 static void commit_write_buffer(size_t size)
 {
+    /* The first few only: this is per-chunk. If none of these ever appear,
+     * the codec produced no PCM and the search moves off the audio path
+     * entirely and into the codec's output. */
+    {
+        static int commits;
+        if (commits < 4)
+            logf("pcmbuf commit #%d size=%lu", commits, (unsigned long)size);
+        commits++;
+    }
+
     /* Add this data and commit if one or more chunks are ready */
     pcmbuf_bytes_waiting += size;
     commit_if_needed(COMMIT_CHUNKS);
@@ -571,7 +597,13 @@ static unsigned int get_next_required_pcmbuf_chunks(void)
     }
 #endif
 
-    logf("pcmbuf len: %lu", (unsigned long)(size / BYTERATE));
+    /* Chunks, not seconds. The seconds figure integer-divides to 0 on a small
+     * target and hides the number that actually matters: fewer than about
+     * three chunks cannot close one while another is being written, and
+     * playback deadlocks with chunk_widx stuck at 0. */
+    logf("pcmbuf: %lu bytes = %lu chunks of %u",
+         (unsigned long)size, (unsigned long)(size / PCMBUF_CHUNK_SIZE),
+         (unsigned)PCMBUF_CHUNK_SIZE);
     return size / PCMBUF_CHUNK_SIZE;
 }
 
@@ -855,7 +887,13 @@ static void pcmbuf_sampr_callback(uint32_t sampr)
 /* Force playback */
 void pcmbuf_play_start(void)
 {
-    logf("pcmbuf_play_start");
+    /* Both halves of the guard below, because failing it is silent and looks
+     * exactly like a dead audio driver: the sink is never called, no DMA is
+     * ever armed, and the elapsed time never moves. widx == ridx means the
+     * codec has committed no PCM at all. */
+    logf("pcmbuf start: widx=%d ridx=%d chan=%d",
+         (int)chunk_widx, (int)chunk_ridx,
+         (int)mixer_channel_status(PCM_MIXER_CHAN_PLAYBACK));
 
     if (mixer_channel_status(PCM_MIXER_CHAN_PLAYBACK) == CHANNEL_STOPPED &&
         chunk_widx != chunk_ridx)

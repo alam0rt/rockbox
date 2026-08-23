@@ -24,7 +24,11 @@
 #include "backlight.h"
 #include "backlight-target.h"
 #include "sl6801-regs.h"
-#ifdef ROCKBOX_HAS_LOGF
+/* The power path polls, so it logs on a timer whether or not anything is
+ * wrong, and that crowds the 6 KB ring: it was 21% of the first dump that
+ * mattered. The driver is done (ROADMAP A3), so keep it quiet by default and
+ * define YP3_LOGF_POWER when the PMU itself is the thing under suspicion. */
+#if defined(ROCKBOX_HAS_LOGF) && defined(YP3_LOGF_POWER)
 #define LOGF_ENABLE
 #endif
 #include "logf.h"

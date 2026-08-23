@@ -107,7 +107,7 @@ SECTIONS
     {
         _persistbegin = .;
         yp3_blackbox = .;
-        . += 128;                       /* struct yp3_blackbox */
+        . += 192;                       /* struct yp3_blackbox */
         *logf.o(.bss* COMMON);
         _persistend = .;
     } > SRAM

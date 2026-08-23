@@ -37,6 +37,17 @@
 #include "sdmmc.h"
 #include <string.h>
 #include <stdint.h>
+#ifdef ROCKBOX_HAS_LOGF
+#define LOGF_ENABLE
+#endif
+#include "logf.h"
+
+/* Reads and writes that FAIL, only. Silence is the useful signal here: a file
+ * that reads short with nothing logged puts the fault above this driver, in
+ * the FAT layer, and a burst of these puts it below. Logging every transfer
+ * would wrap the 6 KB ring long before the interesting one. */
+#define SD_LOG_FAIL(op, lba, n, rc) \
+    logf("sd: " op " fail lba=%lu n=%d rc=%d", (unsigned long)(lba), (n), (rc))
 
 #define SD_BASE     0x40003000u
 #define R(o)        (*(volatile uint32_t *)(SD_BASE + (o)))
@@ -325,8 +336,26 @@ int sd_init(void)
 
 
     err = sd_power_on();
-    if (err)
-        return -1;
+    if (err) {
+        /* No card in the slot, or one that will not identify.
+         *
+         * This is NOT fatal here and must not be reported as an init failure.
+         * apps/main.c turns a non-zero storage_init() into panicf("ata: %d"),
+         * which is how booting this device with the card removed ends in a
+         * panic screen rather than a usable player. The firmware runs from
+         * flash (XIP), so everything except content is still available, and
+         * Rockbox already has a graceful path for a device with no mountable
+         * volume - disk_mount_all() returning <= 0 shows the info screen and
+         * offers USB.
+         *
+         * So report success with no medium: sd_ok stays false, which is what
+         * sd_read_sectors and sd_write_sectors already gate on, and the card
+         * info stays zeroed so nothing believes there is a volume. */
+        sd_ok = false;
+        memset(&sd_card, 0, sizeof(sd_card));
+        logf("sd: no card (power_on=%lu)", (unsigned long)err);
+        return 0;
+    }
 
     sd_udelay(30);
 
@@ -435,6 +464,32 @@ static void sd_setup_data(uint32_t len)
     R(SD_DATALEN) = len;
 }
 
+/* Wait for the controller to finish the block it just handed us, and clear
+ * the flag. The write path has always done this - ROM 0x488c spins on the same
+ * bit and ROM 0x4892 writes 8 to clear it - and the read path never did.
+ *
+ * That asymmetry is what broke playback. One CMD17 per sector, with the next
+ * command's STA reset, DCTRL and DATALEN written while the controller was
+ * still closing out the previous block, desynchronised the data path after a
+ * few sectors: "sd: read fifo fail lba=66243 n=61 rc=125" is sector four of a
+ * 64-sector request timing out with the FIFO never going ready again. Small
+ * reads - a directory entry, an ID3 tag - are one block and never hit it,
+ * which is why the browser worked and only the audio buffer fill failed. */
+/* Defined below with the write path, which has always used it; the read path
+ * needs it too, for the recovery in sd_read_sectors. */
+static uint32_t SDICODE sd_wait_ready(void);
+
+static uint32_t SDICODE sd_wait_dataend(void)
+{
+    uint32_t t = 0;
+
+    while (!(R(SD_STA) & STA_DATAEND))
+        if (++t > SD_SPIN)
+            return 0x79;
+    R(SD_STA) = STA_DATAEND;
+    return 0;
+}
+
 int SDICODE sd_read_sectors(IF_MD(int drive,)
                             sector_t start, int count, void *buf)
 {
@@ -455,13 +510,41 @@ int SDICODE sd_read_sectors(IF_MD(int drive,)
 
         ROM_SD_CMD(&sdh, 17, sd_addr(start));    /* READ_SINGLE_BLOCK */
         if ((err = sd_wait_data(17)) != 0) {
-            return -2;
+            SD_LOG_FAIL("read cmd", start, count + 1, (int)err);
+            goto fail;
         }
         if ((err = sd_read_fifo512(p)) != 0) {
-            return -3;
+            SD_LOG_FAIL("read fifo", start, count + 1, (int)err);
+            goto fail;
+        }
+        if ((err = sd_wait_dataend()) != 0) {
+            SD_LOG_FAIL("read end", start, count + 1, (int)err);
+            goto fail;
         }
         p += 512;
         start++;
+        continue;
+
+fail:
+        /* Recover the CARD, not just the controller.
+         *
+         * Clearing the controller flags leaves a card that is still in a data
+         * state exactly as stuck as it was, so the storage layer's retry
+         * re-issues CMD17 into the same condition and fails identically. That
+         * is visible in the log as the same LBA failing seven times with the
+         * same code and nothing changing in between.
+         *
+         * So do what the write path has always done and the read path never
+         * did: abort any transfer the card thinks is running, then wait for it
+         * to report ready again. Both results are ignored deliberately - this
+         * is a best-effort cleanup on a path that has already failed, and the
+         * caller's retry is what decides the outcome. */
+        R(SD_STA) = STA_ALLFLAGS;
+        ROM_SD_CMD(&sdh, 12, 0);            /* STOP_TRANSMISSION */
+        (void)sd_wait_data(12);
+        R(SD_STA) = STA_ALLFLAGS;
+        (void)sd_wait_ready();
+        return (err == 0x7f) ? -2 : -3;
     }
     return 0;
 }

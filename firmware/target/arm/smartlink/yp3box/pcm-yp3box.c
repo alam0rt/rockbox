@@ -25,6 +25,26 @@
 #include "pcm-internal.h"
 #include "pcm_sink.h"
 #include "sl6801-regs.h"
+#ifdef ROCKBOX_HAS_LOGF
+#define LOGF_ENABLE
+#endif
+#include "logf.h"
+
+/* Playback reaches pcmbuf_play_start and then nothing happens: no sound and a
+ * frozen elapsed time. Elapsed time only advances as the PCM buffer drains,
+ * and the buffer only drains when the transfer-complete IRQ fires, so those
+ * two symptoms are one symptom - the DMA never completes a buffer.
+ *
+ * That is the second row of the table in CLAUDE.md: registers that hold their
+ * values while transfers never finish means a module that is off or a clock
+ * that was never committed. So log both halves for the DMA engine and the
+ * codec block, and read the DMA registers back after arming them - a readback
+ * of zero says the module is dead, correct values with no completion says the
+ * clock is.
+ *
+ * The IRQ only counts; logf from interrupt context is not worth the risk. The
+ * count is reported from sink_stop, which is the compact, decisive number:
+ * zero completions means the engine never ran at all. */
 
 /* --- audio master clock ---------------------------------------------------
  *
@@ -182,9 +202,14 @@ static void yp3_irq_disable(unsigned irq)
     NVIC_ICER[irq >> 5] = 1u << (irq & 31);
 }
 
+static uint32_t pcm_irqs;        /* transfer-complete callbacks taken */
+static uint32_t pcm_plays;       /* sink_play calls */
+
 void yp3_audio_irq(void)
 {
     uint32_t status = AUDIO_IRQSTAT;
+
+    pcm_irqs++;
 
     if (status & 2u) {                  /* full transfer complete */
         const void *addr;
@@ -195,6 +220,48 @@ void yp3_audio_irq(void)
     }
 
     AUDIO_IRQSTAT = status | 7u;        /* W1C, after callbacks as vendor does */
+}
+
+/* --- the speaker power amplifier -------------------------------------------
+ *
+ * docs/AUDIO-BOARD.md lists the PA enable as unresolved: "no board PA-enable,
+ * speaker mute, jack-detect, or route-select packed descriptor is proved".
+ * It is in the dump, reached from the media manager's own logging.
+ *
+ * FIRM 0xd42ce0, the branch that prints "PA open in media_manager OK.":
+ *
+ *     d42ce2  r0 = [0xd42d0c]        = 0x0001f00b
+ *     d42ce4  bl 0x8051f4            SRAM thunk -> b.w 0x7ac
+ *     d42ce8  r0 = "PA open in media_manager OK."
+ *     d42cf2  r0 = 0x0001f000        the close path, same helper
+ *
+ * 0x8051f4 sits in the same SRAM thunk table as the clock helpers this port
+ * already uses (0x8051ec -> 0x27a0, 0x8051f0 -> 0x2a7c), and it branches to
+ * ROM 0x7ac - the GPIO helper, ROM_GPIO_CFG1 here.
+ *
+ * Decoding the descriptor with the ROM's own unpacker at 0x77a, which takes
+ * the port from bits 16..19 and the pin from bits 11..15:
+ *
+ *     0x0001f00b -> port 1 pin 30, low nibble 0xb    PA on
+ *     0x0001f000 -> port 1 pin 30, low nibble 0x0    PA off
+ *
+ * Checked against the two descriptors this port already had names for:
+ * 0x0001bf90 and 0x0001b790 decode to port 1 pins 23 and 22, which is exactly
+ * what usb-yp3box.c documents them as. So the speaker amplifier is port 1
+ * pin 30, and these are the vendor's own two words for it - not a guess at a
+ * pin, and not a guess at what to write to it. */
+#define SPK_PA_ON       0x0001f00bu     /* FIRM 0xd42d0c */
+#define SPK_PA_OFF      0x0001f000u     /* FIRM 0xd42cf2 */
+
+static bool spk_pa_on;
+
+static void yp3_speaker_pa(bool on)
+{
+    if (on == spk_pa_on)
+        return;
+    spk_pa_on = on;
+    ROM_GPIO_CFG1(on ? SPK_PA_ON : SPK_PA_OFF);
+    logf("spk: PA %s", on ? "open" : "close");
 }
 
 /* --- the sink ------------------------------------------------------------- */
@@ -246,10 +313,52 @@ static void sink_play(const void *addr, size_t size)
     AUDIO_CTRL    = (AUDIO_CTRL & ~0xf0u) | 0x11eu | 0x1u;
     AUDIO_ENABLE |= 0x3u;
     yp3_irq_enable(IRQ_AUDIO, 8);
+
+    /* Amplifier last, once samples are already flowing, so it is not powered
+     * up into a silent line. */
+    yp3_speaker_pa(true);
+
+    /* The first two only: after that this is a per-buffer hot path. */
+    if (pcm_plays < 2) {
+        logf("pcm play #%lu addr=%08lx size=%lu mclk=%lu",
+             (unsigned long)pcm_plays, (unsigned long)addr,
+             (unsigned long)size, yp3_audio_mclk);
+        logf("pcm mod: dma21=%d codec57=%d",
+             ROM_CLK_IS_ON(AUDIO_DMA_MODULE), ROM_CLK_IS_ON(AUDIO_MODULE));
+        /* Readback. Zeroes here mean the module is off; correct values with
+         * no completion mean the clock was never committed. */
+        logf("pcm dma: addr=%08lx len=%lu ctrl=%04x fmt=%02x cfg=%04x",
+             (unsigned long)AUDIO_DMA_ADDR(AUDIO_DMA_PLAY_CH),
+             (unsigned long)AUDIO_DMA_LEN(AUDIO_DMA_PLAY_CH),
+             AUDIO_DMA_CTRL(AUDIO_DMA_PLAY_CH),
+             AUDIO_DMA_FORMAT, AUDIO_DMA_PLAY_CFG);
+        logf("pcm blk: ctrl=%08lx en=%08lx irqst=%08lx iser1=%08lx",
+             (unsigned long)AUDIO_CTRL, (unsigned long)AUDIO_ENABLE,
+             (unsigned long)AUDIO_IRQSTAT,
+             (unsigned long)REG32(0xE000E104));
+        logf("pcm cod: 40=%08lx 4c=%08lx 50=%08lx",
+             (unsigned long)CODEC(0x40), (unsigned long)CODEC(0x4c),
+             (unsigned long)CODEC(0x50));
+    }
+    pcm_plays++;
 }
 
 static void sink_stop(void)
 {
+    /* Amplifier first on the way down. The vendor's teardown order is
+     * explicitly unresolved in docs/AUDIO-BOARD.md ("Ordering of mute versus
+     * PA GPIO and all delays remain [U]"), so this is our choice, not a
+     * transcription: muting the amplifier before the samples stop is the
+     * usual way to keep the stop out of the speaker. */
+    yp3_speaker_pa(false);
+
+    /* The number that settles it: plays without completions means the engine
+     * was armed and never ran. */
+    logf("pcm stop: plays=%lu irqs=%lu dmalen=%lu irqst=%08lx",
+         (unsigned long)pcm_plays, (unsigned long)pcm_irqs,
+         (unsigned long)AUDIO_DMA_LEN(AUDIO_DMA_PLAY_CH),
+         (unsigned long)AUDIO_IRQSTAT);
+
     /* Disable the interrupt before stopping DMA, so completion cannot request
      * another transfer. */
     yp3_irq_disable(IRQ_AUDIO);

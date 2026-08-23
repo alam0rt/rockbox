@@ -53,6 +53,28 @@
 #define MSC_BLOCK_SIZE      MSC32(0x25c)    /* 0x5b26 */
 #define MSC_BLOCK_COUNT     MSC32(0x260)    /* 0x5b14 */
 
+/* The CSW lives at MSC_BASE+0x228: signature, tag, dCSWDataResidue, status.
+ * The residue is the field this driver forgot, and it cost a whole round of
+ * "our side works but the host disagrees".
+ *
+ * The ROM seeds it from the CBW when the command arrives (0x63d6):
+ *
+ *     [base+0x22c] = [base+0x20c]      CSW tag     = CBW tag
+ *     [base+0x230] = [base+0x210]      CSW residue = dCBWDataTransferLength
+ *
+ * and every handler is expected to DECREMENT it as it moves data. The ROM's
+ * own read pump does exactly that at 0x5c64:
+ *
+ *     r3 = [base+0x230]; r3 -= bytes_sent; [base+0x230] = r3
+ *
+ * The CSW builder at 0x5e70 writes only the signature and the status - it
+ * never recomputes the residue - so a handler that does not decrement sends
+ * "I transferred nothing" alongside a full data phase. The host sees data it
+ * was told did not arrive and fails the command with DID_ERROR, which is
+ * exactly what usb-storage reported while our own counters read
+ * hooks=202 chunks=202 sderr=0. */
+#define MSC_RESIDUE         MSC32(0x230)
+
 /* MSC_STATE, from the three completion callbacks that switch on it:
  *   0  idle, waiting for a CBW
  *   1  data-out in flight     (0x6454 continues the command)
@@ -77,6 +99,22 @@
 /* the USB PHY/controller enable the vendor reaches through SRAM thunk
  * 0x80db54, which is one branch to this */
 #define ROM_USB_PHY         ((void (*)(unsigned))0x3ad5u)
+/* Soft-connect. usb_attach does NOT do this - it ends in ROM 0x5204, which is
+ * the soft-DISCONNECT, so that the host sees a clean attach afterwards. The
+ * pull-up is a separate call, and without it D+ is never driven and the host
+ * never sees a device at all:
+ *
+ *     0x7f4c  [0x40040060] |= 1;          DEVCTL SESSION
+ *             b 0x51f0                    [0x40040001] |= 0x40; delay(3)
+ *     0x7f60  [0x40040060] &= ~1;
+ *             b 0x5204                    [0x40040001] &= ~0x40; delay(3)
+ *
+ * 0x40040001 is POWER and 0x40 is SOFTCONN, which is what the log said: the
+ * register read back 0x20 (high-speed enable, no soft-connect) through every
+ * attach. The ROM's own download mode reaches 0x7f4c through the thunk chain
+ * 0x590c -> 0x55b8 -> 0x51f0, so this is the known-good enumeration path. */
+#define ROM_USB_CONNECT     ((void (*)(void))0x7f4du)
+#define ROM_USB_DISCONNECT  ((void (*)(void))0x7f61u)
 /* USB pad and PHY configuration: two more pin-mux writes (port 2 pins 0 and
  * 1, mode 2) and a configuration word into the PHY register at 0x40085100,
  * behind a busy bit. See the comment on usb_hw_enable(). */
@@ -157,6 +195,36 @@ static int usb_msc_stub(void)
 static uint32_t msc_lba;
 static uint32_t msc_blocks_left;
 
+/* Counters, not logf: the hook runs in the USB interrupt (ROM 0x631c is
+ * reached from the IRQ 41/42 handlers), and logf is not interrupt-safe. They
+ * are reported from usb_enable(false), in thread context.
+ *
+ * The host's READ(10) for 8 sectors at LBA 0 comes back DID_ERROR, and there
+ * are three candidate explanations that these numbers separate cleanly:
+ *
+ *   hooks == 0            the dispatcher never reaches us - table or opcode
+ *   hooks 1, chunks 1     the ROM did not re-dispatch for chunk 2, so the
+ *                         host got 512 bytes of a 4096-byte transfer and
+ *                         timed out: the multi-chunk protocol is wrong
+ *   sderrs > 0            storage_enable(false) left the card unusable, so
+ *                         the hook is fine and the medium is not
+ *
+ * A fourth stays unmeasured for now: sd_read_sectors is polled, and running
+ * it inside the USB interrupt may hold the handler long enough for the host
+ * to time out. This target has no microsecond counter to time it with, and
+ * chunks==1 would point at it anyway. */
+static uint32_t msc_hooks, msc_chunks, msc_rejects, msc_sderrs, msc_runaways;
+static uint32_t msc_last_lba;
+/* Wall time in USB mode, so throughput is a measured number rather than an
+ * argument about which of two plausible bottlenecks matters more. The link
+ * enumerates at FULL speed - the kernel says so, and the ROM's own download
+ * mode does the same - which caps it near 1 MB/s before our code does
+ * anything. Against that, every 512 bytes here costs one polled CMD17 with a
+ * FIFO drained a word at a time, from inside the USB interrupt. If the
+ * measured rate lands near the link cap the SD path is not worth rewriting;
+ * if it lands an order of magnitude below, it is. */
+static long msc_t0;
+
 /* Decide whether to take the command, and set up if so.
  *
  * Every reason NOT to take it is delegated rather than reported, because the
@@ -193,10 +261,25 @@ static bool usb_msc_begin(void)
 }
 
 /* One 512-byte chunk per call, which is what the ROM's pump does and what the
- * single staging buffer allows. */
+ * single staging buffer allows.
+ *
+ * The guard is not paranoia. usb_msc_hook only calls usb_msc_begin() when the
+ * state is IDLE and otherwise falls straight through to here, so any
+ * re-dispatch that arrives with the command already finished would decrement
+ * zero to 0xffffffff. The state would then never reach MSC_ST_LAST, the CSW
+ * would never be sent, and this would stream sectors for ever - a transfer
+ * the host waits on indefinitely, which is precisely the `cat` that never
+ * returned. Finish the command instead and let the ROM send the CSW. */
 static void usb_msc_read_chunk(void)
 {
+    if (msc_blocks_left == 0) {
+        msc_runaways++;
+        MSC_STATE = MSC_ST_LAST;
+        return;
+    }
+
     if (sd_read_sectors(IF_MD(0,) msc_lba, 1, MSC_BUF) != 0) {
+        msc_sderrs++;
         /* Nothing here can fail the command either: by this point the data
          * phase is in flight and the only paths out of ROM 0x6380 are "send
          * the next chunk" and "send the CSW". Sending a zeroed block keeps
@@ -206,8 +289,13 @@ static void usb_msc_read_chunk(void)
         memset(MSC_BUF, 0, 512);
     }
 
+    msc_last_lba = msc_lba;
+    msc_chunks++;
     msc_lba++;
     msc_blocks_left--;
+
+    /* Account for the block, or the CSW will claim it never went. */
+    MSC_RESIDUE -= 512;
 
     /* State 3 tells the ROM this is the last chunk: when it completes, ROM
      * 0x6380 falls into its state 3..4 arm and sends the CSW itself. */
@@ -221,11 +309,21 @@ static void usb_msc_read_chunk(void)
  * sent is sitting in MSC_BUF. */
 static void usb_msc_write_chunk(void)
 {
+    if (msc_blocks_left == 0) {         /* see usb_msc_read_chunk */
+        msc_runaways++;
+        MSC_STATE = MSC_ST_LAST;
+        return;
+    }
+
     if (sd_write_sectors(IF_MD(0,) msc_lba, 1, MSC_BUF) != 0)
         logf("usb: write error at lba %lu", (unsigned long)msc_lba);
 
     msc_lba++;
     msc_blocks_left--;
+
+    /* Same accounting as the read path: the host's data arrived and was
+     * consumed, so the residue has to shrink by it. */
+    MSC_RESIDUE -= 512;
 
     MSC_STATE = msc_blocks_left ? MSC_ST_DATA_OUT : MSC_ST_LAST;
 }
@@ -238,9 +336,13 @@ static int usb_msc_hook(unsigned opcode)
     if (!usb_exposed)
         return 0;
 
+    msc_hooks++;
+
     if (MSC_STATE == MSC_ST_IDLE) {
-        if (!usb_msc_begin())
+        if (!usb_msc_begin()) {
+            msc_rejects++;
             return 0;                   /* let the ROM fail it properly */
+        }
 
         MSC_STATE = (opcode == 0x28) ? MSC_ST_DATA_IN : MSC_ST_DATA_OUT;
 
@@ -271,7 +373,7 @@ struct usb_msc_ops {
     int (*read)(void *buf, uint32_t lba, uint32_t n);   /* +0x10 */
     int (*write)(void *buf, uint32_t lba, uint32_t n);  /* +0x14 */
     int (*unused18)(void);                              /* +0x18 */
-    int (*unused1c)(void);                              /* +0x1c */
+    const void *inquiry;                                /* +0x1c */
     int (*hook)(unsigned opcode);                       /* +0x20 */
 };
 
@@ -289,7 +391,24 @@ static struct usb_msc_ops usb_msc_ops = {
     .read            = usb_msc_rw_unused,   /* never reached, see file header */
     .write           = usb_msc_rw_unused,
     .unused18        = usb_msc_stub,
-    .unused1c        = usb_msc_stub,
+    /* NOT a function. ROM 0x599c is the INQUIRY handler and it treats +0x1c
+     * as a pointer to 36 bytes of INQUIRY response, which it memcpys into
+     * the staging buffer:
+     *
+     *     r3 = [0x801068]; r3 = [r3 + 0x1c];
+     *     if (r3 == 0) r3 = 0x800588;      the ROM's own default
+     *     [0x800dee] = 36; copy 36 bytes r3 -> 0x800df0
+     *
+     * docs/USB.md called this slot unused and the vendor's a "return 0"; the
+     * vendor's is 0x81ac43, a data address, and ours was usb_msc_stub. The
+     * ROM duly sent 36 bytes of that function's Thumb code as the INQUIRY
+     * response, which the host read as vendor "ppGP", product "1N F F0H 4x"
+     * and peripheral-qualifier 1 - no medium, so no block device.
+     *
+     * NULL takes the ROM's default, which is the SMTLINK/DEVICE response
+     * that download mode enumerates with. Point it at our own 36 bytes when
+     * there is a reason to; there is no reason yet. */
+    .inquiry         = NULL,
     .hook            = usb_msc_hook,
 };
 
@@ -373,9 +492,12 @@ static void usb_log_state(const char *when)
 {
     logf("usb %s: mod23=%d clk sys40000000=%08lx", when,
          ROM_CLK_IS_ON(USB_MODULE), (unsigned long)USB_SYS_ENABLE);
-    logf("usb %s: 00=%02x 01=%02x 0b=%02x 0e=%02x 12=%04x", when,
+    /* 01 is POWER: 0x20 is high-speed enable, 0x40 is SOFTCONN - the D+
+     * pull-up, and the difference between a device the host can see and one
+     * it cannot. 60 is DEVCTL; its bit 0 is SESSION. */
+    logf("usb %s: 00=%02x 01=%02x 0b=%02x 0e=%02x 12=%04x 60=%02x", when,
          USBC(0x00), USBC(0x01), USBC(0x0b), USBC(0x0e),
-         REG16(0x40040012));
+         REG16(0x40040012), USBC(0x60));
     logf("usb %s: phy 40085100=%08lx", when,
          (unsigned long)REG32(0x40085100));
 }
@@ -412,6 +534,7 @@ void usb_enable(bool on)
         msc_lba = 0;
         msc_blocks_left = 0;
         MSC_STATE = MSC_ST_IDLE;
+        msc_t0 = current_tick;
 
         usb_log_state("pre");
         usb_hw_enable();
@@ -422,6 +545,10 @@ void usb_enable(bool on)
         ROM_USB_SET_USERFN(&usb_msc_ops);
         ROM_USB_ATTACH();
         usb_log_state("post-attach");
+        /* Only now is there anything for the host to talk to: attach has
+         * registered the interrupts and left the pull-up down. */
+        ROM_USB_CONNECT();
+        usb_log_state("post-connect");
         logf("usb: vtor=%08lx irq41=%08lx irq42=%08lx",
              (unsigned long)REG32(0xE000ED08),
              (unsigned long)REG32(0x00800000 + (41 + 16) * 4),
@@ -442,7 +569,28 @@ void usb_enable(bool on)
         if (!usb_exposed)
             return;
 
+        logf("msc: hooks=%lu chunks=%lu rej=%lu sderr=%lu run=%lu",
+             (unsigned long)msc_hooks, (unsigned long)msc_chunks,
+             (unsigned long)msc_rejects, (unsigned long)msc_sderrs,
+             (unsigned long)msc_runaways);
+        {
+            long dt = current_tick - msc_t0;
+            /* KB/s: chunks are 512 bytes, and HZ ticks make a second. */
+            unsigned long kbs = dt > 0
+                ? (unsigned long)((uint64_t)msc_chunks * 512 * HZ / dt / 1024)
+                : 0;
+            logf("msc: lastlba=%lu left=%lu state=%d",
+                 (unsigned long)msc_last_lba, (unsigned long)msc_blocks_left,
+                 MSC_STATE);
+            logf("msc: ticks=%ld hz=%d -> %lu KB/s", dt, HZ, kbs);
+        }
+        msc_hooks = msc_chunks = msc_rejects = msc_sderrs = 0;
+        msc_runaways = 0;
+
         usb_exposed = false;
+        /* Drop the pull-up before the clock goes away, so the host sees a
+         * disconnect rather than a device that stopped answering. */
+        ROM_USB_DISCONNECT();
         ROM_USB_SET_USERFN(NULL);
         usb_hw_disable();
     }

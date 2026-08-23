@@ -392,14 +392,26 @@ static inline void usb_slave_mode(bool on)
 
         usb_enable(false);
 
-        rc = storage_init();
-        if(rc)
-            panicf("storage: %d",rc);
+        /* The USB overlay stays up until SYS_USB_DISCONNECTED is broadcast,
+         * and that happens only after everything below. Time the two costly
+         * steps separately: a slow unplug is either the storage re-init or
+         * the FAT remount, and guessing which has already wasted a cycle. */
+        {
+            long t0 = current_tick, t1;
 
-        sleep(HZ/10);
-        rc = disk_mount_all();
-        if(rc <= 0) /* no partition */
-            panicf("mount: %d",rc);
+            rc = storage_init();
+            if(rc)
+                panicf("storage: %d",rc);
+            t1 = current_tick;
+
+            sleep(HZ/10);
+            rc = disk_mount_all();
+            if(rc <= 0) /* no partition */
+                panicf("mount: %d",rc);
+
+            logf("usb out: storage_init=%ld mount=%ld ticks (HZ=%d)",
+                 t1 - t0, current_tick - t1, HZ);
+        }
     }
 }
 #endif /* HAVE_USBSTACK */

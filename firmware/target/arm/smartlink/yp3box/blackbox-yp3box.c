@@ -37,8 +37,16 @@
 #include "blackbox.h"
 #include "sl6801-regs.h"
 #include "logf.h"
+#include "version.h"
+#include "yp3-buildstamp.h"
 
-#define BLACKBOX_MAGIC      0x59503342u     /* "YP3B" */
+/* "YP3B", plus a layout revision in the last nibble. BUMP THIS whenever the
+ * header or the .persist layout changes: the logf ring sits directly behind
+ * this struct, so growing the struct moves the ring, and a stale magic would
+ * make the next boot read the old ring at the new offset and dump convincing
+ * garbage. A changed magic forces a clean cold init instead, costing exactly
+ * one log - the one spanning the change, which is never the interesting one. */
+#define BLACKBOX_MAGIC      0x59503343u
 /* Stop a fault that reproduces immediately from rebooting for ever. */
 #define BLACKBOX_MAX_FAULTS 3
 
@@ -70,6 +78,12 @@ struct yp3_blackbox {
     uint32_t pc, sp, lr, psr;
     uint32_t cfsr, hfsr, mmfar, bfar;
     char     msg[64];
+    /* Which firmware filled the ring. Kept in .persist rather than read from
+     * rbversion at dump time, because the boot dump writes the PREVIOUS run's
+     * log: the version doing the writing is not the version that produced the
+     * lines. Getting that backwards is how a log from an old image gets read
+     * as evidence about a new one. */
+    char     version[48];
 };
 
 /* Placed by app.lds at the head of .persist; never defined in C, so nothing
@@ -80,6 +94,27 @@ extern struct yp3_blackbox yp3_blackbox;
  * the last one left. */
 static bool blackbox_have_previous;
 static bool blackbox_written;
+/* The version that filled the ring we inherited, saved before this run stamps
+ * its own over it. */
+static char blackbox_prev_version[48];
+/* Set only on the boot dump, where the record describes the previous run. A
+ * panic or fault dump describes THIS run, so it reports this run's version. */
+static bool blackbox_dump_is_previous;
+
+/* rbversion is the git hash plus a dirty marker; YP3_BUILD_STAMP is generated
+ * per build by tools/40_build.sh. Both are needed: during a debugging session
+ * every build comes from the same modified tree, so the hash alone never
+ * changes, and __DATE__/__TIME__ are pinned by SOURCE_DATE_EPOCH. The stamp
+ * carries a real clock time and a hash of the target sources. */
+
+/* strlcpy/strlcat rather than snprintf: this struct is also written from
+ * panic context, and the same helper is used on both paths. */
+static void bb_stamp_version(struct yp3_blackbox *bb)
+{
+    strlcpy(bb->version, rbversion, sizeof(bb->version));
+    strlcat(bb->version, " ", sizeof(bb->version));
+    strlcat(bb->version, YP3_BUILD_STAMP, sizeof(bb->version));
+}
 
 void blackbox_init(void)
 {
@@ -95,11 +130,42 @@ void blackbox_init(void)
         memset(_persistbegin, 0, _persistend - _persistbegin);
         bb->magic = BLACKBOX_MAGIC;
         bb->boots = 1;
+        bb_stamp_version(bb);
         return;
     }
 
     bb->boots++;
+    strlcpy(blackbox_prev_version, bb->version,
+            sizeof(blackbox_prev_version));
+    bb_stamp_version(bb);
+
+    /* A crash is not the only failure worth reading. The symptom that costs
+     * the most cycles here - a track that never starts, a hang, a peripheral
+     * that goes quiet - leaves no panic and no fault, so keying the dump off
+     * bb->reason would write nothing for exactly the runs we reset the device
+     * to investigate. Any warm boot that finds log in the ring dumps it, with
+     * reason "none (log only)"; pinhole-reset the device and the next boot
+     * has the previous run's log on the card. No keypad required. */
     blackbox_have_previous = (bb->reason != BB_NONE);
+#ifdef ROCKBOX_HAS_LOGF
+    /* logfindex and logfwrap live in .persist too, so they arrive from the
+     * previous run UNVALIDATED - and the runs this code exists to record are
+     * exactly the ones that may have scribbled on them. An out-of-range index
+     * makes bb_write_log read outside logfbuffer and write a file until the
+     * card fills. Distrust them: a bad index means the ring is not
+     * reconstructable, so drop it rather than dump garbage. */
+    if (logfindex < 0 || logfindex >= MAX_LOGF_SIZE) {
+        logfindex = 0;
+        logfwrap = false;
+    }
+    else if (logfindex != 0 || logfwrap)
+        blackbox_have_previous = true;
+
+    /* The dump happens after this boot has already logged, so the file holds
+     * the previous run's log followed by the start of this one. Mark the seam
+     * in the ring itself rather than making the reader guess. */
+    logf("--- boot %lu ---", (unsigned long)bb->boots);
+#endif
 }
 
 /* Formatting by hand: this runs from panic and fault context, where the
@@ -194,6 +260,11 @@ static void bb_rotate(void)
     }
 }
 
+/* Every path out of here is a return, never a panic: this runs on the boot
+ * path and from panic and fault context, and a flight recorder that takes the
+ * device down when the card is missing is worse than no flight recorder. With
+ * no card the open below simply fails and the record stays in SRAM, where a
+ * later boot with a card can still write it - nothing is lost by failing. */
 bool blackbox_dump(void)
 {
     struct yp3_blackbox *bb = &yp3_blackbox;
@@ -201,19 +272,34 @@ bool blackbox_dump(void)
 
     if (blackbox_written)
         return false;
+    /* Set before any I/O, so a panic raised from inside this function cannot
+     * recurse through system_exception_wait back into it. */
     blackbox_written = true;
 
+    /* Rotate first so the newest name is free. With no card these are five
+     * failing calls that change nothing; with a card they are the rotation.
+     * Deliberately not gated on a probe - opendir would take an entry out of
+     * the disk cache, and running that out IS a panic (see
+     * DC_NUM_ENTRIES_OVERRIDE in the target config). */
     bb_rotate();
 
     fd = open(BLACKBOX_NEWEST, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0)
-        return false;
+        return false;       /* no card, no filesystem, full card: all fine */
 
     bb_puts(fd, "\n=== yp3 blackbox ===\n");
     bb_puts(fd, "reason: ");
     bb_puts(fd, bb_reason_name(bb->reason));
     bb_puts(fd, "\n");
     bb_puthex(fd, "boots:  ", bb->boots);
+
+    {
+        const char *v = blackbox_dump_is_previous ? blackbox_prev_version
+                                                  : bb->version;
+        bb_puts(fd, "build:  ");
+        bb_puts(fd, v[0] ? v : "(unknown - cold boot)");
+        bb_puts(fd, "\n");
+    }
 
     if (bb->msg[0]) {
         bb->msg[sizeof(bb->msg) - 1] = '\0';
@@ -253,8 +339,10 @@ bool blackbox_dump(void)
  * moment anything can be written. */
 void blackbox_boot_dump(void)
 {
-    if (blackbox_have_previous)
+    if (blackbox_have_previous) {
+        blackbox_dump_is_previous = true;
         (void)blackbox_dump();
+    }
     else
         yp3_blackbox.faults = 0;    /* a boot that got this far is clean */
 }
