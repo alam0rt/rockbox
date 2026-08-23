@@ -21,7 +21,11 @@ wavpack.c
 #ifndef RB_PROFILE
 alac.c
 #endif
+/* cook, ay and gbs need 110-128 KB and do not fit a 108 KB codec buffer;
+   measured from their .elf bss ends. See firmware/export/config/yp3box.h. */
+#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x20000
 cook.c
+#endif
 a52_rm.c
 atrac3_rm.c
 atrac3_oma.c
@@ -36,11 +40,15 @@ au.c
 vox.c
 wav64.c
 tta.c
+#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x20000
 ay.c
+#endif
 #ifdef HAVE_FPU
 vtx.c
 #endif
+#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x20000
 gbs.c
+#endif
 #if MEMORYSIZE > 2
 sid.c
 kss.c

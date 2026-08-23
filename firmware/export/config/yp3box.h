@@ -85,12 +85,35 @@
  *     wav      54 KB     vorbis     98 KB     aac   190 KB
  *                                             flac  194 KB
  *
- * 128 KB covers MP3, Vorbis, WAV and WavPack. FLAC, AAC and Opus do not fit;
- * the measured codec sizes above show what fits in this buffer.
- * This is a 512 KB device, so every byte here comes off the audio buffer. */
+ * This is a 512 KB device, so every byte here comes off the audio buffer, and
+ * that buffer is what stops playback working: with 0x20000/0x10000 reserved
+ * here, audio_reset_buffer_noalloc() panicked with "EOM (17440 > 14448)" - the
+ * PCM ring wanted 17 KB and 14 KB of core arena was left.
+ *
+ * Both reservations are fixed cuts off the top of SRAM, so both are worth more
+ * to playback than to what they hold:
+ *
+ * PLUGIN_BUFFER_SIZE. No plugins are built for this target at all - the
+ * generated Makefile has an empty ENABLEDPLUGINS and rockbox.zip contains zero
+ * .rock files, because the plugin keymaps do not exist yet (ROADMAP B4). 64 KB
+ * was reserved for nothing. 8 KB keeps the loader's arithmetic honest and
+ * leaves room for a launcher stub; raise it again in the same commit that
+ * makes plugins build.
+ *
+ * CODEC_SIZE. A codec's .bss is sized by this and a codec that overflows fails
+ * to LINK, so the number is a real gate, not a hint. Measured need, from the
+ * built .elf files (bss end minus codecbuf):
+ *
+ *     mpa (MP3) 103 KB    atrac3_rm  98 KB    everything else smaller
+ *     cook     128 KB     ay        120 KB    gbs       110 KB
+ *
+ * 0x1b000 is 108 KB: it keeps MP3, Vorbis, WAV and WavPack with about 4.6 KB
+ * of headroom over mpa, and drops cook (RealAudio), ay (ZX Spectrum) and gbs
+ * (Game Boy) - see the gates in lib/rbcodec/codecs/SOURCES. FLAC, AAC and Opus
+ * did not fit at 128 KB either. */
 
-#define PLUGIN_BUFFER_SIZE  0x10000
-#define CODEC_SIZE          0x20000
+#define PLUGIN_BUFFER_SIZE  0x2000
+#define CODEC_SIZE          0x1b000
 
 /* The tree cache is allocated before playback. The generic 1,000-entry default
  * consumes 52 KiB (40-byte names plus 12-byte entries) from the small core
