@@ -6,7 +6,8 @@
 #define BUTTON_NEXT     0x00000004
 #define BUTTON_MENU     0x00000008
 #define BUTTON_VOL      0x00000010
-#define BUTTON_MAIN     (BUTTON_PLAY|BUTTON_PREV|BUTTON_NEXT|BUTTON_MENU|BUTTON_VOL)
+#define BUTTON_MAIN \
+    (BUTTON_PLAY | BUTTON_PREV | BUTTON_NEXT | BUTTON_MENU | BUTTON_VOL)
 /* Must be a button no key produces: firmware/drivers/button.c shuts the player
  * down on the first POWEROFF_BUTTON repeat, so pointing this at a key that is
  * held for any normal purpose powers the device off mid-use. Four of the five

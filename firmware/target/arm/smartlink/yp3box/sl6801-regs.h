@@ -67,10 +67,9 @@
 #define ROM_CLK_SRC     ((void (*)(unsigned, unsigned))0x3119u)
 #define ROM_CLK_DIV     ((void (*)(unsigned, unsigned))0x2d59u)
 #define ROM_CLK_APPLY   ((void (*)(unsigned))0x27a1u)
-/* 0x27a0 starts a clock, 0x2a7c stops it - FIRM settles it at 0xd7e844/0xd7e88e,
- * where the codec enable starts 0x1f and 0x38 and the disable stops 0x38. */
+/* 0x27a0 starts a clock, 0x2a7c stops it. FIRM settles this at
+ * 0xd7e844/0xd7e88e, where codec enable starts 0x1f and 0x38. */
 #define ROM_CLK_STOP    ((void (*)(unsigned))0x2a7du)
-#define ROM_CLK_FREQ    ((uint32_t (*)(unsigned))0x3851u)
 #define ROM_GPIO_CFG1   ((void (*)(unsigned))0x7adu)
 #define ROM_GPIO_WRITE  ((void (*)(unsigned, unsigned))0x80fu)
 

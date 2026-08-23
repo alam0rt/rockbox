@@ -101,12 +101,6 @@ endif
 
 ifeq (,$(findstring checkwps,$(APP_TYPE)))
   include $(ROOTDIR)/lib/fixedpoint/fixedpoint.make
-
-# Doom built into the core image rather than loaded - only where the plugin
-# buffer is too small to hold it and there is flash to execute it from.
-ifeq ($(MODELNAME),yp3box)
-  include $(APPSDIR)/plugins/doom/doom_core.make
-endif
 endif
 
 ifneq (,$(findstring bootloader,$(APPSDIR)))

@@ -302,16 +302,6 @@ const struct button_mapping pla_main_ctx[] =
     { PLA_DOWN_REPEAT,      BUTTON_DOWN|BUTTON_REPEAT,          BUTTON_NONE },
     { PLA_LEFT_REPEAT,      BUTTON_LEFT|BUTTON_REPEAT,          BUTTON_NONE },
     { PLA_RIGHT_REPEAT,     BUTTON_RIGHT|BUTTON_REPEAT,         BUTTON_NONE },
-#elif CONFIG_KEYPAD == YP3BOX_PAD
-    /* Four keys, so right cannot be both a direction and select, and select is
-     * what every plugin needs - so PLA_RIGHT is deliberately absent and
-     * BUTTON_PLAY is select below. Left is a direction on press and exit when
-     * held, which is why it has no repeat. Revisit when the centre key lands. */
-    { PLA_UP,               BUTTON_PREV,                        BUTTON_NONE },
-    { PLA_DOWN,             BUTTON_NEXT,                        BUTTON_NONE },
-    { PLA_LEFT,             BUTTON_MENU,                        BUTTON_NONE },
-    { PLA_UP_REPEAT,        BUTTON_PREV|BUTTON_REPEAT,          BUTTON_NONE },
-    { PLA_DOWN_REPEAT,      BUTTON_NEXT|BUTTON_REPEAT,          BUTTON_NONE },
 #else
 #   ifndef HAVE_TOUCHSCREEN
 #       error pluginlib_actions: No directions defined
@@ -565,11 +555,6 @@ const struct button_mapping pla_main_ctx[] =
     {PLA_SELECT,            BUTTON_A,                           BUTTON_NONE},
     {PLA_SELECT_REL,        BUTTON_A|BUTTON_REL,                BUTTON_SELECT},
     {PLA_SELECT_REPEAT,     BUTTON_A|BUTTON_REPEAT,             BUTTON_NONE},
-#elif (CONFIG_KEYPAD == YP3BOX_PAD)
-    {PLA_EXIT,              BUTTON_MENU|BUTTON_REPEAT,          BUTTON_NONE},
-    {PLA_SELECT,            BUTTON_PLAY,                        BUTTON_NONE},
-    {PLA_SELECT_REL,        BUTTON_PLAY|BUTTON_REL,             BUTTON_PLAY},
-    {PLA_SELECT_REPEAT,     BUTTON_PLAY|BUTTON_REPEAT,          BUTTON_NONE},
 #else
 #   ifndef HAVE_TOUCHSCREEN
 #       error pluginlib_actions: No actions defined

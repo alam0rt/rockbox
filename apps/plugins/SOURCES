@@ -7,10 +7,6 @@ db_folder_select.c
 tagcache/tagcache.c
 #endif
 chessclock.c
-#ifdef HAVE_BUILTIN_DOOM
-/* stub: the engine is in the core image, see apps/plugins/doom/doom_builtin.c */
-doom.c
-#endif
 countdown_timer.c
 credits.c
 cube.c

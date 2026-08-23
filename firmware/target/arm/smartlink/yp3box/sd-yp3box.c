@@ -35,7 +35,6 @@
 #include "sd.h"
 #include "storage.h"
 #include "sdmmc.h"
-#include "breadcrumb.h"
 #include <string.h>
 #include <stdint.h>
 
@@ -66,7 +65,8 @@
 /* Clock/module ids: the vendor resets module 0x24 and drives clock 0x11. */
 #define SD_MODULE   0x24u
 #define SD_CLOCK    0x11u
-#define SD_DIV_ID   64u            /* identification-speed divider (vendor: 0x40) */
+#define SD_DIV_ID   64u
+/* Identification-speed divider (vendor: 0x40). */
 
 /* Boot ROM SD HAL. All of these take a handle whose first word is the base. */
 #define ROM_SD_CMD      ((void     (*)(void *, unsigned, uint32_t))0x40c5u)
@@ -102,12 +102,7 @@
 #define ROM_CLK_DISABLE ((void (*)(unsigned))0x2571u)
 #define ROM_GPIO_CFG1   ((void (*)(unsigned))0x7adu)
 
-/* Every ROM entry point used here dereferences only handle[0] (verified by
- * reading each one). The vendor's handle is 0xcc bytes and some ROM paths we do
- * NOT call reach as far as handle[0x8c] for a callback pointer, so the struct is
- * NOT call (ROM 0x3e04/0x3e12) reach handle[0x8c] for a callback pointer. Those
- * are never invoked from here, so one word is sufficient; giving the struct the
- * vendor's full 0xcc bytes overflows the LOW region by 64 bytes. */
+/* ROM entry points only dereference handle[0]. */
 static struct { volatile uint32_t *base; } sdh;
 
 /* CLK, CMD, DAT0-3 on port 3 pins 4..9, alternate function 11. */
@@ -118,19 +113,12 @@ static const unsigned sd_pins[] = {
 
 static bool     sd_ok;
 static uint32_t sd_rca;
-static uint32_t sd_cardtype;         /* 1 = SDv2 byte-addressed, 2 = SDHC/SDXC */
+static uint32_t sd_cardtype;         /* 1 = SDv2, 2 = SDHC/SDXC */
 static uint32_t sd_numblocks;
 static tCardInfo sd_card;
 
-/* Do NOT use the ROM's udelay (0xb764) here. It spins until a 64-bit counter at
- * 0x40082100 advances past a target, and that timer is not running under
- * Rockbox - the ROM starts it during its own boot and we never do. The first
- * ROM_UDELAY(5) call hung the device between breadcrumbs 1 and 2, which the
- * watchdog then turned into a boot loop. The LCD driver already busy-loops for
- * the same reason.
- *
- * SPIN_PER_US is deliberately generous: over-delaying during card
- * identification costs nothing, under-delaying breaks it. */
+/* Do not use the ROM delay: its timer is not running once Rockbox owns the
+ * device. A generous local delay is harmless during card identification. */
 /* Clock changes and delay loops run from SRAM. Executed from XIP flash, a
  * clk_apply that perturbs the flash controller stalls the CPU mid-loop, and a
  * calibrated delay is not calibrated at all when every iteration waits on a SPI
@@ -139,7 +127,12 @@ static tCardInfo sd_card;
 
 #define SPIN_PER_US 80u
 
-static void SDICODE sd_busywait(uint32_t n) { volatile uint32_t i; for (i = 0; i < n; i++) ; }
+static void SDICODE sd_busywait(uint32_t n)
+{
+    volatile uint32_t i;
+    for (i = 0; i < n; i++)
+        ;
+}
 static void SDICODE sd_udelay(unsigned us) { sd_busywait(us * SPIN_PER_US); }
 static void SDICODE sd_mdelay(unsigned ms) { while (ms--) sd_udelay(1000); }
 
@@ -161,22 +154,10 @@ static void SDICODE sd_set_clock(unsigned div)
 
 
 
-/* Faithful port of the vendor's own R1 wait (SRAM 0x828796), used for CMD55.
- *
- * NOT ROM 0x419a. That routine looks like a generic index-checking wait, but its
- * tail returns 0 only when RESP0 bit 31 is SET and 41 otherwise:
- *
- *     ldr r3,[r3,#56]   ; RESP0
- *     cmp r3,#0
- *     ite lt
- *     movlt r0,#0       ; success only if bit31 set
- *     movge r0,#41
- *
- * CMD55's R1 normally has bit 31 clear, so 0x419a reports failure on a perfectly
- * good response - observed as "CMD55 rejected" with ACMD41 already fixed. The
- * vendor never uses 0x419a here; it uses this, which checks the flags and the
- * response index and then simply returns 0.
- */
+/* Faithful port of the vendor's R1 wait at SRAM 0x828796, used for CMD55. */
+/* ROM 0x419a performs a generic index check and rejects a valid R1 response. */
+/* Check the flags and response index exactly as the vendor does. */
+/* The response flag handling below mirrors the ROM's return codes. */
 static uint32_t SDICODE sd_wait_r1_idx(unsigned idx)
 {
     uint32_t sta;
@@ -251,7 +232,7 @@ static uint32_t sd_identify(void)
     if (ROM_SD_WAIT_R2(&sdh))
         return 6;
 
-    ROM_SD_CMD(&sdh, 3, 0);                  /* SEND_RELATIVE_ADDR, replies R6 */
+    ROM_SD_CMD(&sdh, 3, 0);                  /* SEND_RELATIVE_ADDR */
     if (ROM_SD_WAIT_R6(&sdh, 3, &rca16))
         return 7;
     sd_rca = rca16;
@@ -261,7 +242,8 @@ static uint32_t sd_identify(void)
         return 8;
 
     /* For a long (R2) response, index 3 is the MOST significant word:
-     *   RESP3 = CSD[127:96], RESP2 = CSD[95:64], RESP1 = [63:32], RESP0 = [31:0]
+     * RESP3 = CSD[127:96], RESP2 = CSD[95:64], RESP1 = [63:32],
+     * RESP0 = [31:0]
      *
      * This was originally assumed the other way round, because for SHORT
      * responses index 0 does hold the response - ROM 0x4400 reads it for CMD3's
@@ -269,7 +251,7 @@ static uint32_t sd_identify(void)
      *
      * Verified against a real card: RESP3 = 0x400e0032 gives CSD_STRUCTURE 1,
      * TAAC 0x0e, TRAN_SPEED 0x32, and RESP2 = 0x5b590000 gives CCC 0x5b5 and
-     * READ_BL_LEN 9 - every field where it belongs. The vendor agrees: it stores
+     * READ_BL_LEN 9 - every field belongs where expected. The vendor stores
      * resp(3) at the LOWEST offset of its CSD array (SRAM 0x828a20). */
     csd[3] = ROM_SD_RESP(&sdh, 3);
     csd[2] = ROM_SD_RESP(&sdh, 2);
@@ -283,15 +265,6 @@ static uint32_t sd_identify(void)
     sd_card.csd[2] = csd[1];
     sd_card.csd[3] = csd[0];
 
-    /* Record the four response words raw. sd_numblocks came out exactly 0 on the
-     * first successful init, which in the v1.0 branch is what happens when
-     * READ_BL_LEN decodes small enough that blocklen/512 truncates to zero - i.e.
-     * the v2.0 test below did not match and the word order is not what was
-     * assumed. Decode these offline rather than guessing the layout again. */
-    BC_SLOT(46) = csd[3];                    /* RESP0 */
-    BC_SLOT(47) = csd[2];                    /* RESP1 */
-    BC_SLOT(48) = csd[1];                    /* RESP2 */
-    BC_SLOT(49) = csd[0];                    /* RESP3 */
 
     if ((csd[3] >> 30) == 1) {               /* CSD version 2.0 */
         csize = ((csd[2] & 0x3fu) << 16) | (csd[1] >> 16);
@@ -308,12 +281,15 @@ static uint32_t sd_identify(void)
 
 void sd_enable(bool on) { (void)on; }
 bool sd_removable(IF_MD_NONVOID(int drive)) { IF_MD((void)drive;) return true; }
-bool sd_present(IF_MD_NONVOID(int drive))   { IF_MD((void)drive;) return sd_ok; }
+bool sd_present(IF_MD_NONVOID(int drive))
+{
+    IF_MD((void)drive;)
+    return sd_ok;
+}
 long sd_last_disk_activity(void) { return 0; }
 int  sd_event(long id, intptr_t data) { (void)id; (void)data; return 0; }
-/* sdmmc.h declares this as returning tCardInfo *. It was previously defined here
- * as void(int, void *), which only compiled because sdmmc.h was not included -
- * any caller would have gone wrong. */
+/* sdmmc.h declares this as returning tCardInfo *. Keep the target definition
+ * consistent with that declaration. */
 tCardInfo *card_get_info_target(int card_no)
 {
     (void)card_no;
@@ -325,7 +301,6 @@ int sd_init(void)
     unsigned i;
     uint32_t err;
 
-    BC_SLOT(32) = 1;
 
     /* Module reset pulse, exactly as sdmmc_wrap_init does it. Runs from SRAM:
      * ROM clk_enable spins on an acknowledge bit and must not be executed from
@@ -338,7 +313,6 @@ int sd_init(void)
     sdh.base = (volatile uint32_t *)SD_BASE;
 
     sd_set_clock(SD_DIV_ID);
-    BC_SLOT(32) = 2;
 
     ROM_SD_RESET(&sdh);
     /* Vendor constants from HAL_SD_Init_new (0x828b54): the trailing three are
@@ -349,35 +323,24 @@ int sd_init(void)
     R(SD_DTIMER) = 0xffffff40u;
     R(SD_CTRL)   = 0x40000000u;
 
-    {   /* Is the ROM's timer running? Costs nothing to find out. */
-        volatile uint32_t *tmr = (volatile uint32_t *)0x40082104u;
-        uint32_t t0 = *tmr;
-        sd_busywait(20000);
-        BC_SLOT(43) = *tmr - t0;     /* 0 = frozen, confirming the hang above */
-    }
-    BC_SLOT(33) = R(SD_STA);
-    BC_SLOT(34) = R(SD_CLKCFG);
-    BC_SLOT(32) = 3;
 
     err = sd_power_on();
-    BC_SLOT(35) = err ? (0xE0000000u | err) : sd_cardtype;
     if (err)
         return -1;
 
     sd_udelay(30);
-    BC_SLOT(32) = 4;
 
     err = sd_identify();
-    BC_SLOT(36) = err ? (0xE0000000u | err) : sd_rca;
-    BC_SLOT(37) = sd_numblocks;
     if (err)
         return -2;
 
     /* ROM 0x4282 sends CMD7 and waits, in one call. */
-    if (ROM_SD_SELECT(&sdh, sd_rca << 16)) { BC_SLOT(38) = 0xE0000007u; return -3; }
+    if (ROM_SD_SELECT(&sdh, sd_rca << 16))
+        return -3;
 
     ROM_SD_CMD(&sdh, 16, 512);               /* SET_BLOCKLEN */
-    if (ROM_SD_WAIT(&sdh, 16)) { BC_SLOT(38) = 0xE0000010u; return -4; }
+    if (ROM_SD_WAIT(&sdh, 16))
+        return -4;
 
     sd_card.initialized = 1;
     sd_card.numblocks   = sd_numblocks;
@@ -385,20 +348,14 @@ int sd_init(void)
     sd_card.rca         = sd_rca;
     sd_card.sd2plus     = (sd_cardtype >= 1);
 
-    BC_SLOT(32) = 5;
-    BC_SLOT(38) = 0x5D000000u;               /* init complete */
     sd_ok = true;
     return 0;
 }
 
 /* Bounded equivalents of ROM 0x4bc0 and 0x4794.
  *
- * Both ROM routines spin with NO timeout: 0x4bc0 waits forever for STA bit 2 and
- * 0x4794 waits forever for the RX burst flag. That is fine for the vendor, whose
- * watchdog would reset the device, but here it hung disk_mount_all with no way to
- * tell a hang from a failure. These mirror the ROM's checks exactly - including
- * the R1 error mask 0xfdffe008 from the pool at ROM 0x4cb0 - but give up rather
- * than spin.
+ * Both ROM routines can spin forever. These bounded equivalents return an error
+ * instead, so disk_mount_all cannot hang without reporting a failure.
  */
 /* From SRAM this is a real bound, not a flash-fetch crawl. 4 million iterations
  * per wait, executed from flash, across the reads a FAT mount performs, is
@@ -422,7 +379,7 @@ static uint32_t SDICODE sd_wait_data(unsigned idx)
         return 16;
 
     R(SD_STA) = STA_DONE | STA_ERRMASK;
-    if (ROM_SD_RESP(&sdh, 0) & 0xfdffe008u)  /* R1 error bits, ROM pool 0x4cb0 */
+    if (ROM_SD_RESP(&sdh, 0) & 0xfdffe008u)
         return 33;
     return 0;
 }
@@ -430,7 +387,8 @@ static uint32_t SDICODE sd_wait_data(unsigned idx)
 static uint32_t SDICODE sd_fifo_word(uint32_t *out)
 {
     uint32_t t = 0;
-    while (R(SD_FIFOSTA) & (1u << 2))        /* bit 2 set = RX empty (ROM 0x4602) */
+    /* Bit 2 set means the RX FIFO is empty. */
+    while (R(SD_FIFOSTA) & (1u << 2))
         if (++t > SD_SPIN)
             return 0x7e;
     *out = R(SD_FIFO);
@@ -477,7 +435,8 @@ static void sd_setup_data(uint32_t len)
     R(SD_DATALEN) = len;
 }
 
-int SDICODE sd_read_sectors(IF_MD(int drive,) sector_t start, int count, void *buf)
+int SDICODE sd_read_sectors(IF_MD(int drive,)
+                            sector_t start, int count, void *buf)
 {
     uint8_t *p = buf;
 
@@ -490,22 +449,19 @@ int SDICODE sd_read_sectors(IF_MD(int drive,) sector_t start, int count, void *b
         uint32_t err;
 
         R(SD_STA) = STA_ALLFLAGS;
-        R(SD_DCTRL) |= 8u;                       /* vendor does this first, 0x8227f8 */
+        /* The vendor sets DCTRL before configuring the transfer. */
         sd_setup_data(512);
 
         ROM_SD_CMD(&sdh, 17, sd_addr(start));    /* READ_SINGLE_BLOCK */
         if ((err = sd_wait_data(17)) != 0) {
-            BC_SLOT(39) = 0xE0001100u | (err & 0xff);
             return -2;
         }
         if ((err = sd_read_fifo512(p)) != 0) {
-            BC_SLOT(39) = 0xE0001200u | (err & 0xff);
             return -3;
         }
         p += 512;
         start++;
     }
-    BC_SLOT(39) = 0x5D000001u;
     return 0;
 }
 
@@ -539,7 +495,7 @@ static uint32_t SDICODE sd_wait_ready(void)
 
 /* The data half of a block write, modelled on ROM 0x483a. Two things this does
  * that simply pushing 128 words does not: it checks the data error bits between
- * words, and it waits for DATAEND and clears it afterwards. The command-response
+ * words, waits for DATAEND, and clears the status afterwards.
  * wait is NOT a substitute - it reports on the command, not on the data. */
 static uint32_t SDICODE sd_write_fifo512(const void *buf)
 {
@@ -556,7 +512,7 @@ static uint32_t SDICODE sd_write_fifo512(const void *buf)
             if (sta & (1u << 4)) break;        /* TX ready, ROM 0x4850 */
             if (++t > SD_SPIN) return 0x7b;
         }
-        memcpy(&w, p, 4);                      /* buf is not guaranteed aligned */
+        /* buf is not guaranteed to be aligned. */
         ROM_FIFO_WR(&sdh, &w);
         p += 4;
     }
@@ -571,10 +527,9 @@ static uint32_t SDICODE sd_write_fifo512(const void *buf)
     return 0;
 }
 
-/* SDICODE for the same reason the read path is: this is a per-transfer hot loop
- * spinning on FIFO flags, and run from XIP flash every iteration waits on a SPI
- * fetch. It was the one data path still left in flash. */
-int SDICODE sd_write_sectors(IF_MD(int drive,) sector_t start, int count, const void *buf)
+/* The write path is placed in SRAM because it spins on FIFO flags. */
+int SDICODE sd_write_sectors(IF_MD(int drive,)
+                             sector_t start, int count, const void *buf)
 {
     const uint8_t *p = buf;
 
@@ -585,35 +540,26 @@ int SDICODE sd_write_sectors(IF_MD(int drive,) sector_t start, int count, const 
     while (count--) {
         uint32_t err;
 
-        if ((err = sd_wait_ready()) != 0) {     /* card still busy from before */
-            BC_SLOT(40) = 0xE0002400u | (err & 0xff);
+        /* The card may still be busy from the previous block. */
+        if ((err = sd_wait_ready()) != 0)
             return -4;
-        }
 
         R(SD_STA) = STA_ALLFLAGS;
         R(SD_DCTRL) |= 8u;
         sd_setup_data(512);
 
         ROM_SD_CMD(&sdh, 24, sd_addr(start));    /* WRITE_BLOCK */
-        if ((err = sd_wait_data(24)) != 0) {
-            BC_SLOT(40) = 0xE0002100u | (err & 0xff);
+        if ((err = sd_wait_data(24)) != 0)
             return -2;
-        }
-        if ((err = sd_write_fifo512(p)) != 0) {
-            BC_SLOT(40) = 0xE0002200u | (err & 0xff);
+        if ((err = sd_write_fifo512(p)) != 0)
             return -3;
-        }
         p += 512;
         start++;
     }
 
-    /* Do not return while the card is still committing the last block: the very
-     * next read would be issued into a busy card. */
-    if (sd_wait_ready() != 0) {
-        BC_SLOT(40) = 0xE0002500u;
+    /* Do not return while the card is committing the last block. */
+    if (sd_wait_ready() != 0)
         return -5;
-    }
 
-    BC_SLOT(40) = 0x5D000002u;
     return 0;
 }

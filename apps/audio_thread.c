@@ -36,7 +36,6 @@
 #include "voice_thread.h"
 #include "talk.h"
 #include "settings.h"
-#include "breadcrumb.h"  /* yp3box bring-up instrumentation */
 
 /* Macros to enable logf for queues
    logging on SYS_TIMEOUT can be disabled */
@@ -69,9 +68,7 @@ static void NORETURN_ATTR audio_thread(void)
     struct queue_event ev;
     ev.id = Q_NULL; /* something not in switch below */
 
-    BC_SLOT(64) = 0xA0D10001u;   /* audio thread scheduled and running */
     pcm_postinit();
-    BC_SLOT(64) = 0xA0D10002u;   /* pcm_postinit returned */
 
     while (1)
     {
@@ -161,14 +158,11 @@ void INIT_ATTR audio_init(void)
 
     logf("audio: initializing");
 
-    BC_SLOT(62) = 1;
     /* Initialize queues before giving control elsewhere in case it likes
        to send messages. Thread creation will be delayed however so nothing
        starts running until ready if something yields such as talk_init. */
     queue_init(&audio_queue, true);
-    BC_SLOT(62) = 2;
     codec_thread_init();
-    BC_SLOT(62) = 3;
 
     /* This thread does buffer, so match its priority */
     audio_thread_id = create_thread(audio_thread, audio_stack,
@@ -176,23 +170,18 @@ void INIT_ATTR audio_init(void)
                   IF_PRIO(, MIN(PRIORITY_BUFFERING, PRIORITY_USER_INTERFACE))
                   IF_COP(, CPU));
 
-    BC_SLOT(62) = 4;
     queue_enable_queue_send(&audio_queue, &audio_queue_sender_list,
                             audio_thread_id);
 
-    BC_SLOT(62) = 5;
     playback_init();
-    BC_SLOT(62) = 6;
 #ifdef AUDIO_HAVE_RECORDING
     recording_init();
 #endif
 
     add_event(VOICE_EVENT_IS_PLAYING, audio_voice_event);
-    BC_SLOT(62) = 7;
 
    /* Probably safe to say */
     audio_is_initialized = true;
 
     sound_settings_apply();
-    BC_SLOT(62) = 8;   /* audio_init complete */
 }

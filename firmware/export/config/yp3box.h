@@ -7,13 +7,12 @@
  *   GC9106 128x160 RGB565 panel behind an LCDC at 0x40095000
  */
 #define MODEL_NAME      "anko yp3box"
-#define MODEL_NUMBER    120
+#define MODEL_NUMBER    126
 
 #define CONFIG_CPU          SL6801
 #define CPU_FREQ            192000000
 /* Rate the general-purpose timer API counts at. Same as the core clock: the
- * timer we would drive it from is the Cortex-M SysTick's sibling, and nothing
- * divides it. timer_register() users (doom) need this to compile. */
+ * timer we drive it from is the Cortex-M SysTick's sibling. */
 #define TIMER_FREQ          CPU_FREQ
 
 
@@ -39,14 +38,6 @@
 #define STORAGE_WANTS_ALIGN
 #define SECTOR_SIZE         512
 
-#define CONFIG_BATTERY_MEASURE  VOLTAGE_MEASURE
-#define CONFIG_CHARGING         CHARGING_MONITOR
-#define HAVE_SW_POWEROFF
-#define BATTERY_CAPACITY_DEFAULT 210
-#define BATTERY_CAPACITY_MIN     210
-#define BATTERY_CAPACITY_MAX     210
-#define BATTERY_CAPACITY_INC     0
-
 #define CONFIG_I2C          I2C_NONE
 #define CONFIG_RTC          0
 
@@ -64,10 +55,6 @@
  * taken off the audio buffer (225 KB -> 211 KB), which is affordable; guessing
  * a smaller number is not, because the next guess costs another boot. */
 #define DC_NUM_ENTRIES_OVERRIDE 32
-/* Record panics into breadcrumb slots 200..252 as well as onto the panel; the
- * panel is 20 characters wide and the backtrace runs off the bottom of it.
- * The saved addresses can be symbolised against the matching ELF. */
-#define HAVE_PANIC_BREADCRUMB
 #define HAVE_DUMMY_CODEC
 #define HAVE_SW_VOLUME_CONTROL
 #define HAVE_SW_TONE_CONTROLS
@@ -83,10 +70,6 @@
  * 128 KB covers MP3, Vorbis, WAV and WavPack. FLAC, AAC and Opus do not fit;
  * the measured codec sizes above show what fits in this buffer.
  * This is a 512 KB device, so every byte here comes off the audio buffer. */
-/* Doom is linked into the core image and executed from flash: 228 KB of code
- * against a 64 KB plugin buffer is not a tuning problem. doom.rock is a stub
- * that calls rb->doom_builtin_main(). */
-#define HAVE_BUILTIN_DOOM
 
 #define PLUGIN_BUFFER_SIZE  0x10000
 #define CODEC_SIZE          0x20000

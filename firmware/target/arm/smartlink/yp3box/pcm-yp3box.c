@@ -24,7 +24,7 @@
 #include "pcm.h"
 #include "pcm-internal.h"
 #include "pcm_sink.h"
-#include "sl6801.h"
+#include "sl6801-regs.h"
 
 /* --- audio master clock ---------------------------------------------------
  *
@@ -248,8 +248,8 @@ static void sink_play(const void *addr, size_t size)
 
 static void sink_stop(void)
 {
-    /* audio_stop, FIRM 0xd67024, in its order: interrupt off first so a
-     * transfer completing under us cannot ask for more after we have stopped. */
+    /* Disable the interrupt before stopping DMA, so completion cannot request
+     * another transfer. */
     yp3_irq_disable(IRQ_AUDIO);
     AUDIO_ENABLE &= ~0x3u;
     AUDIO_CTRL   &= ~0x102u;

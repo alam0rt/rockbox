@@ -54,7 +54,6 @@
 #include "wps.h"
 #include "playlist.h"
 #include "core_alloc.h"
-#include "breadcrumb.h"  /* yp3box bring-up instrumentation */
 #include "rolo.h"
 #include "screens.h"
 #include "usb_screen.h"
@@ -172,37 +171,17 @@ int main(int argc, char *argv[])
 int main(void) INIT_ATTR MAIN_NORETURN_ATTR;
 int main(void)
 {
-    BC_SLOT(53) = 0x4A100001u;   /* main() entered */
-    /* The flash-controller register dump that lived here is gone too: the
-     * window question is answered (0x30000024, opened in crt0), and its slots
-     * 12..43 overlapped the SD range at 32..40. */
-    /* The in-firmware register sweep that used to live here is GONE.
-     *
-     * It wrote every flash-controller register including the DMA control,
-     * command, length, flash-address and destination registers, which start
-     * transfers that overwrite SRAM - including the breadcrumb region it was
-     * reporting through. Every run it produced a false hang and false hits, and
-     * it corrupted an otherwise good XIP boot after the answer was already known.
-     *
-     * The window limit register was found from the host instead
-     * (tools/33_window_reg_sweep.sh): 0x30000024, reset value 0, write
-     * 0xffffffff for the full 2MB. crt0 now does that as its first instruction.
-     */
 #endif
     CHART(">init");
     init();
-    BC_SLOT(56) = 99;
-    BC_SLOT(52) = 0x00711FE0u;
     CHART("<init");
     FOR_NB_SCREENS(i)
     {
         screens[i].clear_display();
         screens[i].update();
     }
-    BC_SLOT(76) = 1;    /* first full-screen update after init() returned */
     list_init();
     tree_init();
-    BC_SLOT(76) = 2;
 #if defined(HAVE_DEVICEDATA) && !defined(BOOTLOADER) /* SIMULATOR */
     verify_device_data();
 #endif
@@ -504,9 +483,7 @@ static void init(void)
     int rc;
     bool mounted = false;
 
-    BC_SLOT(54) = 0x4A100002u;   /* init() entered */
     system_init();
-    BC_SLOT(55) = 0x4A100003u;   /* system_init returned */
     core_allocator_init();
     kernel_init();
 
@@ -613,9 +590,7 @@ static void init(void)
     CHART("<viewportmanager_init");
 
     CHART(">storage_init");
-    BC_SLOT(50) = 0x5701A9E0u;          /* about to call storage_init */
     rc = storage_init();
-    BC_SLOT(50) = 0x5701A900u | (rc & 0xff);
     CHART("<storage_init");
     if(rc)
     {
@@ -668,9 +643,7 @@ static void init(void)
     if (!mounted)
     {
         CHART(">disk_mount_all");
-        BC_SLOT(51) = 0x0D15C0E0u;      /* about to mount */
         rc = disk_mount_all();
-        BC_SLOT(51) = 0x0D15C000u | (rc & 0xff);
         CHART("<disk_mount_all");
         if (rc<=0)
         {
@@ -732,7 +705,6 @@ static void init(void)
         }
     }
 
-    BC_SLOT(56) = 1;
     pcm_init();
     dsp_init();
 
@@ -802,12 +774,9 @@ static void init(void)
     shortcuts_init();
 
     CHART(">audio_init");
-    BC_SLOT(56) = 13;
     audio_init();
-    BC_SLOT(56) = 14;               /* audio_init RETURNED */
     CHART("<audio_init");
-    talk_announce_voice_invalid();
-    BC_SLOT(56) = 15; /* notify user w/ voice prompt if voice file invalid */
+    talk_announce_voice_invalid(); /* notify user w/ voice prompt if voice file invalid */
 
 #ifdef HAVE_WIFI
     wifi_init();
@@ -815,7 +784,6 @@ static void init(void)
 
     /* runtime database has to be initialized after audio_init() */
     cpu_boost(false);
-    BC_SLOT(56) = 16;
 
 #if CONFIG_CHARGING
     car_adapter_mode_init();
@@ -836,7 +804,6 @@ static void init(void)
 #endif
     CHART("<settings_apply_skins");
     settings_apply_skins();
-    BC_SLOT(56) = 17;               /* settings_apply_skins returned - init() done */
     CHART(">settings_apply_skins");
 }
 

@@ -22,7 +22,7 @@
 #include "system.h"
 #include "backlight.h"
 #include "backlight-target.h"
-#include "sl6801.h"
+#include "sl6801-regs.h"
 
 #define CLK(o) (*(volatile uint32_t *)(CLKCTRL_BASE + (o)))
 
@@ -131,7 +131,7 @@ yp3_power_down(void)
     /* vendor 0xcf7cf0(0): clear the two-bit field at PMU reg 0 bits 6-7 */
     pmu_write(0, (uint8_t)(pmu_read(0) & ~0xc0u));
 
-    yp3_mask_all_irqs();                            /* vendor 0x80d1b4/0x80d1e0 */
+    yp3_mask_all_irqs();  /* vendor 0x80d1b4/0x80d1e0 */
     yp3_pmu_arm_sleep();
 
     while (1)
@@ -150,10 +150,10 @@ void power_off(void)
 
 bool charging_state(void)
 {
-    return false;   /* TODO: PMU status register; the mailbox above is the way in */
+    return false;   /* PMU status is not available on this target. */
 }
 
 unsigned int power_input_status(void)
 {
-    return POWER_INPUT_NONE;   /* TODO: same */
+    return POWER_INPUT_NONE;  /* PMU status is not available. */
 }

@@ -186,7 +186,8 @@ bool skin_backdrops_preload(void)
             if (*filename && *filename != '-')
             {
 #ifdef AUDIO_BUFFER_RESERVE
-                if (core_allocatable() < buf_size + pcmbuf_size_reqd() + AUDIO_BUFFER_RESERVE)
+                if (core_allocatable() <
+                    buf_size + pcmbuf_size_reqd() + AUDIO_BUFFER_RESERVE)
                 {
                     retval = false;
                     continue;
@@ -332,7 +333,8 @@ void skin_backdrop_load_setting(void)
                 if (backdrops[i].buflib_handle <= 0)
                 {
 #ifdef AUDIO_BUFFER_RESERVE
-                    if (core_allocatable() < LCD_BACKDROP_BYTES + pcmbuf_size_reqd() + AUDIO_BUFFER_RESERVE)
+                    if (core_allocatable() < LCD_BACKDROP_BYTES +
+                        pcmbuf_size_reqd() + AUDIO_BUFFER_RESERVE)
                         return;
 #endif
                     backdrops[i].buflib_handle =

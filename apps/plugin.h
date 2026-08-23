@@ -1046,12 +1046,6 @@ struct plugin_api {
                                    const struct viewport *vp);
     int (*gesture_flick_get)(const struct gesture_event *gevt);
 #endif
-#ifdef HAVE_BUILTIN_DOOM
-    /* Doom lives in the core image on this target - it is far too big to load
-       into the plugin buffer - so doom.rock is a stub that calls in here.
-       See apps/plugins/doom/doom_builtin.c. */
-    enum plugin_status (*doom_builtin_main)(const void *parameter);
-#endif
 };
 
 /* plugin header */
@@ -1091,7 +1085,6 @@ extern unsigned char plugin_end_addr[];
 #define str(x) language_strings[x]
 
 int plugin_load(const char* plugin, const void* parameter);
-const struct plugin_api *plugin_get_api(void);
 
 /* defined by the plugin */
 extern const struct plugin_api *rb;

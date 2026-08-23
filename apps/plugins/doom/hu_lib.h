@@ -45,24 +45,11 @@
  * #define HU_CHARERASE    KEYD_BACKSPACE / not used               / phares
  */
 
-#ifdef HAVE_BUILTIN_DOOM
-/* These sizes are the single biggest block of .bss in the engine: every
-   hu_textline_t carries HU_MAXLINELENGTH*MAXLINES+1 bytes of text, and the
-   widgets hold up to HU_MAXMESSAGES of them. At the stock 80x25 that is 2 KB a
-   line, 32 KB for the message-refresh widget alone, and 75,869 bytes of
-   hu_stuff.c .bss in total - on a 128-pixel-wide screen that shows about twenty
-   characters. Sized for the screen instead. */
-#define HU_MAXLINES   4
-#define HU_MAXLINELENGTH  40
-#define HU_REFRESHSPACING 8
-#define HU_MAXMESSAGES 4
-#else
 #define HU_MAXLINES   4
 #define HU_MAXLINELENGTH  80
 #define HU_REFRESHSPACING 8 /*jff 2/26/98 space lines in text refresh widget*/
 /*jff 2/26/98 maximum number of messages allowed in refresh list */
 #define HU_MAXMESSAGES 16
-#endif
 
 /*
  * Typedefs of widgets
@@ -83,11 +70,7 @@ typedef struct
    int   cm;                         //jff 2/16/52 output color range
 
    // killough 1/23/98: Support multiple lines:
-#ifdef HAVE_BUILTIN_DOOM
-  #define MAXLINES 4
-#else
   #define MAXLINES 25
-#endif
 
    int   linelen;
    char  l[HU_MAXLINELENGTH*MAXLINES+1]; // line of text

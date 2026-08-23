@@ -1,20 +1,9 @@
-/* Device IRQ vectors.
- *
- * These previously all pointed at Rockbox's UIE, which is `while(1)`. The moment
- * the LCDC was properly clocked it began raising interrupts, and the first one
- * hung the machine. Point them at our own handler instead: it records which IRQ
- * fired, masks it, and returns - so an unexpected interrupt yields evidence
- * rather than a lockup.
- *
- * A driver claims its vector by defining the handler symbol and this table
- * naming it. There is deliberately no weak-alias default: the usual CMSIS
- * idiom (.weak name / .thumb_set name, default) was tried here and SILENTLY
- * LOST - the assembler resolved the reference against the weak definition in
- * this same object, so vector 43 still pointed at yp3_spurious_irq with the
- * real handler linked in and unreferenced. The vector table read correctly in
- * nm and wrongly in the image. Name handlers directly; they are all compiled
- * unconditionally anyway.
- */
+/* Device IRQ vectors. Unexpected device interrupts are masked and returned
+ * from the shared handler until a driver claims each vector. */
+
+/* There is deliberately no weak-alias default: the usual CMSIS idiom was
+ * tried here and silently resolved references to the weak definition in this
+ * object. */
     .syntax unified
     .thumb
     .section .vectors.platform,"ax",%progbits

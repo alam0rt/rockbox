@@ -1,7 +1,7 @@
 /* Backlight = PWM channel 3, register base 0x40084080.
  *
  * Reversed from the vendor driver rather than probed:
- *   /dev/pwm_ch3 struct 0x0082bdb0 -> handle table 0x0081e59c[ch+4] = 0x40084080
+ *   /dev/pwm_ch3 struct 0x0082bdb0 -> 0x40084080 in the handle table
  *   0xc483fc(base,on)   [base+0x00] bit4 = enable
  *   0xc4843c(base,on)   [base+0x10] bit0 = run
  *   0xc48430(base,h,l)  [base+0x14] = l | (h<<16)   period
@@ -12,7 +12,6 @@
  */
 #include "config.h"
 #include "backlight-target.h"
-#include "breadcrumb.h"
 #include <stdint.h>
 
 #define PWM3    0x40084080u
@@ -70,11 +69,11 @@
 #define PWM_PERIOD 48000u
 
 /* Mode word for +0x00, from the vendor open path:
- *   0xd7e394:  [base+0x00] = 0x40 ; [base+0x00] |= cfgval
- *   0xd7e314 builds cfgval from the backlight's cfg bytes 03 00 01 0f:
- *     (1<<4)&0x10 | (0<<7)&0xff | (0x0f&0x0f) | (1<<5)&0x20  ==  0x3f
- * so the mode register ends up 0x7f. Setting only bit4 (0x10), as we did, leaves
- * the PWM unconfigured and it never drives the pin. */
+ *   0xd7e394: [base+0x00] = 0x40; [base+0x00] |= cfgval
+ *   0xd7e314 builds cfgval from the backlight cfg bytes 03 00 01 0f:
+ *     (1<<4)&0x10 | (0<<7)&0xff | (0x0f&0x0f) | (1<<5)&0x20 == 0x3f
+ * so the mode register ends up 0x7f. Setting only bit4 (0x10), as we did,
+ * leaves the PWM unconfigured and it never drives the pin. */
 #define PWM_MODE 0x7fu
 
 void backlight_hw_on(void)
@@ -103,7 +102,6 @@ bool backlight_hw_init(void)
 {
     volatile uint32_t d;
 
-    BC_SLOT(26) = 0xB1000000u;
 
     ROM_GPIO_CFG1(PWM3_OUT_PIN);        /* mux the PWM output pad */
 
@@ -116,23 +114,8 @@ bool backlight_hw_init(void)
     PWMR(0x14) = PWM_PERIOD;            /* period, per vendor */
     PWMR(0x18) = PWM_PERIOD;            /* duty = period -> 100% */
 
-    /* The blink test that used to live here has been removed.
-     *
-     * It toggled the pad 8 times with multi-million-iteration busy loops, which
-     * took several seconds. That WAS the "boot loop": off -> white -> off was
-     * the blink, not a reset. Because reading breadcrumbs means resetting the
-     * device, every dump caught this function mid-blink, so slot 27 never got
-     * written and progress appeared to stop in a different place each run. It
-     * answered its question - the pad drives the backlight, active high - and
-     * then cost several cycles by masquerading as a crash. */
 
     backlight_hw_on();
-    BC_SLOT(31) = 0xB11E0000u;   /* backlight path completed */
-    for (d = 0; d < 5000; d++) ;
 
-    BC_SLOT(27) = 0xB1D30000u;
-    BC_SLOT(28) = PWMR(0x00);
-    BC_SLOT(29) = PWMR(0x10);
-    BC_SLOT(30) = PWMR(0x18);
     return true;
 }
