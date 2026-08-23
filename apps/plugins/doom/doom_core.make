@@ -41,6 +41,34 @@ DOOMCORE_FLAGS = $(CFLAGS) -I$(APPSDIR) -I$(APPSDIR)/gui -I$(APPSDIR)/recorder \
                   -Wno-strict-prototypes -O2 -fno-strict-aliasing -fgnu89-inline \
                   -Wno-stringop-truncation
 
+DOOMSTUB := $(BUILDDIR)/apps/plugins/doom.rock
+DOOMSTUB_OBJ := $(BUILDDIR)/apps/plugins/doom.o
+DOOMSTUB_CRT0 := $(BUILDDIR)/apps/plugins/plugin_crt0.o
+DOOMSTUB_LDS := $(BUILDDIR)/apps/plugins/plugin.link
+DOOMSTUB_FLAGS = $(CFLAGS) -DPLUGIN -I$(APPSDIR) -I$(APPSDIR)/gui \
+                 -I$(APPSDIR)/recorder -I$(APPSDIR)/plugins
+
+# The target disables the general plugin suite, but the browser still needs the
+# small standard .rock launcher for built-in Doom. Keep this path independent of
+# plugins.make so building the launcher cannot pull in every plugin library.
+build: $(DOOMSTUB)
+$(DOOMSTUB_LDS): $(APPSDIR)/plugins/plugin.lds $(FIRMDIR)/export/config/$(MODELNAME).h
+	$(call PRINTS,PP $(@F))
+	$(shell mkdir -p $(dir $@))
+	$(call preprocess2file,$<,$@,-DPLUGIN)
+$(DOOMSTUB_OBJ): $(APPSDIR)/plugins/doom.c $(APPSDIR)/plugin.h
+	$(SILENT)mkdir -p $(dir $@)
+	$(call PRINTS,CC $(subst $(ROOTDIR)/,,$<))$(CC) $(DOOMSTUB_FLAGS) -c $< -o $@
+
+$(DOOMSTUB_CRT0): $(APPSDIR)/plugins/plugin_crt0.c $(APPSDIR)/plugin.h
+	$(SILENT)mkdir -p $(dir $@)
+	$(call PRINTS,CC $(subst $(ROOTDIR)/,,$<))$(CC) $(DOOMSTUB_FLAGS) -c $< -o $@
+
+$(DOOMSTUB): $(DOOMSTUB_OBJ) $(DOOMSTUB_CRT0) $(DOOMSTUB_LDS) $(SETJMPLIB)
+	$(call PRINTS,LD $(@F))$(CC) $(DOOMSTUB_FLAGS) -nostdlib -o $@.elf \
+		$(DOOMSTUB_OBJ) $(DOOMSTUB_CRT0) $(SETJMPLIB) -lgcc -T$(DOOMSTUB_LDS)
+	$(call PRINTS,OC $(@F))$(OC) -S -x $@.elf $@
+
 $(DOOMCORE_OBJ): $(BUILDDIR)/%.o: $(ROOTDIR)/%.c
 	$(SILENT)mkdir -p $(dir $@)
 	$(call PRINTS,CC $(subst $(ROOTDIR)/,,$<))$(CC) $(DOOMCORE_FLAGS) -c $< -o $@
