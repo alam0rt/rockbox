@@ -514,6 +514,7 @@ static uint32_t SDICODE sd_write_fifo512(const void *buf)
             if (++t > SD_SPIN) return 0x7b;
         }
         /* buf is not guaranteed to be aligned. */
+        memcpy(&w, p, 4);
         ROM_FIFO_WR(&sdh, &w);
         p += 4;
     }
