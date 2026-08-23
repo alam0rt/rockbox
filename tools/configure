@@ -4098,7 +4098,29 @@ fi
     t_model="shanlingq1"
     ;;
 
-    270|echor1)
+    280|yp3box)
+    target_id=120
+    modelname="yp3box"
+    target="YP3BOX"
+    memory=1
+    armcortexm7cc
+    appextra="recorder:gui"
+    plugins=""
+    tool="cp "
+    boottool="cp "
+    output="rockbox.yp3"
+    bootoutput="bootloader.yp3"
+    sysfontbl="08-Rockfont"
+    sysfont="08-Rockfont"
+    toolset="$genericbitmaptools"
+    bmp2rb_mono="$rootdir/tools/bmp2rb -f 0"
+    bmp2rb_native="$rootdir/tools/bmp2rb -f 4"
+    t_cpu="arm"
+    t_manufacturer="smartlink"
+    t_model="yp3box"
+    ;;
+
+   270|echor1)
     target_id=119
     modelname="echor1"
     target="ECHO_R1"

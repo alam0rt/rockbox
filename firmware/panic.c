@@ -37,6 +37,12 @@
 #include "backtrace.h"
 #endif
 
+#ifdef HAVE_PANIC_BREADCRUMB
+#include <stdint.h>
+/* target-supplied; records the panic where a reset cannot erase it */
+void panic_log_target(const char *msg, uint32_t pc, uint32_t sp);
+#endif
+
 #if (defined(CPU_MIPS) && (CONFIG_PLATFORM & PLATFORM_NATIVE))
 /* TODO: see comment above exception_dump in system-mips.c */
 char panic_buf[128];
@@ -95,6 +101,13 @@ void panicf( const char *fmt, ...)
     va_start( ap, fmt );
     vsnprintf( panic_buf, sizeof(panic_buf), fmt, ap );
     va_end( ap );
+
+#ifdef HAVE_PANIC_BREADCRUMB
+    /* Log before touching the LCD: the panel shows about twenty characters a
+     * line and the backtrace runs off the bottom, and a panic raised from the
+     * display path itself would never reach the screen at all. */
+    panic_log_target(panic_buf, (uint32_t)pc, (uint32_t)sp);
+#endif
 
     lcd_set_viewport(NULL);
 

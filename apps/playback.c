@@ -25,6 +25,7 @@
 #include "kernel.h"
 #include "panic.h"
 #include "core_alloc.h"
+#include "breadcrumb.h"  /* yp3box bring-up instrumentation */
 #include "sound.h"
 #include "pcm_sink.h"
 #include "codecs.h"
@@ -861,7 +862,9 @@ static void scratch_mem_init(void *mem)
 }
 
 static int audiobuf_handle;
+#ifndef AUDIO_BUFFER_RESERVE
 #define AUDIO_BUFFER_RESERVE (256*1024)
+#endif
 static size_t filebuflen;
 
 
@@ -4342,10 +4345,14 @@ void INIT_ATTR playback_init(void)
 {
     logf("playback: initializing");
 
+    BC_SLOT(63) = 1;
     /* Initialize the track buffering system */
     mutex_init(&id3_mutex);
+    BC_SLOT(63) = 2;
     track_list_init();
+    BC_SLOT(63) = 3;
     buffering_init();
+    BC_SLOT(63) = 4;
 #ifdef HAVE_CROSSFADE
     /* Set crossfade setting for next buffer init which should be about... */
     pcmbuf_request_crossfade_enable(global_settings.crossfade);
@@ -4353,4 +4360,5 @@ void INIT_ATTR playback_init(void)
 #ifdef HAVE_DISK_STORAGE
     audio_set_buffer_margin(global_settings.buffer_margin);
 #endif
+    BC_SLOT(63) = 6;   /* playback_init complete */
 }

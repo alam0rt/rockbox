@@ -91,7 +91,10 @@
  * volumes that would slow cache probing. IOC_MAP_NUM_ENTRIES is the number
  * for each map per volume. The buffers themselves are shared.
  */
-#if MEMORYSIZE < 8
+#if defined(DC_NUM_ENTRIES_OVERRIDE)
+#define DC_NUM_ENTRIES      DC_NUM_ENTRIES_OVERRIDE
+#define DC_MAP_NUM_ENTRIES  64
+#elif MEMORYSIZE < 8
 #define DC_NUM_ENTRIES      32
 #define DC_MAP_NUM_ENTRIES  128
 #else

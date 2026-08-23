@@ -130,6 +130,11 @@ OUTPUT_FORMAT(elf32-littlemips)
 #define DRAMORIG STM32_SDRAM1_BASE
 #define DRAMSIZE (MEMORYSIZE * 0x100000) - PLUGIN_BUFFER_SIZE - CODEC_SIZE
 
+#elif CONFIG_CPU == SL6801
+/* 512 KB SRAM; code XIPs from flash so RAM holds only data and buffers */
+#define DRAMORIG 0x00800000
+#define DRAMSIZE (512 * 1024) - PLUGIN_BUFFER_SIZE - CODEC_SIZE
+
 #else
 # error "DRAM/IRAM memory map not defined!"
 #endif

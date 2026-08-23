@@ -1207,6 +1207,10 @@ static struct buflib_callbacks ops = {
 
 void tree_mem_init(void)
 {
+#ifdef MAX_FILES_IN_DIR_LIMIT
+    if (global_settings.max_files_in_dir > MAX_FILES_IN_DIR_LIMIT)
+        global_settings.max_files_in_dir = MAX_FILES_IN_DIR_LIMIT;
+#endif
     /* initialize tree context struct */
     struct tree_cache* cache = &tc.cache;
     memset(&tc, 0, sizeof(tc));

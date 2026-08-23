@@ -25,6 +25,7 @@
 #include "kernel.h"
 #include "codecs.h"
 #include "codec_thread.h"
+#include "breadcrumb.h"  /* yp3box bring-up instrumentation */
 #include "pcm_mixer.h"
 #include "pcmbuf.h"
 #include "audio_thread.h"
@@ -591,6 +592,8 @@ static void do_callback(void (* callback)(void))
 static void NORETURN_ATTR codec_thread(void)
 {
     struct queue_event ev;
+
+    BC_SLOT(65) = 0xC0DEC001u;   /* codec thread scheduled and running */
 
     while (1)
     {

@@ -84,7 +84,11 @@ static inline unsigned int data_level(int quarter_secs)
 #define LOW_DATA            data_level(4)
 #else
 #define PCMBUF_WATERMARK    (BYTERATE / 4)  /* 0.25 seconds */
+#ifdef PCM_MIN_BUFFER_DIVISOR
+#define MIN_BUFFER_SIZE     (BYTERATE / PCM_MIN_BUFFER_DIVISOR)
+#else
 #define MIN_BUFFER_SIZE     (BYTERATE * 1)
+#endif
 /* under watermark is low data */
 #define LOW_DATA            pcmbuf_watermark
 #endif

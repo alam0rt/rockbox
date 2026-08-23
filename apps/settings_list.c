@@ -411,7 +411,9 @@ static const char graphic_numeric[] = "graphic,numeric";
 #define DEFAULT_THEME_SELECTOR_TEXT LCD_RGBPACK(0x00, 0x00, 0x00)
 #define DEFAULT_THEME_SEPARATOR  LCD_RGBPACK(0x80, 0x80, 0x80)
 
+#ifndef DEFAULT_BACKDROP
 #define DEFAULT_BACKDROP    BACKDROP_DIR "/cabbiev2.bmp"
+#endif
 
 #ifdef HAVE_RECORDING
 /* these should be in the config.h files */

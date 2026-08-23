@@ -678,7 +678,9 @@ target/arm/mmu-arm.S
 target/arm/bits-armv6.S
 target/arm/mmu-armv6.S
 # elif ARM_ARCH == 7 && ARM_PROFILE == ARM_PROFILE_MICRO
+#  if CONFIG_CPU != SL6801
 target/arm/cpucache-armv7m.c
+#  endif
 # endif
 
 #if defined(CPU_ARM_CLASSIC)
@@ -1969,6 +1971,24 @@ target/arm/stm32/system-stm32h7.c
 target/arm/stm32/timer-stm32h7.c
 #if defined(HAVE_USBSTACK)
 target/arm/stm32/usb-stm32h7.c
+#endif
+#endif
+
+#if CONFIG_CPU == SL6801
+target/arm/smartlink/yp3box/crt0-sl6801.S
+target/arm/smartlink/yp3box/system-yp3box.c
+target/arm/smartlink/yp3box/sd-yp3box.c
+target/arm/smartlink/yp3box/stubs-yp3box.c
+target/arm/smartlink/yp3box/timer-yp3box.c
+target/arm/smartlink/yp3box/vectors-sl6801.S
+target/arm/smartlink/yp3box/cpucache-sl6801.c
+target/arm/smartlink/yp3box/lcd-yp3box.c
+target/arm/smartlink/yp3box/button-yp3box.c
+target/arm/smartlink/yp3box/backlight-yp3box.c
+target/arm/smartlink/yp3box/power-yp3box.c
+target/arm/smartlink/yp3box/powermgmt-yp3box.c
+#ifndef BOOTLOADER
+target/arm/smartlink/yp3box/pcm-yp3box.c
 #endif
 #endif
 

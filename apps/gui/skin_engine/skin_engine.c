@@ -35,6 +35,7 @@
 #endif
 #include "gui/list.h"
 #include "skin_engine.h"
+#include "breadcrumb.h"  /* yp3box bring-up instrumentation */
 #include "skin_buffer.h"
 #include "statusbar-skinned.h"
 #include "wps_internals.h"
@@ -166,10 +167,13 @@ void settings_apply_skins(void)
 {
     int i;
 
+    BC_SLOT(67) = 1;
     if (audio_status() & AUDIO_STATUS_PLAY)
         audio_stop();
 
+    BC_SLOT(67) = 2;
     bool first_run = skin_backdrop_init();
+    BC_SLOT(67) = 3;
 
     if (!first_run)
     {
@@ -180,6 +184,7 @@ void settings_apply_skins(void)
                 skin_reset_buffers(i, j);
         }
     }
+    BC_SLOT(67) = 4;
     skins_initialised = true;
 
     /* Make sure each skin is loaded */
@@ -190,17 +195,25 @@ void settings_apply_skins(void)
             gui_skin_reset(&skins[i][j]);
             skins[i][j].gui_wps.display = &screens[j];
             if (skin_helpers[i]->load_on_boot)
+            {
+                BC_SLOT(68) = 0x5C000000u | (i << 8) | j;
                 skin_get_gwps(i, j);
+                BC_SLOT(68) = 0x5C0000FFu | (i << 8) | j;
+            }
         }
     }
 
     /* any backdrop that was loaded with "-" has to be reloaded because
      * the setting may have changed */
+    BC_SLOT(67) = 5;
     skin_backdrop_load_setting();
+    BC_SLOT(67) = 6;
     viewportmanager_theme_changed(THEME_STATUSBAR);
+    BC_SLOT(67) = 7;
 
     FOR_NB_SCREENS(i)
         skin_backdrop_show(sb_get_backdrop(i));
+    BC_SLOT(67) = 8;   /* settings_apply_skins COMPLETE */
 }
 
 static void skin_load(enum skinnable_screens skin, enum screen_type screen,
@@ -208,12 +221,15 @@ static void skin_load(enum skinnable_screens skin, enum screen_type screen,
 {
     bool loaded = false;
 
+    BC_SLOT(69) = 1;
     skin_helpers[skin]->process(screen, &skins[skin][screen].data, true);
+    BC_SLOT(69) = 2;
 
     if (filename && *filename)
         loaded = skin_data_load(screen, &skins[skin][screen].data,
                                 filename, true, &skins[skin][screen].stats);
 
+    BC_SLOT(69) = 3;
     if (!loaded && skin_helpers[skin]->default_skin)
     {
         loaded = skin_data_load(screen, &skins[skin][screen].data,
@@ -222,8 +238,10 @@ static void skin_load(enum skinnable_screens skin, enum screen_type screen,
         skins[skin][screen].failsafe_loaded = loaded;
     }
 
+    BC_SLOT(69) = 4;
     skins[skin][screen].needs_full_update = true;
     skin_helpers[skin]->process(screen, &skins[skin][screen].data, false);
+    BC_SLOT(69) = 5;   /* skin_load complete */
 #ifdef HAVE_BACKDROP_IMAGE
     if (loaded)
         skin_backdrops_preload();

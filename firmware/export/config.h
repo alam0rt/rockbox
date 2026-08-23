@@ -82,6 +82,7 @@
 #define RK27XX       2700
 #define X1000        1000
 #define STM32H743   32743
+#define SL6801       6801
 #define N10480H     10480
 
 /* platforms
@@ -153,6 +154,7 @@
 #define FIIO_M3K_PAD       73
 #define SHANLING_Q1_PAD    74
 #define ECHO_R1_PAD        75
+#define YP3BOX_PAD         81
 #define SURFANS_F28_PAD    76
 #define RG_NANO_PAD        77
 #define CTRU_PAD           78
@@ -274,6 +276,7 @@
 #define LCD_SHANLING_Q1   70 /* as used by the Shanling Q1 */
 #define LCD_EROSQ         71 /* as used by the ErosQ (native) */
 #define LCD_ECHO_R1       72 /* ILI9342, as used by the Echo R1 */
+#define LCD_YP3BOX        73 /* GC9106, as used by the anko yp3 */
 
 /* LCD_PIXELFORMAT */
 #define HORIZONTAL_PACKING 1
@@ -571,6 +574,8 @@ Lyre prototype 1 */
 #include "config/erosqnative.h"
 #elif defined(ECHO_R1)
 #include "config/echor1.h"
+#elif defined(YP3BOX)
+#include "config/yp3box.h"
 #elif defined(SURFANS_F28)
 #include "config/surfansf28.h"
 #elif defined(RG_NANO)

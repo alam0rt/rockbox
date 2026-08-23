@@ -182,6 +182,10 @@ static void plugin_check_open_close__exit(void)
 
 #endif /* HAVE_PLUGIN_CHECK_OPEN_CLOSE */
 
+#ifdef HAVE_BUILTIN_DOOM
+enum plugin_status doom_builtin_main(const void *parameter);
+#endif
+
 static const struct plugin_api rockbox_api = {
     rbversion,
     &global_settings,
@@ -880,10 +884,20 @@ static const struct plugin_api rockbox_api = {
     gesture_flick_get_in_vp,
     gesture_flick_get,
 #endif
+#ifdef HAVE_BUILTIN_DOOM
+    doom_builtin_main,
+#endif
 };
 
 static int plugin_buffer_handle;
 static size_t plugin_buffer_size;
+
+/* The API struct is private to this file, and a built-in plugin has no loader
+   to hand it over - see apps/plugins/doom/doom_builtin.c. */
+const struct plugin_api *plugin_get_api(void)
+{
+    return &rockbox_api;
+}
 
 int plugin_load(const char* plugin, const void* parameter)
 {

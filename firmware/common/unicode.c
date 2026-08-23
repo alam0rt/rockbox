@@ -92,7 +92,9 @@ struct cp_info
     const char  *name;
 };
 
+#ifndef MAX_CP_TABLE_SIZE
 #define MAX_CP_TABLE_SIZE  32768
+#endif
 
 #define CPF_ISO "iso.cp"
 #define CPF_932 "932.cp"  /* SJIS    */

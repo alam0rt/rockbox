@@ -25,6 +25,11 @@
 #include "backtrace.h"
 #include "safe_read.h"
 
+#ifdef HAVE_PANIC_BREADCRUMB
+#include <stdint.h>
+void panic_log_frame(uint32_t addr);
+#endif
+
 /***************************************************************************
  * Prototypes
  ***************************************************************************/
@@ -81,6 +86,11 @@ static Boolean CliReport(void *data, Int32 address)
               (address & 0x1) ? 'T' : 'A',
               address & (~0x1));
     lcd_update();
+
+#ifdef HAVE_PANIC_BREADCRUMB
+    /* the panel holds only the first frame or two; keep the whole chain */
+    panic_log_frame((uint32_t)address);
+#endif
 
     return TRUE;
 }

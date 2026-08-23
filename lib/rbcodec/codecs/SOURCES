@@ -1,9 +1,20 @@
 /* decoders */
 
+/* A codec is linked against codec.lds, which places its .bss in a region sized
+   by CODEC_SIZE, so a codec bigger than the target's codec buffer fails to LINK
+   rather than failing to load. The gates below keep small-memory targets
+   buildable and are inert everywhere else: every other target has
+   CODEC_SIZE >= 0x48000, the smallest codec buffer in the tree.
+
+   The 0x21000 figure for Opus is measured - it overflows a 0x20000 buffer by
+   2456 bytes on ARM. The 0x48000 group is not a per-codec measurement: those
+   codecs need between 155 KB and 285 KB and are excluded together. */
+
+#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x21000
 opus.c
+#endif
 vorbis.c
 mpa.c
-flac.c
 wav.c
 a52.c
 wavpack.c
@@ -11,15 +22,9 @@ wavpack.c
 alac.c
 #endif
 cook.c
-raac.c
 a52_rm.c
 atrac3_rm.c
 atrac3_oma.c
-mpc.c
-wma.c
-ape.c
-asap.c
-aac.c
 spc.c
 mod.c
 shorten.c
@@ -31,21 +36,32 @@ au.c
 vox.c
 wav64.c
 tta.c
-wmapro.c
 ay.c
 #ifdef HAVE_FPU
 vtx.c
 #endif
 gbs.c
-hes.c
-nsf.c
-sgc.c
-vgm.c
 #if MEMORYSIZE > 2
 sid.c
 kss.c
 #endif
+
+/* need a full-size codec buffer, see above */
+#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x48000
+flac.c
+aac.c
 aac_bsf.c
+raac.c
+ape.c
+mpc.c
+wma.c
+wmapro.c
+asap.c
+hes.c
+nsf.c
+sgc.c
+vgm.c
+#endif
 
 #ifdef HAVE_RECORDING
 

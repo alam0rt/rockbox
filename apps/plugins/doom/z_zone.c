@@ -241,7 +241,18 @@ void Z_Init(void)
 
    // Allocate the memory
 
+#ifdef HAVE_BUILTIN_DOOM
+   /* A built-in Doom must not take the audio buffer: that is buflib's arena,
+      and the engine's own data already occupies the overlay window. The heap is
+      what is left of that window - see app.lds and doom_builtin.c. */
+   {
+      extern unsigned char __doom_heap_start[], __doom_heap_end[];
+      zonebase = (memblock_t *)__doom_heap_start;
+      size = __doom_heap_end - __doom_heap_start;
+   }
+#else
    zonebase=rb->plugin_get_audio_buffer(&size);
+#endif
    size-=2*(HEADER_SIZE + CACHE_ALIGN);  // Leave space for header and CACHE_ALIGN
    size = (size+CHUNK_SIZE-1) & ~(CHUNK_SIZE-1);  // round to chunk size
    size += HEADER_SIZE + CACHE_ALIGN;

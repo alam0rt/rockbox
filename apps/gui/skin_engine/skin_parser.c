@@ -34,6 +34,7 @@
 #include "skin_buffer.h"
 #include "skin_debug.h"
 #include "skin_parser.h"
+#include "breadcrumb.h"  /* yp3box bring-up instrumentation */
 #include "tag_table.h"
 
 #ifdef __PCTOOL__
@@ -2616,12 +2617,18 @@ bool skin_data_load(enum screen_type screen, struct wps_data *wps_data,
     skin_clear_stats(stats);
     /* get buffer space from the plugin buffer */
     size_t buffersize = 0;
+    BC_SLOT(70) = 1;
     wps_buffer = (char *)plugin_get_buffer(&buffersize);
+    BC_SLOT(70) = 2;
+    BC_SLOT(71) = (uint32_t)wps_buffer;
+    BC_SLOT(72) = (uint32_t)buffersize;
 
     if (!wps_buffer)
         return false;
 
+    BC_SLOT(70) = 3;
     skin_data_reset(wps_data);
+    BC_SLOT(70) = 4;
     wps_data->wps_loaded = false;
     curr_screen = screen;
     curr_line = NULL;
@@ -2667,8 +2674,11 @@ bool skin_data_load(enum screen_type screen, struct wps_data *wps_data,
     wps_data->backdrop_id = -1;
 #endif
     /* parse the skin source */
+    BC_SLOT(70) = 5;
     skin_buffer_init(skin_buffer, buffersize);
+    BC_SLOT(70) = 6;
     struct skin_element *tree = skin_parse(wps_buffer, skin_element_callback, wps_data);
+    BC_SLOT(70) = 7;
     wps_data->tree = PTRTOSKINOFFSET(skin_buffer, tree);
     if (!SKINOFFSETTOPTR(skin_buffer, wps_data->tree)) {
 #ifdef DEBUG_SKIN_ENGINE
@@ -2691,6 +2701,7 @@ bool skin_data_load(enum screen_type screen, struct wps_data *wps_data,
         snprintf(bmpdir, MAX_PATH, "%s", BACKDROP_DIR);
     }
     /* load the bitmaps that were found by the parsing */
+    BC_SLOT(70) = 8;
     if (!load_skin_bitmaps(wps_data, bmpdir) ||
         !skin_load_fonts(wps_data))
     {
@@ -2708,7 +2719,9 @@ bool skin_data_load(enum screen_type screen, struct wps_data *wps_data,
     }
 #endif
 #ifndef __PCTOOL__
+    BC_SLOT(70) = 9;
     wps_data->buflib_handle = core_alloc(skin_buffer_usage());
+    BC_SLOT(70) = 10;
     if (wps_data->buflib_handle > 0)
     {
         wps_data->wps_loaded = true;

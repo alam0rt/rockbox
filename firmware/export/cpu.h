@@ -60,6 +60,8 @@
 #include "x1000.h"
 #elif CONFIG_CPU == STM32H743
 #include "stm32h743.h"
+#elif CONFIG_CPU == SL6801
+#include "sl6801.h"
 #endif
 
 #if (CONFIG_PLATFORM & PLATFORM_NATIVE) && (defined(CPU_ARM) || defined(CPU_MIPS))

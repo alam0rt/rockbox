@@ -35,6 +35,7 @@
 #include "playback.h"
 #endif
 #include "buffering.h"
+#include "breadcrumb.h"  /* yp3box bring-up instrumentation */
 #include "linked_list.h"
 
 /* Define LOGF_ENABLE to enable logf output in this file */
@@ -1680,6 +1681,7 @@ void INIT_ATTR buffering_init(void)
                                       ***
        Whoever is using buffering should be responsible enough to clear all
        the handles at the right time. */
+    BC_SLOT(66) = 0xB0FFE001u;   /* buffering_init: about to create thread */
     queue_init(&buffering_queue, false);
     buffering_thread_id = create_thread( buffering_thread, buffering_stack,
             sizeof(buffering_stack), CREATE_THREAD_FROZEN,
@@ -1688,6 +1690,7 @@ void INIT_ATTR buffering_init(void)
 
     queue_enable_queue_send(&buffering_queue, &buffering_queue_sender_list,
                             buffering_thread_id);
+    BC_SLOT(66) = 0xB0FFE002u;   /* buffering_init returned */
 }
 
 /* Initialise the buffering subsystem */
