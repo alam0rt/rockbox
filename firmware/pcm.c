@@ -84,6 +84,9 @@ static volatile bool pcm_is_ready[PCM_SINK_NUM] SHAREDBSS_ATTR = { false };
 extern struct pcm_sink iap_pcm_sink;
 #endif
 
+_Static_assert(PCM_SINK_COUNT == PCM_SINK_NUM,
+               "PCM_SINK_COUNT is out of step with enum pcm_sink_ids");
+
 static struct pcm_sink* sinks[PCM_SINK_NUM] = {
     [PCM_SINK_BUILTIN] = &builtin_pcm_sink,
 #ifdef USB_ENABLE_IAP
@@ -327,19 +330,19 @@ bool pcm_switch_sink(enum pcm_sink_ids sink)
     }
 
     /*
-     * If PCM_SINK_NUM == 1, GCC 9.5 can infer that cur_sink
-     * must be nonzero here (because of the above checks) and
-     * issue a -Warray-bounds warning. This only happens on
-     * some architectures (ARM), and oddly enough, only when
-     * cur_sink is an enum type.
+     * With one sink the two tests above are exhaustive, so nothing below is
+     * reachable: `sink` can only be PCM_SINK_BUILTIN, and cur_sink == sink
+     * has already returned. GCC sees that too, concludes cur_sink != 0 here,
+     * and warns that sinks[cur_sink] is past the end of a one-element array.
      *
-     * Since this situation isn't possible outside of memory
-     * corruption we can just tell the compiler to assume it
-     * can't happen. This avoids the warning, and saves a bit
-     * of code size since none of the code below is reachable
-     * when there's only one PCM sink.
+     * ASSUME(cur_sink < PCM_SINK_NUM) used to paper over that, but it only
+     * hands the compiler a contradiction rather than removing the dead code,
+     * and GCC 15 warns through it. Compile the body out instead, which is
+     * what the ASSUME was trying to achieve.
      */
-    ASSUME(cur_sink < PCM_SINK_NUM);
+#if PCM_SINK_COUNT == 1
+    return false;
+#else
 
     /* save current sink before switching */
     struct pcm_sink* old_sink = sinks[cur_sink];
@@ -364,6 +367,7 @@ bool pcm_switch_sink(enum pcm_sink_ids sink)
     }
 
     return true;
+#endif /* PCM_SINK_COUNT == 1 */
 }
 
 void pcm_play_data(pcm_play_callback_type get_more,

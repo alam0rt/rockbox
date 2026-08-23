@@ -65,5 +65,14 @@ enum pcm_sink_ids {
     PCM_SINK_NUM
 };
 
+/* The same count, visible to the preprocessor: PCM_SINK_NUM is an enumerator,
+ * so it cannot be tested with #if, and pcm.c needs to compile out the
+ * sink-switching path entirely when there is only one sink. */
+#ifdef USB_ENABLE_IAP
+#define PCM_SINK_COUNT 2
+#else
+#define PCM_SINK_COUNT 1
+#endif
+
 /* defined in each platform pcm source */
 extern struct pcm_sink builtin_pcm_sink;
