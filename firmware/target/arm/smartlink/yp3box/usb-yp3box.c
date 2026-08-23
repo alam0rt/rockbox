@@ -298,8 +298,12 @@ static struct usb_msc_ops usb_msc_ops = {
 static void __attribute__((section(".icode"), noinline))
 usb_hw_enable(void)
 {
-    if (!ROM_CLK_IS_ON(USB_MODULE))
-        ROM_CLK_ENABLE(USB_MODULE);
+    /* Unconditionally, as the vendor does at FIRM 0xd66d98 - it calls ROM
+     * 0x2564 straight, with no is-it-already-on check. */
+    ROM_CLK_ENABLE(USB_MODULE);
+    /* The vendor's delay(2000) here is ROM 0xb730, a raw three-instruction
+     * spin, so about 30us at 192 MHz - not a millisecond delay. 2 ms is
+     * generous and costs nothing on this path. */
     udelay(2000);                       /* FIRM 0xd66d9e */
 
     ROM_CLK_SET_SRC(USB_CLOCK, USB_CLOCK_SRC);
@@ -331,6 +335,36 @@ void usb_init_device(void)
 /* usb.c's non-usbstack slave mode has already unmounted the disk, reset
  * storage and called storage_enable(false) by the time this runs, so the card
  * is ours to hand over. */
+/* The controller registers, for the probe below. The ROM's USB code reaches
+ * 0x40040001 (0x5204), 0x4004000b (0x5572), 0x4004000e and 0x40040012
+ * (0x5118..0x5136) - the same page pcm-yp3box.c writes for audio DMA, which
+ * is worth knowing but is not in play here: nothing plays during USB mode. */
+#define USBC(o)             REG8(0x40040000u + (o))
+
+static void usb_log_state(const char *when)
+{
+    logf("usb %s: mod23=%d clk sys40000000=%08lx", when,
+         ROM_CLK_IS_ON(USB_MODULE), (unsigned long)USB_SYS_ENABLE);
+    logf("usb %s: 00=%02x 01=%02x 0b=%02x 0e=%02x 12=%04x", when,
+         USBC(0x00), USBC(0x01), USBC(0x0b), USBC(0x0e),
+         REG16(0x40040012));
+}
+
+/* Does the register file answer at all? The failure signatures differ:
+ * a module that is off reads back zero, a module that is on with no committed
+ * clock holds values but never transfers. Write a pattern into the endpoint
+ * index register, read it back, put it back. */
+static void usb_probe_regs(void)
+{
+    uint8_t saved = USBC(0x0e);
+
+    USBC(0x0e) = 0x55;
+    logf("usb probe: wrote 55 to 0e, read %02x", USBC(0x0e));
+    USBC(0x0e) = 0x2a;
+    logf("usb probe: wrote 2a to 0e, read %02x", USBC(0x0e));
+    USBC(0x0e) = saved;
+}
+
 void usb_enable(bool on)
 {
     logf("usb_enable(%d)", on);
@@ -343,10 +377,22 @@ void usb_enable(bool on)
         msc_blocks_left = 0;
         MSC_STATE = MSC_ST_IDLE;
 
+        usb_log_state("pre");
         usb_hw_enable();
+        usb_log_state("post-clk");
+        usb_probe_regs();
+
         usb_exposed = true;
         ROM_USB_SET_USERFN(&usb_msc_ops);
         ROM_USB_ATTACH();
+        usb_log_state("post-attach");
+        logf("usb: vtor=%08lx irq41=%08lx irq42=%08lx",
+             (unsigned long)REG32(0xE000ED08),
+             (unsigned long)REG32(0x00800000 + (41 + 16) * 4),
+             (unsigned long)REG32(0x00800000 + (42 + 16) * 4));
+        logf("usb: iser1=%08lx userfn=%08lx",
+             (unsigned long)REG32(0xE000E104),
+             (unsigned long)REG32(0x00801068));
     } else {
         if (!usb_exposed)
             return;
