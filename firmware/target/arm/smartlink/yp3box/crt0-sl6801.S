@@ -76,10 +76,33 @@ reset_handler:
     blo     2b
 
 
-    /* The ROM jumps to us with interrupts masked (cpsid i) and VTOR still
-       pointing at 0x800000, which is now our .bss. Fix both before main. */
-    ldr     r0, =0xE000ED08         /* VTOR */
+    /* The vector table has to live at 0x800000 - not in flash - because the
+       boot ROM writes into it.
+     *
+       ROM irq_set_handler (0x2348) reads VTOR, and if it is not exactly
+       0x800000 it FORCES it there before storing the handler at
+       0x800000 + (irq + 16) * 4. Nothing asks its permission: the USB attach
+       path alone registers IRQ 41 and 42 that way (ROM 0x553a/0x5548). Point
+       VTOR at flash and the first ROM call that registers an interrupt moves
+       the whole table out from under Rockbox - SysTick, the audio IRQ and
+       PendSV included.
+
+       0x800000 is where the ROM's own table already is: it is the reset VTOR,
+       0x800000 is the ROM's initial stack pointer top too (vector entry 0),
+       and every other piece of ROM state sits above 0x8001c0. Our linker
+       keeps 0x800000-0x806000 out of the Rockbox image for exactly this
+       reason. So copy our table over the ROM's, 112 words - 16 core vectors
+       plus 96 device IRQs - and leave VTOR where the ROM put it. */
+    ldr     r0, =0x00800000
     ldr     r1, =__vectors_arm
+    add     r2, r0, #(112 * 4)
+1:  ldr     r3, [r1], #4
+    str     r3, [r0], #4
+    cmp     r0, r2
+    blo     1b
+
+    ldr     r0, =0xE000ED08         /* VTOR */
+    ldr     r1, =0x00800000
     str     r1, [r0]
     dsb
     isb

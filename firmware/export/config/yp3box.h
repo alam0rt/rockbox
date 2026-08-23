@@ -133,7 +133,18 @@
 #define DEFAULT_BACKDROP      "-"
 
 #define CONFIG_TUNER        0
-#define USB_NONE
+
+/* USB mass storage. Not a Rockbox usbstack port and not a device-controller
+ * driver: the boot ROM is a complete Bulk-Only Transport / SCSI target and
+ * takes its medium from a table of function pointers, so the target only
+ * supplies that table, the module/clock bring-up and VBUS detection. See
+ * firmware/target/arm/smartlink/yp3box/usb-yp3box.c and docs/USB.md.
+ *
+ * That means the !HAVE_USBSTACK path in firmware/usb.c, which is the right
+ * one here: it unmounts, quiesces storage, calls usb_enable(true) and waits.
+ * The device is bus powered and cannot switch charging, so no
+ * HAVE_USB_POWER / HAVE_USB_CHARGING_ENABLE. */
+#define CONFIG_USBOTG       USBOTG_SL6801_ROM
 
 #define ROCKBOX_DIR         "/.rockbox"
 #define BOOTDIR             "/.rockbox"
