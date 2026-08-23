@@ -113,7 +113,29 @@
  * did not fit at 128 KB either. */
 
 #define PLUGIN_BUFFER_SIZE  0x2000
-#define CODEC_SIZE          0x1b000
+
+/* Codec XIP split. Codec .text and .rodata are linked into per-codec slots in
+ * SPI NOR and execute in place, so codecbuf holds only .data and .bss and is
+ * sized by the worst codec's WRITABLE footprint rather than its total. The
+ * tables above are totals and no longer set CODEC_SIZE; measured writable
+ * footprints after the split are:
+ *
+ *     spc        76,780     <- binding constraint
+ *     atrac3_rm  68,096     atrac3_oma 67,584     tta 57,944
+ *     wav/wav64  43,076
+ *     mpa        38,288     (was 105,784; rq_table alone is 32,828)
+ *     vorbis        172     (90,192 of text+rodata, all now in flash)
+ *
+ * See apps/plugins/plugin.lds (SL6801 branch), tools/codec_slots.txt for the
+ * slot addresses, and tools/gen_codec_slots.py which feeds both the link flags
+ * and the loader's table. */
+#define HAVE_CODEC_XIP
+
+/* 0x13000 is 77,824: clears spc, the worst writable footprint, by 1,044
+ * bytes. Before the XIP split this had to be 0x1b000 to hold mpa's
+ * 105,784-byte total. Dropping spc, atrac3 and tta - the call already
+ * made for cook, ay and gbs - would let it fall to 0xb000. */
+#define CODEC_SIZE          0x13000
 
 /* The tree cache is allocated before playback. The generic 1,000-entry default
  * consumes 52 KiB (40-byte names plus 12-byte entries) from the small core
@@ -122,11 +144,13 @@
  * compressed-input reserve. Existing settings are clamped at tree init. */
 #define MAX_FILES_IN_DIR_LIMIT 200
 
-/* The core audio arena must also coexist with the tree cache, fonts and skin
- * data. The default 5-chunk ring can leave no contiguous allocation after the
- * UI has initialized. Use two 8 KiB chunks and no default 40 KiB backdrop;
- * explicit backdrops remain optional and fail cleanly if memory is tight. */
-#define PCM_MIN_BUFFER_DIVISOR 8
+/* No PCM_MIN_BUFFER_DIVISOR here, and none in apps/pcmbuf.c either.
+ * That knob was invented by this port and existed on no other target, so
+ * nothing upstream ever exercised the code path and it broke twice in a row:
+ * two 8 KiB chunks could never close a chunk, and five could never reach a
+ * watermark that was still sized against the full-rate ring. Use the sizing
+ * every other target uses and solve the memory problem as a memory problem.
+ */
 #define AUDIO_BUFFER_RESERVE   0x4000
 /* A 128x160 RGB565 default backdrop costs 40 KiB in core buflib. Keep that
  * memory available for the PCM ring and compressed-file buffer. */

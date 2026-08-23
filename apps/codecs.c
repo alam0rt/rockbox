@@ -36,6 +36,9 @@
 #include "screens.h"
 #include "misc.h"
 #include "codecs.h"
+#ifdef HAVE_CODEC_XIP
+#include "codec-slots.h"   /* generated; see tools/gen_codec_slots.py */
+#endif
 #include "lang.h"
 #include "keyboard.h"
 #include "buffering.h"
@@ -247,9 +250,68 @@ int codec_load_buf(int hid, struct codec_api *api)
 }
 #endif /* HAVE_CODEC_BUFFERING */
 
+#ifdef HAVE_CODEC_XIP
+/* Written into the slot base by plugin.lds. .text and .rodata are already in
+ * flash, so "loading" a resident codec is copying .data to its home in
+ * codecbuf; codec_start() zeroes .bss itself, as it always has. */
+#define YP3_CODEC_XIP_MAGIC 0x59503358u /* 'YP3X' */
+
+struct codec_xip_desc {
+    uint32_t magic;
+    uint32_t dataload;      /* .data initialiser image, in flash */
+    uint32_t data_start;    /* .data destination, in codecbuf */
+    uint32_t data_end;
+};
+
+#define YP3_CODEC_SLOT(name, base, size) { name, (base) },
+static const struct { const char *name; uint32_t base; } codec_slots[] = {
+    YP3_CODEC_SLOT_LIST
+};
+#undef YP3_CODEC_SLOT
+
+/* Returns the codec header for a flash-resident codec, or NULL if this codec
+ * is not resident and should be read from the card as usual. */
+static struct codec_header * codec_open_resident(const char *plugin)
+{
+    for (unsigned i = 0; i < ARRAYLEN(codec_slots); i++)
+    {
+        if (strcmp(codec_slots[i].name, plugin) != 0)
+            continue;
+
+        const struct codec_xip_desc *d =
+            (const struct codec_xip_desc *)codec_slots[i].base;
+
+        /* A slot that was never packed reads as erased flash. Say so rather
+         * than jumping into it: this is the failure mode when the image and
+         * codec_slots.txt have drifted apart. */
+        if (d->magic != YP3_CODEC_XIP_MAGIC)
+        {
+            logf("Codec: %s slot %08lx bad magic %08lx", plugin,
+                 (unsigned long)codec_slots[i].base, (unsigned long)d->magic);
+            return NULL;
+        }
+
+        if (d->data_end > d->data_start)
+            memcpy((void *)d->data_start, (const void *)d->dataload,
+                   d->data_end - d->data_start);
+
+        commit_discard_idcache();
+        return (struct codec_header *)(d + 1);
+    }
+
+    return NULL;
+}
+#endif /* HAVE_CODEC_XIP */
+
 int codec_load_file(const char *plugin, struct codec_api *api)
 {
     char path[MAX_PATH];
+
+#ifdef HAVE_CODEC_XIP
+    curr_handle = codec_open_resident(plugin);
+    if (curr_handle != NULL)
+        return codec_load_ram(api);
+#endif
 
     codec_get_full_path(path, plugin);
 

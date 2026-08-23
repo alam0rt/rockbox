@@ -136,6 +136,33 @@ OUTPUT_FORMAT(elf32-littlemips)
 #define DRAMORIG 0x00806000
 #define DRAMSIZE (512 * 1024) - 0x6000 - PLUGIN_BUFFER_SIZE - CODEC_SIZE
 
+/* Codec text and rodata execute in place from SPI NOR, so codecbuf only has to
+ * hold what is actually writable - .data and .bss.
+ *
+ * codecbuf is a fixed cut off the top of a 512 KB SRAM and is sized by the
+ * WORST codec, so read-only bytes sitting in it are pure loss: mpa is 105,784
+ * bytes of which 24,032 is .text and 43,464 .rodata, and rq_table - libmad's
+ * x^(4/3) requantisation lookup - is 32,828 on its own. The application has
+ * always run this way (app.lds sends .text and .rodata to FLASH); codecs did
+ * not, only because this script declared a single region and there was
+ * nowhere else to put them.
+ *
+ * Each codec is linked at its own slot in the flash region above the
+ * application image. The slot base arrives as a link-time symbol so one
+ * script serves every codec:
+ *
+ *     -Wl,--defsym,CODEC_XIP_ORIGIN=0x00caa000
+ *
+ * tools/codec_slots.txt is the source of truth for those addresses and
+ * tools/gen_codec_slots.py turns it into both the link flags and the resident
+ * codec table the loader uses. The slot region is proven good: the vendor's
+ * own FIRM occupies flash to 0xda2880 and executes in place from it.
+ *
+ * Layout is .header|.text|.rodata then .data's initialiser image, contiguous,
+ * so the whole flash payload for a codec is one objcopy range and .data's LMA
+ * is simply the end of .rodata. */
+#define CODEC_XIP 1
+
 #else
 # error "DRAM/IRAM memory map not defined!"
 #endif
@@ -179,6 +206,72 @@ MEMORY
 
 SECTIONS
 {
+#if defined(CODEC) && defined(CODEC_XIP)
+    /* Read-only sections at the codec's flash slot. Placed by address rather
+     * than by region: a MEMORY origin must be a constant at script-parse time,
+     * an output section address may be a link-time symbol, and that is what
+     * lets one script serve every codec. */
+    /* A descriptor at the slot base, so the loader can find .data's load
+     * address, destination and length by reading flash at run time. Putting it
+     * here rather than in a table compiled into the firmware removes a build
+     * ordering problem: the firmware would otherwise have to be linked after
+     * every codec in order to know addresses only their links produce. The
+     * firmware needs to know nothing but the slot base, which comes from
+     * tools/codec_slots.txt and is fixed. */
+    .codecxip CODEC_XIP_ORIGIN : {
+        LONG(0x59503358);               /* 'YP3X' */
+        LONG(_codec_xip_dataload);
+        LONG(_codec_xip_data_start);
+        LONG(_codec_xip_data_end);
+    }
+
+    .header : {
+        _plugin_start_addr = .;
+        plugin_start_addr = .;
+        KEEP(*(.header))
+    }
+
+    .text :
+    {
+        *(.text*)
+#ifdef CPU_ARM
+        *(.glue_7)
+        *(.glue_7t)
+#endif
+    }
+
+    .rodata :
+    {
+        *(.rodata*)
+    }
+
+    /* Place the unwind tables explicitly. Left as orphans ld puts them at the
+     * current location counter - which is after .rodata, exactly where .data's
+     * load address is - and the link fails with an LMA overlap. In the old
+     * single-region script they were orphans too, but everything was flowing
+     * into PLUGIN_RAM in order so nothing noticed. */
+    .ARM.exidx :
+    {
+        *(.ARM.exidx*)
+    }
+
+    .ARM.extab :
+    {
+        *(.ARM.extab*)
+    }
+
+    . = ALIGN(4);
+    _codec_xip_dataload = .;
+
+    /* VMA in codecbuf, initialiser image in flash directly behind the code. */
+    .data : AT(_codec_xip_dataload)
+    {
+        _codec_xip_data_start = .;
+        *(.data*)
+        . = ALIGN(4);
+        _codec_xip_data_end = .;
+    } > PLUGIN_RAM
+#else
     .header : {
         _plugin_start_addr = .;
         plugin_start_addr = .;
@@ -203,6 +296,7 @@ SECTIONS
     {
         *(.data*)
     } > PLUGIN_RAM
+#endif
 
 #if defined(NOCACHE_BASE)
     /*
