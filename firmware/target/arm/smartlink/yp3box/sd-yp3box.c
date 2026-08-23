@@ -110,7 +110,7 @@
  * vendor's full 0xcc bytes overflows the LOW region by 64 bytes. */
 static struct { volatile uint32_t *base; } sdh;
 
-/* CLK, CMD, DAT0-3 on port 3 pins 4..9, alt mode 11 (see docs/SD.md). */
+/* CLK, CMD, DAT0-3 on port 3 pins 4..9, alternate function 11. */
 static const unsigned sd_pins[] = {
     0x0003258bu, 0x00032d8bu, 0x0003358bu,
     0x00033d8bu, 0x0003458bu, 0x00034d8bu,

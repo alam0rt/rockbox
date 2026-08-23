@@ -231,7 +231,7 @@ void I_ShutdownGraphics(void)
 
 #elif CONFIG_KEYPAD == YP3BOX_PAD
 /* Five keys, and Doom wants nine. Provisional while the centre key is brought
-   up; see docs/DOOM.md. */
+   up. */
 #define DOOMBUTTON_UP      BUTTON_PREV
 #define DOOMBUTTON_DOWN    BUTTON_NEXT
 #define DOOMBUTTON_LEFT    BUTTON_MENU

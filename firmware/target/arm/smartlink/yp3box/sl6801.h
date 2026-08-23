@@ -1,4 +1,4 @@
-/* SL6801 register map - all addresses measured on hardware, see yp3box docs */
+/* SL6801 register map - all addresses measured on hardware */
 #ifndef __SL6801_H__
 #define __SL6801_H__
 #include <stdint.h>

@@ -12,9 +12,8 @@
  * jumped into unmapped space, fetched zeros and faulted before crt0 ran.
  *
  * The payload therefore goes at flash 0x00e000 (0x00c0e000), the FIRM partition's
- * slot: 1.6MB against our 336KB, and proven mapped and executable because that is
- * exactly where the vendor's firmware runs from. FIRM is overwritten; full dumps
- * exist in dumps/ and on the NAS.
+ * slot: 1.6MB against our 336KB, proven mapped and executable because that is
+ * exactly where the vendor's firmware runs from. FIRM is overwritten.
  */
 #include "config.h"
 
@@ -140,8 +139,8 @@ SECTIONS
        Upstream defines codecbuf in the .lds for every native target
        (apps/codecs.c:67), so this is the normal arrangement, not a local trick.
 
-       The three of them plus .bss are the whole SRAM budget - see
-       docs/MEMORY.md for what fits and what had to be left out. */
+       The three of them plus .bss are the whole SRAM budget; the regions below
+       make the allocation explicit. */
     pluginbuf   = SRAM_END - PLUGIN_BUFFER_SIZE;
     codecbuf    = pluginbuf - CODEC_SIZE;
     audiobuffer = ALIGN(32);

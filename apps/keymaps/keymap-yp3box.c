@@ -4,7 +4,7 @@
 #include "button.h"
 #include "settings.h"
 
-/* FOUR physical keys of the five, all measured (docs/BUTTONS.md):
+/* FOUR physical keys of the five, all measured:
  *
  *     M / up        BUTTON_PREV   ADC ladder, channel 1, ~1976
  *     VOL / down    BUTTON_NEXT   ADC ladder, channel 1, ~60

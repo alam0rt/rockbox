@@ -10,7 +10,6 @@
 # On an XIP target with 64 KB of plugin buffer and 1.6 MB of spare flash, the
 # 228 KB of Doom code cannot be loaded but can be executed in place. Building it
 # into the image puts .text and .rodata in flash and leaves only .data and .bss
-# in SRAM. See docs/DOOM.md in the yp3box port repo.
 #
 # The sources are the plugin's, unmodified; only the glue and the flags differ.
 

@@ -9,8 +9,8 @@
  *                               length per transfer
  *   IRQ 43                      half- and full-transfer completion
  *
- * Everything here is transcribed from the vendor's /dev/audio0 driver; the
- * addresses are in docs/AUDIO.md with the disassembly they came from.
+ * Everything here is transcribed from the vendor's /dev/audio0 driver and
+ * observed hardware state.
  *
  * The Rockbox side is the software-volume sink path, which is what makes this
  * driver simple: with PCM_SINK_SWVOL the core hands us chunks out of its own
@@ -215,7 +215,7 @@ static void sink_set_freq(uint16_t freq)
 {
     /* freq is a Rockbox sample-rate INDEX, not a rate. Only the family matters
      * to the PLL, and the port declares one rate, so this is the whole job
-     * until the within-family divider is found - see docs/AUDIO.md. */
+     * until the within-family divider is found. */
     (void)freq;
     yp3_codec_enable(SAMPR_44);
     codec_running = true;

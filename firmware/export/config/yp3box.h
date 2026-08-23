@@ -1,7 +1,7 @@
 /*
  * anko 43667840 / yp3_2.0.46 - Smartlink SL6801
  *
- * Values here are measured on hardware, see the yp3box repo docs:
+ * Values here are measured on hardware:
  *   Cortex-M4F, cpu pll 384 MHz / core pll 192 MHz, ahb 32 MHz
  *   512 KB SRAM at 0x800000, SPI NOR XIP-mapped at 0xc00000
  *   GC9106 128x160 RGB565 panel behind an LCDC at 0x40095000
@@ -66,7 +66,7 @@
 #define DC_NUM_ENTRIES_OVERRIDE 32
 /* Record panics into breadcrumb slots 200..252 as well as onto the panel; the
  * panel is 20 characters wide and the backtrace runs off the bottom of it.
- * Reader: tools/read_breadcrumbs.py. */
+ * The saved addresses can be symbolised against the matching ELF. */
 #define HAVE_PANIC_BREADCRUMB
 #define HAVE_DUMMY_CODEC
 #define HAVE_SW_VOLUME_CONTROL
@@ -81,11 +81,11 @@
  *                                             flac  194 KB
  *
  * 128 KB covers MP3, Vorbis, WAV and WavPack. FLAC, AAC and Opus do not fit;
- * see docs/MEMORY.md for the measured codec sizes and the possible larger gate.
+ * the measured codec sizes above show what fits in this buffer.
  * This is a 512 KB device, so every byte here comes off the audio buffer. */
 /* Doom is linked into the core image and executed from flash: 228 KB of code
  * against a 64 KB plugin buffer is not a tuning problem. doom.rock is a stub
- * that calls rb->doom_builtin_main(). See docs/DOOM.md. */
+ * that calls rb->doom_builtin_main(). */
 #define HAVE_BUILTIN_DOOM
 
 #define PLUGIN_BUFFER_SIZE  0x10000

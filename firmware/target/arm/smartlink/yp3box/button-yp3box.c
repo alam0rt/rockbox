@@ -62,7 +62,7 @@
  *                reads 1 is key id 0x42, the record with level 1: LEFT
  *
  * Two keys on one pin, one to each rail, distinguished by which way the pin is
- * biased when you look. probe/gpio_work.bin agrees from the other direction:
+ * biased when you look. The stock capture agrees from the other direction:
  * the stock capture has port 3 pin 12 at +0x24=1 +0x2c=3, the pull-down of the
  * pair - which is the one the vendor's loop applies last. */
 #define KEY_IO_PIN      0x00036000u
@@ -74,8 +74,8 @@
  * 0x819fc8) gives eight ascending bounds - 80, 256, 592, 896, 1040, 1280, 1472,
  * 1824 - but its per-record key byte reads 0 for every entry and the middle word
  * is 0x45 for the first seven and 0x25 for the rest, so it does not say which
- * band is which button. docs/BUTTONS.md has flagged that as unresolved since it
- * was written. With the display working, measuring takes one boot. */
+ * band is which button; the measured ranges below resolve it. With the display
+ * working, measuring takes one boot. */
 #define YP3_ADC_PROBE 0
 
 /* Measured band edges, channel 1: rest 3741-3745, M/up 1975-1978, VOL/down
@@ -294,8 +294,8 @@ int button_read_device(void)
  * the sender is in ROM and the key arrives as an interrupt, not a level. That
  * is its own bring-up.
  *
- * The GPIO side is now exhausted as an explanation: in the stock capture
- * probe/gpio_work.bin, pin 3.12 is the ONLY pin that is mode 0 with a bias
+ * The GPIO side is now exhausted as an explanation: in the stock capture,
+ * pin 3.12 is the ONLY pin that is mode 0 with a bias
  * configured. Every other mode-0 pin has both bias fields clear, i.e. nothing
  * is wired to it that stock cares to read.
  */

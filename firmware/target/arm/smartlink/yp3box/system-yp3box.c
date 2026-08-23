@@ -127,8 +127,8 @@ static void __attribute__((section(".icode"), noinline)) yp3_clock_init(void)
      * conservative 32 MHz branch.
      *
      * So we retimed the controller for a fast clock and then never delivered
-     * one: the measured norf rate is 4 MHz. docs/CLOCKS.md's 12 MHz is not a
-     * contradiction, it was measured in BOOTLOADER mode, which is a different
+     * one: the measured norf rate is 4 MHz. The earlier 12 MHz measurement is not a
+     * contradiction, it was made in BOOTLOADER mode, which is a different
      * configuration from the normal-boot path we come up on. Every instruction
      * of this XIP image has been fetched at an eighth of the rate the vendor
      * runs the same flash at, which is where "~10s to first light" comes from.
@@ -153,10 +153,10 @@ static void __attribute__((section(".icode"), noinline)) yp3_clock_init(void)
     BC_SLOT(126) = 0xC10C100Eu;
 #endif
 
-    /* Clock census. Every "expected" figure this port has been comparing
-     * against came from docs/CLOCKS.md, which was measured in bootloader mode -
-     * i.e. before the vendor's own clock init has run - so half of them are the
-     * wrong baseline. These are the ids the tree actually turns on:
+    /* Clock census. Every expected figure this port had been comparing
+     * against came from bootloader mode, before the vendor's own clock init
+     * ran, so half of them are the wrong baseline. These are the ids the tree
+     * actually turns on:
      *
      *   3, 4, 5   the clocks 0x8206e4 sets dividers 2, 1, 1 on
      *   0x29      the parent of sources 8 and 9: ROM 0x3850 answers id 8 with
@@ -192,10 +192,9 @@ void system_init(void)
      * ROM 0x3850 recurses (bl 0x35dc then bl 0x3850), so a corrupt tree can also
      * spin it forever rather than returning a wrong answer. */
     /* Build id, so a dump always states WHICH build produced it.
-     * Derived from __TIME__/__DATE__ at compile time; 29_read_breadcrumbs.sh
-     * pulls the expected value straight out of the ELF and compares. Two
-     * rounds of display testing were spent on observations that may have come
-     * from a stale image - never again. */
+     * The build id can be compared with the matching ELF to detect a stale image.
+     * The dump must be matched to the build that produced it; otherwise progress
+     * observations can be attributed to the wrong image. */
     BC_SLOT(125) = yp3_build_id;
 
 #if YP3_CLOCK_INIT
@@ -279,9 +278,8 @@ int system_memory_guard(int newmode) { (void)newmode; return 0; }
  * "file_cache_alloc - OOM" and exactly one frame.
  *
  * Everything panicf() produces is therefore also written here, into breadcrumb
- * slots that survive the pinhole reset, and tools/read_breadcrumbs.py
- * symbolises the addresses against the ELF. Slots 200..252, one owner
- * (breadcrumb.h).
+ * slots that survive the pinhole reset; saved addresses can be symbolised against
+ * the matching ELF. Slots 200..252, one owner (breadcrumb.h).
  *
  *   200  magic 0x50414E31 'PAN1' - a panic was logged
  *   201  pc          202  sp          203  frames seen (may exceed 16)

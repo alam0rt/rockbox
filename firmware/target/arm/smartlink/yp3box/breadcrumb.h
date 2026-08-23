@@ -86,16 +86,6 @@
  *            204..219 the first 16 unwound frames, 220..251 the message,
  *            252 panic count (>1 = a panic panicked; the record is the last)
  *
- * The interrupt-mask, stage-bisect and full-state-diff probes that owned
- * 160..302 are gone. They eliminated interrupts, then our whole boot sequence,
- * and then found the port 3 pin 0 fault, and were deleted with it. A full-state
- * comparison against a DRAWING system is now payloads/lcdstate.c plus
- * tools/diff_state.py, which need no slots at all.
- *
- * The clock-controller dumps that used to own 160..319 are gone: both
- * controllers were diffed against probe/clk8{0,5}_work.bin and the payload runs
- * that followed proved the whole clock tree correct, so the probe was deleted
- * along with its reader section.
  *
  * Slots 0..63 are ALL claimed. The region is 320 slots (1280 bytes) precisely
  * because reusing one costs a whole hardware cycle to a false reading - it has

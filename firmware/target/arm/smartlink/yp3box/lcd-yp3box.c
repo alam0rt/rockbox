@@ -310,8 +310,8 @@ static const unsigned lcd_pins[] = {
 
 /* PORT 3 PIN 0 MUST BE RELEASED, OR NO PIXEL EVER REACHES THE PANEL.
  *
- * This is the bug. Found on hardware, not by reasoning: payloads/lcdmimic.c
- * forced a system that was drawing red into our firmware's GPIO state one group
+ * This is the bug. Found on hardware, not by reasoning: forcing the system
+ * that was drawing red into our firmware's GPIO state one group
  * at a time, and pin 3.0 in mode 2 - alone, with every LCD pin still at mode 12
  * - turned it into our exact failure. Every transfer completes, zero timeouts,
  * and nothing appears.
@@ -392,7 +392,7 @@ static int lcd_transfer_works(void)
 }
 
 
-/* ROM clock-frequency query, for diagnostics (docs/ROM-API.md). */
+/* ROM clock-frequency query, for diagnostics. */
 
 /* MUST run from SRAM - see app.lds.
  *
@@ -482,7 +482,7 @@ static void __attribute__((section(".icode"), noinline)) lcd_clock_bringup(void)
  * WHY THIS IS NOW THE PRIME SUSPECT. Commands reach the panel - proven twice,
  * by the blink test and by INVON restoring the stock image to normal - and no
  * data byte ever does. Every other explanation is exhausted: the LCDC registers
- * match probe/lcdc_work.bin exactly, the twelve pins match FIRM 0xd66640 entry
+ * match the captured working state exactly, the twelve pins match FIRM 0xd66640 entry
  * for entry, the PIO and DMA primitives match vendor 0x8158d8 and 0x815902
  * instruction for instruction, and the panel bring-up is exonerated because
  * doing strictly less than it still draws nothing.
@@ -605,14 +605,14 @@ static void lcdc_hw_init(void)
     *(volatile uint32_t *)0x40081404u |= 0xffd0u;   /* 0xd7e1c2 */
     /* 0x10 is the only LCDC register that differs between the captured working
      * state (stock firmware displaying) and ROM-only, and that we do not
-     * replay: probe/lcdc_work.bin has 0x00080000, ROM-only has 0. 0x20 and 0x28
+     * replay: the working capture has 0x00080000, ROM-only has 0. 0x20 and 0x28
      * also differ but are per-transfer residue.
      *
      * Capture-derived, not read out of vendor code - the bootloader's own
-     * lcdc_hw_init is not in dumps/sram_live.bin (that region reads as 0xa5a5
-     * filler), so this is the one change here that is not confirmed by
-     * disassembly. It was deleted once before as "invented during probing"; the
-     * working-state capture says otherwise. */
+     * lcdc_hw_init is not present in the available SRAM capture (that region reads as 0xa5a5
+     * filler), so this change is not confirmed by disassembly. It was deleted
+     * once before as "invented during probing"; the working-state capture says
+     * otherwise. */
     LR(0x10) = 0x00080000u;
     /* 0x40/0x44 are the bus TIMING registers: sixteen 4-bit fields. The vendor's
      * values pack fields of 0xf (maximum) next to fields of 0, 1 and 2
@@ -628,13 +628,13 @@ static void lcdc_hw_init(void)
      * inference away from the disassembly.
      *
      * TEST: all fields maximum, i.e. the slowest possible bus. This is a known
-     * valid state - it is exactly what the ROM leaves (probe/lcdc_broke.bin has
-     * 0xffffffff in both). If parameters start landing, the fault is timing and
-     * we narrow down field by field from here.
+     * valid state - it is exactly what the ROM leaves (both timing registers read
+     * 0xffffffff). If parameters start landing, the fault is timing and we narrow
+     * down field by field from here.
      *
      * TRIED: the panel went pure white, i.e. even commands stopped landing. So
      * these fields do gate the bus, but the vendor values are not wrong - the
-     * firmware's own readback matches probe/lcdc_work.bin exactly at both 0x40
+     * firmware's own readback matches the captured working state exactly at both 0x40
      * and 0x44. Timing is ruled out as the command/data asymmetry. */
 #define YP3_LCD_SLOW_BUS 0
 #if YP3_LCD_SLOW_BUS
@@ -785,7 +785,7 @@ void lcd_init_device(void)
  *
  * Six payloads run under stock firmware - register protocol, pin config, RESX
  * pulse, init sequence, LCD clock bring-up, system clock tree, crt0's flash
- * window mask, lcdc_hw_init - all drew red (docs/LCD-COMPLETE.md). Every line of
+ * window mask, lcdc_hw_init - all drew red. Every line of the display driver is
  * the display driver is therefore correct, and the hardware is fine. What
  * differs between a payload that draws and our firmware that does not is the
  * environment the same code runs in:
@@ -1127,12 +1127,9 @@ static void lcd_param_test(void)
 /* Replay the one sequence that has ever put pixels on this panel.
  *
  * The blink test settled that commands DO still reach the panel on the current
- * machine, so the fault is in the data phase - which is exactly where this port
- * has been stuck. But pixels HAVE been drawn on this hardware once, and
- * docs/LCD-GC9106.md records how: a card-reader payload calling the vendor's own
- * helpers (wc = 0x81577d, wd = 0x815789, which are the send_cmd and send_data
- * primitives our lcd_write_cmd and lcd_write_data_n copy instruction for
- * instruction) while the stock firmware was running.
+ * machine, so the fault is in the data phase. Pixels HAVE been drawn on this
+ * hardware once: a card-reader experiment called the vendor's own helpers while
+ * the stock firmware was running.
  *
  * Look at what that sequence did NOT do:
  *
@@ -1147,22 +1144,19 @@ static void lcd_param_test(void)
  *     for (i = 0; i < W*H; i++) wd(swap16(colour), 2)
  *
  * Our init does all of the omitted things, and every one of them depends on a
- * parameter landing. If parameters do not land, our "init sequence lifted
- * verbatim from gc9106_lcd_init" is really a stream of bare opcodes with their
- * arguments silently dropped - which is not the vendor's init at all, and could
- * leave the panel somewhere the vendor never puts it. The working payload
- * sidestepped that entirely by not configuring the panel at all: it inherited a
- * panel the vendor had already set up.
+ * parameter landing. If parameters do not land, our init is really a stream of
+ * bare opcodes with their arguments silently dropped, which could leave the
+ * panel somewhere the vendor never puts it. The working sequence sidestepped
+ * that by not configuring the panel at all: it inherited a configured panel.
  *
  * We cannot inherit that any more - RESX now demonstrably pulses, so the panel
  * is genuinely reset every boot - but we CAN stop doing the things the working
- * sequence did not do, and find out whether our init is the thing breaking it.
+ * sequence did not do and find out whether our init is the thing breaking it.
  * If a red screen appears here, the fault is in our panel bring-up rather than
- * in the bus, and everything about "data never lands" was a consequence rather
- * than a cause.
+ * in the bus, and everything about "data never lands" was a consequence.
  *
- * Colour is pre-swapped: docs/LCD-GC9106.md records that 0xF800 renders blue
- * because the panel receives 0x00F8, so red goes out as 0x00f8.
+ * Colour is pre-swapped: 0xF800 renders blue because the panel receives 0x00F8,
+ * so red goes out as 0x00f8.
  */
 static void lcd_minimal_test(void)
 {
@@ -1301,13 +1295,10 @@ static void LCDICODE lcd_pattern_test(void)
 
 /* Snapshot the whole LCDC register block into breadcrumbs.
  *
- * 31_lcdc_diff.sh "ours" cannot see our runtime state: the pinhole reset
- * re-initialises these blocks, which is provable from the capture itself - the
- * clock block came back identical to ROM-only even though our firmware measures
- * the LCD clock at 24MHz at runtime. So the firmware has to read itself back.
+ * An external diff cannot see our runtime state: the pinhole reset
+ * re-initialises these blocks, so the firmware has to read itself back.
  *
- * Slots 81..104, comparable against probe/lcdc_work.bin which was captured live
- * from the stock firmware while it was displaying. */
+ * Slots 81..104 are comparable against the working stock capture. */
 #if YP3_LCD_CMD_TEST
 /* Is the command path actually reaching the panel?
  *
@@ -1373,7 +1364,7 @@ static void lcd_cmd_test(void)
      * its command table at 0x81d9cc and the device struct at 0x81e550 are all
      * overwritten by our own image. The struct read as zeros because it IS our
      * zeroed .bss, and the call hung because it branched into our data.
-     * dumps/sram_live.bin is a static artifact to READ; none of that code is
+     * The captured SRAM image is a static artifact; none of that code is
      * callable at runtime under Rockbox.
      */
 
@@ -1467,7 +1458,7 @@ static void lcd_cmd_test(void)
  * The last unchecked part of the path. Every LCDC register now matches the
  * stock capture, the pin CODES match the vendor's config calls field for field -
  * but we have never compared the resulting GPIO hardware STATE against stock,
- * which docs/STATUS.md has listed as an open lead since session 1.
+ * which remained an unchecked part of the bring-up.
  *
  * Mode is 4 bits per pin, 8 pins per word, base 0x40081000 + 0x40*port. */
 /* DIAGNOSTIC: write GRAM through the FIFO at 0x34, the way stock actually does.
@@ -1476,7 +1467,7 @@ static void lcd_cmd_test(void)
  * modes, the pad register at 0x40081404 (0xffd0 in both) - and parameters still
  * never land. But we have never driven the path stock actually uses.
  *
- * probe/lcdc_work.bin caught stock mid-transfer with 0x28 = 0x39f: a 928-byte
+ * A stock mid-transfer capture showed 0x28 = 0x39f: a 928-byte
  * transfer. The PIO path is capped at 4 bytes (the vendor checks n-1 > 3 and
  * bails), so stock writes GRAM exclusively through the FIFO at base+0x34, fed by
  * DMA (0x815aba -> 0x815a9a). The count==2 fill at 0x812dc4 that we copied may
@@ -1512,11 +1503,11 @@ static void lcd_cmd_test(void)
  *         capture. Omitting it is why the first DMA attempt still timed out:
  *         the channel was addressed correctly but never configured.
  *
- * The control and length-register configuration bits are CAPTURED from stock
- * with channel 0 parked (probe/dma_work.bin): control 0x001a0289 with both
- * bit29 and bit30 clear, length register 0x13000000 with the count zero. We
- * never call the vendor's dma_open, so we write those configuration words
- * ourselves rather than read-modify-writing what open() would have left.
+ * The control and length-register configuration bits are captured from stock
+ * with channel 0 parked: control 0x001a0289 with both bit29 and bit30 clear,
+ * length register 0x13000000 with the count zero. We never call the vendor's
+ * dma_open, so we write those configuration words ourselves rather than
+ * read-modify-writing what open() would have left.
  *
  * Transfer sequence is vendor 0x815aba:
  *   base[0x24] = cmd; base[0x28] = nbytes-1; wait !busy
@@ -1604,9 +1595,8 @@ static void LCDICODE lcd_dma_chunk(unsigned cmd, const void *src, unsigned nbyte
  * does. Its window setter at 0x812cb0 sends CASET and RASET one byte at a time
  * through 0x815788 -> 0x815902 - the standalone data path wd8() copies
  * instruction for instruction - and only the pixel stream ever goes by DMA
- * (0x815aba). docs/LCD-COMPLETE.md claiming "the vendor never sends a parameter
- * that way" is contradicted by that function; DMA for parameters was invented
- * here, not read out of the dump.
+ * (0x815aba). The vendor path shows the opposite of the earlier assumption:
+ * parameters go through PIO; only the pixel stream uses DMA.
  */
 static void LCDICODE lcd_dma_test(void)
 {
@@ -1663,8 +1653,8 @@ static void LCDICODE lcd_dma_test(void)
      *   colour  0x3f3f                both bytes <= 0x3f
      *
      * A 32x32 block of blue-green in the top-left corner means the bus is
-     * dropping the top two bits, and every unexplained result in
-     * docs/LCD-COMPLETE.md collapses into that one fault. Nothing at all means
+     * dropping the top two bits, and every unexplained result
+     * collapses into that one fault. Nothing at all means
      * the truncation theory is dead and the DMA readback in slots 136..141 is
      * the thread to pull instead. */
     lcd_write_cmd(0x2a);
@@ -1730,10 +1720,8 @@ static void LCDICODE lcd_dma_test(void)
 
     BC_SLOT(116) = 0xD1A0006Bu;          /* six-bit block sent, by PIO */
     /* Our LCDC state, for a register-by-register diff against the stock capture
-     * in probe/lcdc_work.bin. docs/LCD-COMPLETE.md asserts "every LCDC register
-     * now matches" - but that snapshot was taken from lcd_update_rect, which
-     * this build never reaches, so the claim has never been checked against
-     * THIS configuration. The reader diffs it automatically now. */
+     * made while stock was displaying. This build does not reach lcd_update_rect,
+     * so the comparison has not been checked against THIS configuration. */
     lcd_snapshot_regs();
     BC_SLOT(142) = lcd_cmds_done;
     BC_SLOT(143) = lcd_timeouts;
