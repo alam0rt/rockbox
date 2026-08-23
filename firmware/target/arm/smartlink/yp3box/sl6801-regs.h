@@ -8,8 +8,15 @@
 #define REG16(a) (*(volatile uint16_t *)(a))
 #define REG8(a)  (*(volatile uint8_t  *)(a))
 
-/* clock controller */
+/* clock controller. The audio PLL lives here at +0x10/+0x14 (vendor set_pll,
+ * SRAM HAL 0x80da34, literal 0x40080000). */
 #define CLKCTRL_BASE    0x40080000
+/* System/PMU block. NOT the clock controller, despite sitting next to it:
+ * every vendor site that touches the PMU mailbox at +0x104..+0x110 (boot ROM
+ * 0x3c64 write / 0x3ca4 read), the sleep sequencer at +0xb0/+0xb8/+0xd0 (FIRM
+ * 0xcf7fae) or +0x60/+0xd8 (FIRM 0xcf7d10) loads 0x40085000. */
+#define PMU_BASE        0x40085000
+#define PMU_REG(o)      REG32(PMU_BASE + (o))
 /* GPIO: 4 ports, 0x40 stride; read at +0x10 */
 #define GPIO_BASE       0x40081000
 #define GPIO_PORT(n)    (GPIO_BASE + (n) * 0x40)
@@ -66,6 +73,25 @@
 #define PMU_REG_VOLTAGE_CONFIG     0x47
 #define PMU_STATUS_CHARGING        0x04
 #define PMU_STATUS_POWER_INPUT     0x44
+
+/* PMU interrupt block. Three status registers, each write-1-to-clear, each
+ * with an enable register holding the INVERTED mask (FIRM 0xcf7b0c writes
+ * ~mask, and FIRM 0xcf7c6c reads the status back and writes it out again):
+ *
+ *     status 0x30  enable 0x19        status 0x4a  enable 0x4b
+ *     status 0x31  enable 0x1a
+ *
+ * The on/off key lives in 0x31. FIRM 0xcf7b6c turns its three bits into the
+ * PMU event bits 1/2/4, and the key manager's callback at FIRM 0xcfe644 maps
+ * those onto key ids: event 1 -> id 0x21 "enter" press, event 2 -> id 0x21
+ * release, event 4 -> id 0x47 "power". "enter" is the centre Play/Pause key.
+ */
+#define PMU_REG_KEY_STATUS         0x31
+#define PMU_REG_KEY_ENABLE         0x1a
+#define PMU_KEY_PRESS              0x40   /* vendor "usk", event 1 */
+#define PMU_KEY_LONG               0x20   /* vendor "lk",  event 4 */
+#define PMU_KEY_RELEASE            0x10   /* vendor "sk",  event 2 */
+#define PMU_KEY_ANY  (PMU_KEY_PRESS | PMU_KEY_LONG | PMU_KEY_RELEASE)
 
 bool yp3_pmu_read(unsigned reg, uint8_t *value);
 bool yp3_pmu_write(unsigned reg, uint8_t value);

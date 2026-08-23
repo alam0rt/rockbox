@@ -54,7 +54,6 @@
 
 static void adc_init_device(void)
 {
-    unsigned ch;
 
     if (!ROM_CLK_IS_ON(ADC_MODULE))
         ROM_CLK_ENABLE(ADC_MODULE);
@@ -86,9 +85,29 @@ static void adc_init_device(void)
 }
 
 
+/* The centre Play/Pause key is not on the ladder and not on 3.12: it is the
+ * PMU's on/off key. See the comment at the bottom of this file for the chain
+ * of vendor code that establishes that. Arm the three key bits in the PMU
+ * interrupt block and drop whatever is already latched, so the first
+ * button_read_device() does not see a press left over from power-on.
+ *
+ * The enable register holds the INVERTED mask (FIRM 0xcf7b0c). The vendor's
+ * live mask for this register is 0x7c (SRAM 0x81b034+18); we only consume the
+ * three key bits, so the two extra bits it enables are left off. */
+static void key_init_pmu(void)
+{
+    uint8_t status;
+
+    (void)yp3_pmu_write(PMU_REG_KEY_ENABLE, (uint8_t)~PMU_KEY_ANY);
+    if (yp3_pmu_read(PMU_REG_KEY_STATUS, &status) && (status & PMU_KEY_ANY))
+        (void)yp3_pmu_write(PMU_REG_KEY_STATUS, status & PMU_KEY_ANY);
+}
+
+
 void button_init_device(void)
 {
     adc_init_device();
+    key_init_pmu();
 }
 
 /* MEASURED on hardware with the probe above, channel 1:
@@ -96,14 +115,15 @@ void button_init_device(void)
  *     nothing   3741-3745        M / up      1975-1978
  *     VOL/down    55-  64        noise spread 4-9 counts
  *
- * The bands are hundreds of counts apart and the noise is single digits, so
- * plain midpoint thresholds are safe and no averaging is needed - Rockbox's own
+ * The bands are hundreds of counts apart and noise is single digits, so plain
+ * midpoint thresholds are safe and no averaging is needed - Rockbox's own
  * button_read repetition handles the rest.
  *
- *     M / up        -> BUTTON_PREV   scroll up
- *     VOL / down    -> BUTTON_NEXT   scroll down
- *     forward/right -> BUTTON_PLAY   select
- *     back / left   -> BUTTON_MENU   cancel
+ *     M / up              -> BUTTON_MENU   menu
+ *     VOL / down          -> BUTTON_VOL    volume / back
+ *     forward/right       -> BUTTON_NEXT   next
+ *     back / left         -> BUTTON_PREV   previous
+ *     centre Play/Pause   -> BUTTON_PLAY   PMU on/off key, see below
  *
  * Right and left share pin 3.12 and are told apart by which way the pin is
  * biased when it is sampled - see KEY_IO_PIN above for the vendor's version.
@@ -121,6 +141,36 @@ void button_init_device(void)
 static bool bias_is_up = true;      /* which bias the pin is carrying now */
 static bool right_held, left_held;
 
+/* The centre key reports EDGES, not a level, so its state has to be latched
+ * across calls the way the biased pin's two keys are. A tap that begins and
+ * ends inside one tick sets both bits in the same read; report the press on
+ * this call and the release on the next, or the tap disappears. */
+static bool play_held, play_release_pending;
+
+static void play_read_pmu(void)
+{
+    uint8_t status;
+
+    if (!yp3_pmu_read(PMU_REG_KEY_STATUS, &status) || !(status & PMU_KEY_ANY)) {
+        if (play_release_pending) {
+            play_release_pending = false;
+            play_held = false;
+        }
+        return;
+    }
+
+    (void)yp3_pmu_write(PMU_REG_KEY_STATUS, status & PMU_KEY_ANY);
+
+    if (status & PMU_KEY_PRESS) {
+        play_held = true;
+        /* PMU_KEY_LONG arrives while the key is still down: not a release. */
+        play_release_pending = (status & PMU_KEY_RELEASE) != 0;
+    } else if (status & PMU_KEY_RELEASE) {
+        play_held = false;
+        play_release_pending = false;
+    }
+}
+
 int button_read_device(void)
 {
     int btn = 0;
@@ -128,9 +178,9 @@ int button_read_device(void)
     bool level = ((GPIO_IN(3) >> 12) & 1u) != 0;
 
     if (v < ADC_DOWN_MAX)
-        btn |= BUTTON_NEXT;                      /* VOL / down, ~60 */
+        btn |= BUTTON_VOL;                       /* VOL / down, ~60 */
     else if (v >= ADC_UP_MIN && v < ADC_UP_MAX)
-        btn |= BUTTON_PREV;                      /* M / up, ~1976 */
+        btn |= BUTTON_MENU;                      /* M / up, ~1976 */
 
     /* Read what the bias applied last time has settled, then flip it. */
     if (bias_is_up) {
@@ -143,29 +193,54 @@ int button_read_device(void)
     bias_is_up = !bias_is_up;
 
     if (right_held)
-        btn |= BUTTON_PLAY;                      /* forward / right, id 0x43 */
+        btn |= BUTTON_NEXT;                      /* forward / right, id 0x43 */
     if (left_held)
-        btn |= BUTTON_MENU;                      /* back / left, id 0x42 */
+        btn |= BUTTON_PREV;                      /* back / left, id 0x42 */
+
+    play_read_pmu();
+    if (play_held)
+        btn |= BUTTON_PLAY;                      /* centre, id 0x21 "enter" */
 
     return btn;
 }
 
-/* STILL UNMAPPED: centre (play/pause).
+/* THE CENTRE KEY: the PMU's on/off key, reported as vendor key id 0x21
+ * "enter".
  *
  * It moves no ADC channel and does not touch 3.12 under either bias, and the
  * vendor opens exactly three key devices - /dev/kadc_ch1, /dev/key_io and
- * /dev/key_onoff (the only three name strings referenced from its key manager,
- * at FIRM 0xc4b7ea, 0xc4b84c and 0xc4b81a) - so key_onoff is what is left.
+ * /dev/key_onoff. The chain that closes it, all read out of the dump:
  *
- * That one is not a register poll. Its driver at FIRM 0xd66378 creates a
- * four-deep message queue named "konoff" and its read at 0xd663dc blocks on it
- * through 0xd7f45e -> ROM 0xb372, mapping queue events 0 and 2 onto the two key
- * ids its caller supplies at open. Nothing in FIRM ever sends to that queue, so
- * the sender is in ROM and the key arrives as an interrupt, not a level. That
- * is its own bring-up.
+ *   FIRM 0xcfe214  the key manager opens all three devices, passing the SAME
+ *                  callback, 0xcfe645, to each. /dev/key_onoff gets key ids
+ *                  0x37 and 0x47 - both power, not the centre key.
+ *   SRAM 0x81d490  holds 0xcfe645 at run time, and FIRM 0xd47c40 is what
+ *                  stores it: the key manager registers that callback with
+ *                  the /dev/pmu driver (opened at FIRM 0xd47bdc), not with
+ *                  key_onoff.
+ *   FIRM 0xd47784  the PMU event dispatcher. Bit 0 of the event word logs
+ *                  "pmu event power key press", bit 1 "release", bit 2
+ *                  "long press", and each calls that callback.
+ *   FIRM 0xcfe644  the callback: event 1 -> key id 0x21 event 0x10,
+ *                  event 2 -> id 0x21 event 0x30, event 4 -> id 0x47.
+ *                  0x21 is "enter" (FIRM 0xcfe780, string 0xc4b94a), which is
+ *                  the centre Play/Pause key; the LONG press is what becomes
+ *                  the power key, which is why holding centre powers the
+ *                  stock firmware down.
+ *   FIRM 0xcf7c6c  where the event word comes from: PMU registers 0x30, 0x31
+ *                  and 0x4a are read, written straight back to clear, and
+ *                  turned into event bits by 0xcf7b6c - which takes the key
+ *                  bits from 0x31 alone: bit 6 -> 1, bit 4 -> 2, bit 5 -> 4.
  *
- * The GPIO side is now exhausted as an explanation: in the stock capture,
- * pin 3.12 is the ONLY pin that is mode 0 with a bias
- * configured. Every other mode-0 pin has both bias fields clear, i.e. nothing
- * is wired to it that stock cares to read.
+ * The vendor reaches all this through an interrupt: the PMU raises GPIO 2.2
+ * (descriptor 0x21000, ROM interrupt-status word at port base +0x214), FIRM
+ * registers ROM 0x8137ac on IRQ 3 (FIRM 0xd678be), and a "pmu_isr_bh" thread
+ * then does the register read above. Nothing about the status bits needs the
+ * interrupt, so this driver just polls them from the tick task like the rest
+ * of the keys; GPIO 2.2 and IRQ 3 stay untouched.
+ *
+ * The GPIO side is now exhausted as an explanation, which agrees: in the stock
+ * capture, pin 3.12 is the ONLY pin that is mode 0 with a bias configured.
+ * Every other mode-0 pin has both bias fields clear, i.e. nothing is wired to
+ * it that stock cares to read.
  */

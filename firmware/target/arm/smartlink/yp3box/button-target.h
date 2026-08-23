@@ -8,12 +8,20 @@
 #define BUTTON_VOL      0x00000010
 #define BUTTON_MAIN \
     (BUTTON_PLAY | BUTTON_PREV | BUTTON_NEXT | BUTTON_MENU | BUTTON_VOL)
-/* Must be a button no key produces: firmware/drivers/button.c shuts the player
- * down on the first POWEROFF_BUTTON repeat, so pointing this at a key that is
- * held for any normal purpose powers the device off mid-use. Four of the five
- * keys are now mapped (see button-yp3box.c) and BUTTON_VOL is the one left
- * over, so it takes the role until the vendor's on/off key is brought up - and
- * that key is the natural power button anyway. */
-#define POWEROFF_BUTTON BUTTON_VOL
+
+/* Previous and Next ARE the left and right keys - one switch each side of the
+ * centre, and the driver reads them as one pin biased two ways (vendor key ids
+ * 0x42 "left" and 0x43 "right"). Saying so gives the core the directional pair
+ * it looks for: apps/action.c mirrors left/right for right-to-left languages
+ * and warns when a pad declares neither the pair nor NO_BUTTON_LR. Aliases,
+ * not new bits, so BUTTON_MAIN and the keymap are unchanged. */
+#define BUTTON_LEFT     BUTTON_PREV
+#define BUTTON_RIGHT    BUTTON_NEXT
+/* The product's Play/Pause key is also its hardware power key. Keep the
+ * software-poweroff fallback on that logical button, not on VOL: VOL is a real
+ * control and must remain safe to hold while adjusting volume. It also matches
+ * the hardware, which turns a long press of that same key into the vendor's
+ * power key. */
+#define POWEROFF_BUTTON BUTTON_PLAY
 #define POWEROFF_COUNT  10
 #endif
