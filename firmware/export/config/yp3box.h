@@ -170,6 +170,12 @@
  * a working UI and keypad, which is exactly what those failures take away.
  * See firmware/target/arm/smartlink/yp3box/blackbox-yp3box.c. */
 #define HAVE_BLACKBOX
+/* Runs kept on the card: the newest is blackbox.txt, the rest rotate to
+ * blackbox.1.txt .. blackbox.4.txt. Five, because the failure worth reading
+ * is often the one before the one you are looking at - and because a reboot
+ * loop writes one per boot, so keeping only the latest would erase the cause
+ * with the symptom. */
+#define BLACKBOX_KEEP       5
 
 #ifdef ROCKBOX_HAS_LOGF
 #define MAX_LOGF_SIZE       6144

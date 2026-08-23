@@ -26,7 +26,9 @@
  *           still in SRAM and the next boot writes it out. No keypad needed.
  *
  * In all three cases the file lands at /.rockbox/blackbox.txt before the UI
- * comes up.
+ * comes up, with the previous runs rotated to blackbox.1.txt and friends -
+ * BLACKBOX_KEEP of them, five by default, because the interesting failure is
+ * often the one before the one you are looking at.
  */
 #include "config.h"
 #include "system.h"
@@ -37,9 +39,22 @@
 #include "logf.h"
 
 #define BLACKBOX_MAGIC      0x59503342u     /* "YP3B" */
-#define BLACKBOX_PATH       ROCKBOX_DIR "/blackbox.txt"
 /* Stop a fault that reproduces immediately from rebooting for ever. */
 #define BLACKBOX_MAX_FAULTS 3
+
+/* How many runs to keep. The newest is blackbox.txt and the rest are
+ * blackbox.1.txt .. blackbox.<KEEP-1>.txt, oldest last - the usual rotation.
+ * A target can override it; five is enough to see a pattern in a reboot loop
+ * without filling the card. */
+#ifndef BLACKBOX_KEEP
+#define BLACKBOX_KEEP       5
+#endif
+
+#define BLACKBOX_NEWEST     ROCKBOX_DIR "/blackbox.txt"
+/* The digit's position in the template below, patched in place rather than
+ * formatted: this runs from panic and fault context. */
+#define BLACKBOX_ROTATED    ROCKBOX_DIR "/blackbox.0.txt"
+#define BLACKBOX_DIGIT_POS  (sizeof(ROCKBOX_DIR "/blackbox.") - 1)
 
 enum blackbox_reason {
     BB_NONE = 0,
@@ -155,7 +170,30 @@ static const char *bb_reason_name(uint32_t reason)
     }
 }
 
-/* Append, so a reboot loop leaves a trail rather than one survivor. */
+/* Shift the kept logs down one and drop the oldest, so blackbox.txt is always
+ * free for the run being written. Best effort: a rename that fails costs one
+ * old log, not this one. */
+static void bb_rotate(void)
+{
+    char older[] = BLACKBOX_ROTATED;
+    char newer[] = BLACKBOX_ROTATED;
+    int i;
+
+    older[BLACKBOX_DIGIT_POS] = '0' + BLACKBOX_KEEP - 1;
+    remove(older);
+
+    for (i = BLACKBOX_KEEP - 1; i > 1; i--) {
+        older[BLACKBOX_DIGIT_POS] = '0' + i;
+        newer[BLACKBOX_DIGIT_POS] = '0' + i - 1;
+        (void)rename(newer, older);
+    }
+
+    if (BLACKBOX_KEEP > 1) {
+        older[BLACKBOX_DIGIT_POS] = '1';
+        (void)rename(BLACKBOX_NEWEST, older);
+    }
+}
+
 bool blackbox_dump(void)
 {
     struct yp3_blackbox *bb = &yp3_blackbox;
@@ -165,7 +203,9 @@ bool blackbox_dump(void)
         return false;
     blackbox_written = true;
 
-    fd = open(BLACKBOX_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    bb_rotate();
+
+    fd = open(BLACKBOX_NEWEST, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0)
         return false;
 
