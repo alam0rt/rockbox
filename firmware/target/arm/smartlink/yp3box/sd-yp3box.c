@@ -449,7 +449,8 @@ int SDICODE sd_read_sectors(IF_MD(int drive,)
         uint32_t err;
 
         R(SD_STA) = STA_ALLFLAGS;
-        /* The vendor sets DCTRL before configuring the transfer. */
+        /* The controller needs data mode enabled for every single-block read. */
+        R(SD_DCTRL) |= 8u;
         sd_setup_data(512);
 
         ROM_SD_CMD(&sdh, 17, sd_addr(start));    /* READ_SINGLE_BLOCK */
