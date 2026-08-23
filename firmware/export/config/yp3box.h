@@ -166,6 +166,7 @@
 #ifdef ROCKBOX_HAS_LOGF
 #define MAX_LOGF_SIZE       6144
 #define LOGF_ENABLE_PLAYBACK
+#define LOGF_ENABLE_USB
 #endif
 
 #define HAVE_SEMAPHORE_OBJECTS

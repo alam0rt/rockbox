@@ -23,6 +23,20 @@
  *
  ****************************************************************************/
 #include "config.h"
+/* A target can turn this file's logf group on with LOGF_ENABLE_USB; see
+ * firmware/export/config/yp3box.h. The connect handshake is otherwise
+ * invisible on a device with no console, and "every thread has to acknowledge
+ * before slave mode starts" is exactly the kind of thing that looks like a
+ * broken USB driver.
+ *
+ * This has to sit above the other includes: logf.h defines logf() inside its
+ * include guard but re-runs the per-file "not enabled, stub it out" tail on
+ * every include, so a gate placed after some other header has already pulled
+ * logf.h in only stops the stub from being re-applied - the stub is already
+ * there. */
+#ifdef LOGF_ENABLE_USB
+#define LOGF_ENABLE
+#endif
 #include "cpu.h"
 #include "kernel.h"
 #include "thread.h"
@@ -64,6 +78,7 @@
 #if (!defined(BOOTLOADER) || defined(HAVE_BOOTLOADER_USB_MODE))
 #define USB_FULL_INIT
 #endif
+
 
 /* USB detect debouncing interval (200ms taken from the usb polling code) */
 #define USB_DEBOUNCE_POLL (200*HZ/1000)
@@ -497,10 +512,13 @@ static void NORETURN_ATTR usb_thread(void)
             }
             if(--usb_num_acks_to_expect > 0) {
                 DEBUGF("usb: got ack, %d to go...\n", usb_num_acks_to_expect);
+                logf("usb: ack, %d to go", usb_num_acks_to_expect);
                 break;
             }
 
             DEBUGF("usb: all threads have acknowledged the connect.\n");
+            logf("usb: all acks in, host=%d excl=%d",
+                 usb_host_present, exclusive_storage_requested);
             if(usb_host_present && exclusive_storage_requested) {
                 usb_slave_mode(true);
                 exclusive_storage_enabled = true;
@@ -866,6 +884,7 @@ void usb_request_exclusive_storage(void)
     usb_broadcast_seqnum += 1;
     usb_num_acks_to_expect = queue_broadcast(SYS_USB_CONNECTED, usb_broadcast_seqnum) - 1;
     DEBUGF("usb: waiting for %d acks...\n", usb_num_acks_to_expect);
+    logf("usb: waiting for %d acks", usb_num_acks_to_expect);
 }
 
 void usb_release_exclusive_storage(void)
