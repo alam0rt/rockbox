@@ -77,6 +77,10 @@
 /* the USB PHY/controller enable the vendor reaches through SRAM thunk
  * 0x80db54, which is one branch to this */
 #define ROM_USB_PHY         ((void (*)(unsigned))0x3ad5u)
+/* USB pad and PHY configuration: two more pin-mux writes (port 2 pins 0 and
+ * 1, mode 2) and a configuration word into the PHY register at 0x40085100,
+ * behind a busy bit. See the comment on usb_hw_enable(). */
+#define ROM_USB_PHY_INIT    ((void (*)(void))0x3c2du)
 #define ROM_CLK_DISABLE     ((void (*)(unsigned))0x2571u)
 
 #define USB_MODULE          0x23u   /* FIRM 0xd66d98 clk_enable, 0xd66c40 off */
@@ -298,6 +302,29 @@ static struct usb_msc_ops usb_msc_ops = {
 static void __attribute__((section(".icode"), noinline))
 usb_hw_enable(void)
 {
+    /* The PHY and its pads first.
+     *
+     * This is the step the vendor's driver_usbd_params_init does NOT do, and
+     * the reason is the oldest rule this port has: our boot path skips the
+     * vendor bootloader entirely, so everything it would normally set up is
+     * ours to do. FIRM inherits a configured USB PHY; we inherit nothing.
+     *
+     * The boot ROM's own USB bring-up at 0x4c034 - the one that enumerates in
+     * download mode, the known-good reference - opens with three calls before
+     * the module enable. Two of them, 0x3cd4 and 0x3b98, reconfigure the
+     * whole clock tree onto sources 15 and 10; those are download mode
+     * setting up the machine and must not be repeated here, or the CPU clock
+     * moves under us. The third, 0x3c2c, is USB-specific and is this:
+     *
+     *     gpio_cfg(0x00020100)          port 2 pin 0, mode 2
+     *     gpio_cfg(0x0002090b)          port 2 pin 1, mode 2
+     *     [0x40085100] |= 0x80000000;   start, then poll until it clears
+     *     [0x40085100] = 0x0001b082;    the PHY configuration word
+     *
+     * Called rather than transcribed: it is mask ROM, it takes no arguments,
+     * and it touches nothing else. */
+    ROM_USB_PHY_INIT();
+
     /* Unconditionally, as the vendor does at FIRM 0xd66d98 - it calls ROM
      * 0x2564 straight, with no is-it-already-on check. */
     ROM_CLK_ENABLE(USB_MODULE);
@@ -349,6 +376,8 @@ static void usb_log_state(const char *when)
     logf("usb %s: 00=%02x 01=%02x 0b=%02x 0e=%02x 12=%04x", when,
          USBC(0x00), USBC(0x01), USBC(0x0b), USBC(0x0e),
          REG16(0x40040012));
+    logf("usb %s: phy 40085100=%08lx", when,
+         (unsigned long)REG32(0x40085100));
 }
 
 /* Does the register file answer at all? The failure signatures differ:
