@@ -34,8 +34,12 @@
 #include "metadata.h"
 #include "settings.h"
 
-/* Define LOGF_ENABLE to enable logf output in this file */
-/*#define LOGF_ENABLE*/
+/* Define LOGF_ENABLE to enable logf output in this file. A target can turn
+ * the playback group on as a set with LOGF_ENABLE_PLAYBACK; see
+ * firmware/export/config/yp3box.h. */
+#ifdef LOGF_ENABLE_PLAYBACK
+#define LOGF_ENABLE
+#endif
 #include "logf.h"
 
 /* macros to enable logf for queues

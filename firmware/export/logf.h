@@ -28,7 +28,11 @@
 
 #ifndef __PCTOOL__
 
+/* Targets with very little RAM can shrink the ring; 16 KB is a lot of .bss on
+ * a 512 KB device where the whole audio buffer is 79 KB. */
+#ifndef MAX_LOGF_SIZE
 #define MAX_LOGF_SIZE 16384
+#endif
 
 extern unsigned char logfbuffer[MAX_LOGF_SIZE + 1];
 extern int logfindex;
