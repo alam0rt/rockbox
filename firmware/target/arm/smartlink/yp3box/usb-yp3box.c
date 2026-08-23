@@ -393,6 +393,15 @@ void usb_enable(bool on)
         logf("usb: iser1=%08lx userfn=%08lx",
              (unsigned long)REG32(0xE000E104),
              (unsigned long)REG32(0x00801068));
+
+        /* The watchdog is the only reset the boot ROM has - there is no
+         * SYSRESETREQ literal anywhere in it - so if the device restarts a
+         * few seconds into USB mode, this is what did it. system_init()
+         * disables it once at boot; log what it looks like now, and put it
+         * back down in case something on the USB path re-armed it. */
+        logf("usb: wdog ctrl=%08lx load=%08lx",
+             (unsigned long)WDOG_CTRL, (unsigned long)WDOG_LOAD);
+        WDOG_CTRL = 0;
     } else {
         if (!usb_exposed)
             return;
