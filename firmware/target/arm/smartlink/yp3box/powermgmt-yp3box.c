@@ -12,6 +12,20 @@
 #include "config.h"
 #include "powermgmt.h"
 #include "sl6801-regs.h"
+/* Our own target file, so the log group is simply on whenever the build
+ * has logf at all. */
+#ifdef ROCKBOX_HAS_LOGF
+#define LOGF_ENABLE
+#endif
+#include "logf.h"
+
+/* A failed mailbox transaction must not read as a flat battery. Rockbox does
+ * not treat a negative voltage as "unknown": powermgmt.c feeds it straight
+ * into the filter and the shutoff comparison, so one bad read is a power-off.
+ * Hold the last good value and report that instead; only report failure
+ * before there has ever been a good one, which is the case powermgmt's own
+ * startup handles. */
+static int last_good_mv = -1;
 
 int _battery_voltage(void)
 {
@@ -20,18 +34,20 @@ int _battery_voltage(void)
     uint32_t voltage;
 
     if (!yp3_pmu_read(PMU_REG_VOLTAGE_CONFIG, &config))
-        return -1;
+        return last_good_mv;
     if (!yp3_pmu_write(PMU_REG_VOLTAGE_CONFIG, config | 0x10u)
             || !yp3_pmu_read(PMU_REG_BATTERY_VOLTAGE, &sample)
             || !yp3_pmu_read(PMU_REG_VOLTAGE_CONFIG, &config)) {
         (void)yp3_pmu_write(PMU_REG_VOLTAGE_CONFIG, config & ~0x10u);
-        return -1;
+        return last_good_mv;
     }
     if (!yp3_pmu_write(PMU_REG_VOLTAGE_CONFIG, config & ~0x10u))
-        return -1;
+        return last_good_mv;
 
     voltage = 14173u * (sample & 0x7fu) + 0x2a8000u + 0x3980u;
-    return (int)(voltage / 1000u);
+    last_good_mv = (int)(voltage / 1000u);
+    logf("batt: pmu 0x2e=%02x -> %d mV", sample, last_good_mv);
+    return last_good_mv;
 }
 
 /* Li-ion profile used by the existing Rockbox 3.7 V targets. Until a YP3

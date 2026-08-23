@@ -1,9 +1,10 @@
 /*
  * Power control.
  *
- * The PMU is not on I2C: it is reached through a mailbox in the clock
- * controller at 0x40085000, decoded from the vendor's HAL helpers at 0x804f28
- * (write) and 0x804f90 (read):
+ * The PMU is not on I2C: it is reached through a mailbox at 0x40085000,
+ * decoded from the vendor's HAL helpers at 0x804f28 (write) and 0x804f90
+ * (read), and confirmed against the boot ROM's own copies at 0x3c64 and
+ * 0x3ca4:
  *
  *     +0x104   command: 0x40000060 | reg << 8   write
  *                       0x40000061 | reg << 8   read
@@ -24,12 +25,17 @@
 #include "backlight-target.h"
 #include "sl6801-regs.h"
 
-#define CLK(o) (*(volatile uint32_t *)(CLKCTRL_BASE + (o)))
+/* PMU_REG is 0x40085000, NOT CLKCTRL_BASE. This file used the clock-controller
+ * base for the whole of its life, which put every access 0x5000 low: mailbox
+ * commands went into the clock controller, so battery voltage and charger
+ * status were whatever that block happened to read back, and power_off()'s
+ * sleep-sequencer writes landed on clock registers. The vendor loads
+ * 0x40085000 at FIRM 0xcf7d24, at 0xcf8044 and in both ROM mailbox helpers. */
 
-#define PMU_CMD     0x104
-#define PMU_WDATA   0x108
-#define PMU_RDATA   0x10c
-#define PMU_STATUS  0x110
+#define PMU_MB_CMD     0x104
+#define PMU_MB_WDATA   0x108
+#define PMU_MB_RDATA   0x10c
+#define PMU_MB_STATUS  0x110
 
 #define PMU_OP_WRITE    0x40000060u
 #define PMU_OP_READ     0x40000061u
@@ -44,15 +50,15 @@ yp3_pmu_read(unsigned reg, uint8_t *value)
 {
     unsigned i;
 
-    CLK(PMU_CMD) = PMU_OP_READ | (reg << 8);
-    CLK(PMU_CMD) |= PMU_GO;
-    for (i = 0; i < PMU_POLL_LIMIT && (CLK(PMU_CMD) & PMU_GO); i++)
+    PMU_REG(PMU_MB_CMD) = PMU_OP_READ | (reg << 8);
+    PMU_REG(PMU_MB_CMD) |= PMU_GO;
+    for (i = 0; i < PMU_POLL_LIMIT && (PMU_REG(PMU_MB_CMD) & PMU_GO); i++)
         ;
 
-    if ((CLK(PMU_CMD) & PMU_GO) || (CLK(PMU_STATUS) & PMU_ERROR_MASK))
+    if ((PMU_REG(PMU_MB_CMD) & PMU_GO) || (PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK))
         return false;
 
-    *value = (uint8_t)CLK(PMU_RDATA);
+    *value = (uint8_t)PMU_REG(PMU_MB_RDATA);
     return true;
 }
 
@@ -61,13 +67,13 @@ yp3_pmu_write(unsigned reg, uint8_t value)
 {
     unsigned i;
 
-    CLK(PMU_WDATA) = value;
-    CLK(PMU_CMD) = PMU_OP_WRITE | (reg << 8);
-    CLK(PMU_CMD) |= PMU_GO;
-    for (i = 0; i < PMU_POLL_LIMIT && (CLK(PMU_CMD) & PMU_GO); i++)
+    PMU_REG(PMU_MB_WDATA) = value;
+    PMU_REG(PMU_MB_CMD) = PMU_OP_WRITE | (reg << 8);
+    PMU_REG(PMU_MB_CMD) |= PMU_GO;
+    for (i = 0; i < PMU_POLL_LIMIT && (PMU_REG(PMU_MB_CMD) & PMU_GO); i++)
         ;
 
-    return !(CLK(PMU_CMD) & PMU_GO) && !(CLK(PMU_STATUS) & PMU_ERROR_MASK);
+    return !(PMU_REG(PMU_MB_CMD) & PMU_GO) && !(PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK);
 }
 
 void power_init(void)
@@ -96,17 +102,17 @@ yp3_pmu_arm_sleep(void)
     if (!yp3_pmu_read(0x21, &v))
         return false;
 
-    CLK(0xb0) = (uint32_t)((v | 3) & 0xff) << 8 | 0x21;
-    CLK(0xd0) |= 1;
+    PMU_REG(0xb0) = (uint32_t)((v | 3) & 0xff) << 8 | 0x21;
+    PMU_REG(0xd0) |= 1;
 
     v = (v & 0xe7) | 4;                 /* the value restored on wake */
-    CLK(0xb8) = ((uint32_t)v << 16) | 0x21
+    PMU_REG(0xb8) = ((uint32_t)v << 16) | 0x21
               | ((uint32_t)(v & 0xfb) << 24);   /* applied on the way down */
 
     if (!yp3_pmu_read(0, &v)
             || !yp3_pmu_write(0, (uint8_t)(v | 8)))
         return false;
-    CLK(0xd0) |= 8;
+    PMU_REG(0xd0) |= 8;
     return true;
 }
 
@@ -148,8 +154,8 @@ yp3_power_down(void)
     ROM_CLK_STOP(2);
     ROM_CLK_STOP(0);
 
-    CLK(0x60) = 1;                                  /* vendor 0xcf7d10 */
-    CLK(0xd8) &= ~6u;
+    PMU_REG(0x60) = 1;                                  /* vendor 0xcf7d10 */
+    PMU_REG(0xd8) &= ~6u;
     /* vendor 0xcf7cf0(0): clear the two-bit field at PMU reg 0 bits 6-7 */
     {
         uint8_t v;

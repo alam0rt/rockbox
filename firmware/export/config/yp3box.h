@@ -38,6 +38,24 @@
 #define STORAGE_WANTS_ALIGN
 #define SECTOR_SIZE         512
 
+/* Battery and charging. The measurement is PMU-backed, not an ADC channel:
+ * powermgmt-yp3box.c implements _battery_voltage() from the vendor's own
+ * conversion (FIRM 0xcf7a28), and power-yp3box.c reads the charger bits out of
+ * PMU status register 0x2a. CHARGING_MONITOR is the right level - the port can
+ * see that the charger is attached and charging, but does not control it.
+ *
+ * The capacity figures are the cell in this device (210 mAh, single value, so
+ * MIN == MAX and the setting is not adjustable). They feed runtime estimation
+ * only; the voltage curve in powermgmt-yp3box.c is still a generic Li-ion
+ * profile pending a discharge sweep. */
+#define CONFIG_BATTERY_MEASURE   VOLTAGE_MEASURE
+#define CONFIG_CHARGING          CHARGING_MONITOR
+#define HAVE_SW_POWEROFF
+#define BATTERY_CAPACITY_DEFAULT 210
+#define BATTERY_CAPACITY_MIN     210
+#define BATTERY_CAPACITY_MAX     210
+#define BATTERY_CAPACITY_INC     0
+
 #define CONFIG_I2C          I2C_NONE
 #define CONFIG_RTC          0
 
@@ -98,6 +116,23 @@
 #define BOOTDIR             "/.rockbox"
 #define BOOTFILE_EXT        "yp3"
 #define BOOTFILE            "rockbox." BOOTFILE_EXT
+
+/* Debug channel. This port has no console: the breadcrumb region went away
+ * with the instrumentation cleanup, and every audio and battery hypothesis
+ * otherwise costs a full flash-and-boot cycle to test. Build with
+ * `YP3_LOGF=1 ./tools/40_build.sh` (configure --type=nl) and the log is
+ * readable on the device under Debug -> "View log" and dumpable to /logf.txt
+ * with Debug -> "Dump Log File".
+ *
+ * 16 KB of ring is not affordable here - the entire core buffer is 79 KB - so
+ * the ring is 6 KB, which holds a few hundred lines: enough for one track
+ * load. LOGF_ENABLE_PLAYBACK turns on the playback, buffering and codec-thread
+ * log groups together, which is the set that says why a track failed to
+ * start. */
+#ifdef ROCKBOX_HAS_LOGF
+#define MAX_LOGF_SIZE       6144
+#define LOGF_ENABLE_PLAYBACK
+#endif
 
 #define HAVE_SEMAPHORE_OBJECTS
 #define INCLUDE_TIMEOUT_API
