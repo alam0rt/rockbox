@@ -26,6 +26,7 @@
  * before there has ever been a good one, which is the case powermgmt's own
  * startup handles. */
 static int last_good_mv = -1;
+static int last_sample = -1;
 
 int _battery_voltage(void)
 {
@@ -46,7 +47,13 @@ int _battery_voltage(void)
 
     voltage = 14173u * (sample & 0x7fu) + 0x2a8000u + 0x3980u;
     last_good_mv = (int)(voltage / 1000u);
-    logf("batt: pmu 0x2e=%02x -> %d mV", sample, last_good_mv);
+
+    /* Once per changed sample, not once per second: the log ring is 6 KB. */
+    if (sample != last_sample) {
+        last_sample = sample;
+        logf("batt: pmu 0x2e=%02x 0x47=%02x -> %d mV",
+             sample, config, last_good_mv);
+    }
     return last_good_mv;
 }
 

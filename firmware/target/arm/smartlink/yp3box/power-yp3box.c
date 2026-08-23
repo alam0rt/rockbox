@@ -24,6 +24,10 @@
 #include "backlight.h"
 #include "backlight-target.h"
 #include "sl6801-regs.h"
+#ifdef ROCKBOX_HAS_LOGF
+#define LOGF_ENABLE
+#endif
+#include "logf.h"
 
 /* PMU_REG is 0x40085000, NOT CLKCTRL_BASE. This file used the clock-controller
  * base for the whole of its life, which put every access 0x5000 low: mailbox
@@ -76,8 +80,47 @@ yp3_pmu_write(unsigned reg, uint8_t value)
     return !(PMU_REG(PMU_MB_CMD) & PMU_GO) && !(PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK);
 }
 
+/* Enable the PMU's voltage measurement.
+ *
+ * Register 0x2e read back 0x80 on hardware: bit 7 set, all seven value bits
+ * zero, i.e. 2800 mV - the bottom of the scale - on a fully charged device.
+ * The block was not measuring.
+ *
+ * The vendor's pmu init at FIRM 0xcf795e reads register 0x47 and sets bit 0
+ * when its config byte +1 is 1. That config is built on the stack at FIRM
+ * 0xd67a4c and its first word is the literal 0x00010102 at 0xd67aa4, so byte
+ * +1 IS 1 on this device and the vendor does set the bit. Bit 4 of the same
+ * register is the channel select the battery read toggles (FIRM 0xcf7a28),
+ * which is a select, not an enable - selecting a channel on a block that is
+ * off gives exactly the zero we saw.
+ *
+ * The rest of that init - registers 0x13, 0x14, 0x15, 0x16, 0x17, 0x1c - is
+ * charger and thermal configuration driven by the same struct, and is not
+ * reproduced: none of it is on the path from the battery sense to 0x2e. If
+ * 0x2e still reads zero, the logged register values below say which of them
+ * to look at next. */
 void power_init(void)
 {
+    uint8_t before = 0, after = 0;
+
+    if (yp3_pmu_read(PMU_REG_VOLTAGE_CONFIG, &before)
+            && yp3_pmu_write(PMU_REG_VOLTAGE_CONFIG, (uint8_t)(before | 1u)))
+        (void)yp3_pmu_read(PMU_REG_VOLTAGE_CONFIG, &after);
+
+    logf("pmu 0x47: %02x -> %02x", before, after);
+
+    /* One line that characterises the block, so a single dump can rule the
+     * rest of the vendor's init in or out. */
+    {
+        static const uint8_t regs[] = { 0x13, 0x17, 0x1c, 0x2a, 0x2e };
+        unsigned i;
+
+        for (i = 0; i < sizeof(regs); i++) {
+            uint8_t v = 0;
+            bool ok = yp3_pmu_read(regs[i], &v);
+            logf("pmu %02x = %02x%s", regs[i], v, ok ? "" : " (failed)");
+        }
+    }
 }
 
 /* Arm the PMU sleep sequencer - vendor 0xcf7fa0, the tail of "enter poweroff
