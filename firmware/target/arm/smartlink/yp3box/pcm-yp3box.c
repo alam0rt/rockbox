@@ -113,20 +113,18 @@ yp3_codec_enable(unsigned long rate)
 
 /* --- DMA ------------------------------------------------------------------
  *
- * The current Rockbox playback implementation uses mode 0, which selects DMA
- * channel 0; the CTRL word is rebuilt rather than merged so that a stopped
- * channel cannot leave a stale mode behind:
- *
- *     ctrl &= ~0x6;  ctrl |= dir << 1;      direction
- *     if (flag) ctrl |= 4;
- *     ctrl &= ~0xf0; ctrl |= 8 | (mode << 4);
- *     ctrl |= 1;                            enable
- *
- * `dir` and `flag` are vendor parameters. The observed SRAM caller at 0x813738
- * uses dir=0, mode=1, flag=1, while the playback mode=0, flag=0 combination
- * remains an unverified port assumption; the record path needs the other
- * combination and the second channel. */
+ * The vendor's audio_dma_setup writes three pieces of state before arming
+ * channel 0: format/mode at 0x4004000e, the playback configuration halfword
+ * at 0x40040016, and the channel registers. The observed playback caller at
+ * SRAM 0x813738 passes dir=0, mode=1, flag=1. The old port only programmed the
+ * channel registers with mode=0, flag=0, leaving the audio block unconfigured.
+ */
 #define AUDIO_DMA_PLAY_CH   0
+#define AUDIO_DMA_MODE      1u
+#define AUDIO_DMA_DIR       0u
+#define AUDIO_DMA_FLAG      1u
+#define AUDIO_DMA_FORMAT    REG8(0x4004000e)
+#define AUDIO_DMA_PLAY_CFG  REG16(0x40040016)
 
 #define AUDIO_DMA_MODULE   0x21u        /* FIRM 0xd7d834: dma_open */
 
@@ -142,18 +140,24 @@ yp3_dma_enable(void)
 
 static void yp3_dma_play(const void *addr, size_t size)
 {
-    uint16_t ctrl;
+    uint16_t cfg, ctrl;
 
     yp3_dma_enable();
+
+    /* Faithful dir=0/mode=1/flag=1 branch of audio_dma_setup. */
+    AUDIO_DMA_FORMAT = AUDIO_DMA_MODE;
+    cfg = AUDIO_DMA_PLAY_CFG & ~0x800u;
+    AUDIO_DMA_PLAY_CFG = cfg | 0xa000u;
 
     AUDIO_DMA_ADDR(AUDIO_DMA_PLAY_CH) = (uint32_t)addr;
     AUDIO_DMA_LEN(AUDIO_DMA_PLAY_CH)  = size;
 
     ctrl = AUDIO_DMA_CTRL(AUDIO_DMA_PLAY_CH);
-    ctrl &= ~0x6u;                      /* direction 0 = out to the codec */
-    ctrl = (ctrl & ~0xf0u) | 0x8u;      /* mode 0 */
-    ctrl |= 1u;                         /* enable */
-    AUDIO_DMA_CTRL(AUDIO_DMA_PLAY_CH) = ctrl;
+    ctrl = (ctrl & ~0x6u) | (AUDIO_DMA_DIR << 1);
+    if (AUDIO_DMA_FLAG)
+        ctrl |= 4u;
+    ctrl = (ctrl & ~0xf0u) | 8u | (AUDIO_DMA_MODE << 4);
+    AUDIO_DMA_CTRL(AUDIO_DMA_PLAY_CH) = ctrl | 1u;
 }
 
 /* --- IRQ 43 ---------------------------------------------------------------
@@ -161,11 +165,8 @@ static void yp3_dma_play(const void *addr, size_t size)
  * The vendor's handler is at 0x813774: read the status word, call the half- and
  * full-transfer callbacks, then write status|7 back to clear (W1C).
  *
- * We only act on full-transfer completion. The half-transfer interrupt exists
- * to let a driver refill the half of a circular buffer that has been consumed;
- * with the software-volume sink the core owns the buffers and hands us one at a
- * time, so the halfway point is nothing to us. Clearing it is still required or
- * it re-asserts immediately. */
+ * We only act on full-transfer completion. The halfway point is still cleared;
+ * otherwise it re-asserts immediately. */
 #define NVIC_ISER   ((volatile uint32_t *)0xE000E100)
 #define NVIC_ICER   ((volatile uint32_t *)0xE000E180)
 #define NVIC_IPR    ((volatile uint8_t  *)0xE000E400)
@@ -185,8 +186,6 @@ void yp3_audio_irq(void)
 {
     uint32_t status = AUDIO_IRQSTAT;
 
-    AUDIO_IRQSTAT = status | 7u;        /* W1C, exactly as the vendor does */
-
     if (status & 2u) {                  /* full transfer complete */
         const void *addr;
         size_t size;
@@ -194,9 +193,12 @@ void yp3_audio_irq(void)
         if (pcm_play_dma_complete_callback(PCM_DMAST_OK, &addr, &size))
             yp3_dma_play(addr, size);
     }
+
+    AUDIO_IRQSTAT = status | 7u;        /* W1C, after callbacks as vendor does */
 }
 
 /* --- the sink ------------------------------------------------------------- */
+
 
 static void sink_init(void)
 {
