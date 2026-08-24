@@ -93,22 +93,21 @@
  * stopped clock, the card never sees CMD0 or CMD55, and sd_power_on reports
  * "no card". CLAUDE.md has the rule this broke: a source number is itself a
  * clock id, so selecting one is a thing you must do, not a thing you inherit. */
+/* CLKCFG as the ROM's own speed switch writes it (ROM 0x46de). The bitfields
+ * ROM_SD_CFG builds at init - 0x20000000, a 6-bit field at bit 16, a byte at
+ * bit 4 and a nibble at bit 0 - are the same ones this word replaces. */
+#define SD_CLKCFG_FAST 0x1003000cu
+
 #define SD_CLOCK_SRC 0x0au
 #define SD_DIV_ID   64u
-/* DISABLED - equal to SD_DIV_ID means no speed change at all. Set to 4
- * (6 MHz) or 2 (12 MHz) only alongside a verification that actually
- * works; see the note below before changing it. */
-#define SD_DIV_DATA SD_DIV_ID
 /* Identification-speed divider (vendor: 0x40).
  *
- * And it is the ONLY divider this driver ever programs. sd_set_clock is called
- * once, from sd_init, before sd_power_on - then identification finishes, CMD7
- * selects the card, SET_BLOCKLEN runs, sd_ok goes true, and the clock is left
- * where it was. The SD spec caps identification at 400 kHz and allows 25 MHz
- * for transfer, so every data read on this device - the FAT mount, every track,
- * and every sector the ROM's BOT target moves during USB mass storage - runs at
- * the identification rate. That is the obvious suspect for "USB access is very
- * slow", and it is not the audio/USB module sharing.
+ * sd_set_clock runs first from sd_init, before sd_power_on, so identification
+ * happens here. The SD spec caps identification at 400 kHz and allows 25 MHz
+ * for transfer, and until the ladder below existed every data read on this
+ * device - the FAT mount, every track, and every sector the ROM's BOT target
+ * moves during USB mass storage - ran at the identification rate. That is the
+ * suspect for "USB access is very slow", not the audio/USB module sharing.
  *
  * Measured, and the guess would have been wrong:
  *
@@ -118,8 +117,8 @@
  * rate, inside the spec's 400 kHz cap. That also settles that selecting source
  * 0x0a is right: it is the source the vendor's divider was chosen against.
  *
- * SD_DIV_DATA would be the transfer divider. It is currently DISABLED, and
- * the history is worth keeping because two hardware cycles went into it.
+ * Raising it is now the speed ladder at the end of sd_init, and the history
+ * is worth keeping because two hardware cycles went into it.
  *
  * 12 MHz was tried first, unverified: the card went unreadable the instant the
  * clock changed and the device booted to what looked like a blank volume.
@@ -135,13 +134,8 @@
  * Worse, the failure destroys the evidence. The black box is written to the
  * card, so a clock that makes the card unwritable produces no log of having
  * done so - the two boots that broke this way left nothing behind at all.
- *
- * Before re-enabling, the verification has to check bytes it can predict -
- * sector 0 ends in 0x55 0xAA on any card with a partition table - and it has
- * to survive the log being unavailable, which means falling back must be the
- * default outcome rather than the exceptional one. Slow and working beats fast
- * and blank; 375 kHz is the known-good rate and it stays until something
- * better is proved rather than assumed. */
+ * That is why the ladder ends at a rung equal to identification: falling all
+ * the way back is a reachable outcome, not an exceptional one. */
 
 /* Boot ROM SD HAL. All of these take a handle whose first word is the base. */
 #define ROM_SD_CMD      ((void     (*)(void *, unsigned, uint32_t))0x40c5u)
@@ -198,6 +192,7 @@ static const unsigned sd_pins[] = {
     0x00033d8bu, 0x0003458bu, 0x00034d8bu,
 };
 
+static uint32_t sd_clkcfg_id;        /* CLKCFG as identification left it */
 static bool     sd_ok;
 static uint32_t sd_rca;
 static uint32_t sd_cardtype;         /* 1 = SDv2, 2 = SDHC/SDXC */
@@ -286,12 +281,36 @@ static uint32_t SDICODE sd_wait_r1_idx(unsigned idx)
     return 0;
 }
 
+int SDICODE sd_read_sectors(IF_MD(int drive,)
+                            sector_t start, int count, void *buf);
+static bool SDICODE sd_verify(void);
+
 /* One sector, for the post-identification speed check. .bss, not const: it is
  * a DMA-free PIO read, but keeping card buffers out of flash is the standing
  * rule in this port. */
 static uint8_t sd_probe_buf[512];
 int SDICODE sd_read_sectors(IF_MD(int drive,) sector_t start, int count,
                             void *buf);
+
+/* Does this rate actually work? Content, never a return code.
+ *
+ * Sector 0's boot signature is the one byte pair every partitioned card is
+ * guaranteed to end its first sector with, so garbage is recognisable as
+ * garbage. The seven sectors after it are read for errors only - one good
+ * sector proves the rate can be reached, a short burst proves it can be
+ * sustained, and sustained is what the audio buffer fill needs. */
+static bool SDICODE sd_verify(void)
+{
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        if (sd_read_sectors(IF_MD(0,) (sector_t)i, 1, sd_probe_buf) != 0)
+            return false;
+        if (i == 0 && (sd_probe_buf[510] != 0x55 || sd_probe_buf[511] != 0xaa))
+            return false;
+    }
+    return true;
+}
 
 /* CMD0, CMD8 and the ACMD41 negotiation - vendor sd_power_on at 0x8288c4. */
 static uint32_t sd_power_on(void)
@@ -443,6 +462,7 @@ int sd_init(void)
     /* Vendor constants from HAL_SD_Init_new (0x828b54): the trailing three are
      * stack arguments landing in CLKCFG and the 0x64 register. */
     ROM_SD_CFG(&sdh, 0, 0, 0x20000000u, 8, 7, 0xfffu);
+    sd_clkcfg_id = R(SD_CLKCFG);
 
     R(SD_REG18) &= ~1u;
     R(SD_DTIMER) = 0xffffff40u;
@@ -493,30 +513,53 @@ int sd_init(void)
 
     sd_ok = true;
 
-    /* Identification is over and the card is selected, so leave 375 kHz behind
-     * - but PROVE the card still answers before keeping the faster clock.
+    /* Identification is over, so leave 375 kHz behind - by asking the ROM
+     * what "fast" means on this controller rather than guessing a divider.
      *
-     * The first attempt at this did not, and 12 MHz was too fast for this
-     * board: the log ended on the line announcing the new rate, and the card
-     * then read as an empty volume. That failure mode is nasty precisely
-     * because it is silent - the card identifies at 375 kHz, sd_ok is already
-     * true, and every subsequent read returns nothing rather than an error,
-     * so the device boots to what looks like a blank card.
+     * ROM 0x4690 is the vendor's own post-identification switch, and the one
+     * line in it that is not about the internal DMA is:
      *
-     * So: raise it, read a sector, and back out if that fails. One 512-byte
-     * read against never shipping a silently unreadable card again. Falling
-     * back is not a failure of sd_init - 375 kHz works, it is merely slow. */
-    if (SD_DIV_DATA != SD_DIV_ID) {
-        sd_set_clock(SD_DIV_DATA);
-        /* Content, not just a return code - see the note by SD_DIV_DATA. The
-         * boot signature is the one thing every partitioned card's sector 0
-         * ends with, so garbage is recognisable as garbage. */
-        if (sd_read_sectors(IF_MD(0,) 0, 1, sd_probe_buf) != 0 ||
-            sd_probe_buf[510] != 0x55 || sd_probe_buf[511] != 0xaa) {
-            logf("sd: div %u bad (%02x %02x), back to %u", SD_DIV_DATA,
-                 sd_probe_buf[510], sd_probe_buf[511], SD_DIV_ID);
-            sd_set_clock(SD_DIV_ID);
+     *     0x46de:  str r2, [r3, #76]     ; CLKCFG = 0x1003000c
+     *
+     * against the 0x20070008 that ROM_SD_CFG leaves behind at init. So the
+     * card clock is not the module divider alone: the controller has its own
+     * rate field at 0x4c, and the vendor's SD bring-up (FIRM 0xd67f26) never
+     * calls clk_div at all - it selects source 0x0a, starts clock 0x11, and
+     * lets CLKCFG do the dividing. Our divide-by-64 was compensating for a
+     * register we never wrote.
+     *
+     * Two earlier attempts raised the module divider blind and shipped a card
+     * that read as an empty volume, so this walks a ladder from fastest to
+     * slowest and keeps the first rung that DEMONSTRABLY reads. Every rung is
+     * verified by content, not by a return code - at the wrong rate this
+     * controller returns data rather than an error, which is exactly how a
+     * silently unreadable card got shipped twice. */
+    {
+        static const struct { uint32_t clkcfg; unsigned div; } ladder[] = {
+            { SD_CLKCFG_FAST, 1u  },        /* 24 MHz module clock */
+            { SD_CLKCFG_FAST, 2u  },        /* 12 MHz */
+            { SD_CLKCFG_FAST, 8u  },        /*  3 MHz */
+            { SD_CLKCFG_FAST, 64u },        /* vendor CLKCFG, identification divider */
+        };
+        unsigned i;
+
+        for (i = 0; i < sizeof(ladder) / sizeof(ladder[0]); i++) {
+            R(SD_CLKCFG) = ladder[i].clkcfg;
+            sd_set_clock(ladder[i].div);
+            if (sd_verify()) {
+                logf("sd: fast ok clkcfg=%08lx div=%u",
+                     (unsigned long)ladder[i].clkcfg, ladder[i].div);
+                return 0;
+            }
+            logf("sd: fast bad clkcfg=%08lx div=%u",
+                 (unsigned long)ladder[i].clkcfg, ladder[i].div);
         }
+
+        /* Nothing on the ladder held up: back to the state that identified the
+         * card, which is known to work and is merely slow. */
+        R(SD_CLKCFG) = sd_clkcfg_id;
+        sd_set_clock(SD_DIV_ID);
+        logf("sd: fast none, back to div=%u", SD_DIV_ID);
     }
 
     return 0;
@@ -565,6 +608,19 @@ static uint32_t SDICODE sd_read_fifo512(void *buf)
     uint8_t *p = buf, *end = p + 512;
     uint32_t t, w, err;
 
+    /* ROM 0x4794 is this loop, written by the people who built the controller:
+     * it drains eight words per burst with a post-indexed word store and no
+     * call per word. Ours went through memcpy() for every four bytes, and
+     * memcpy lives in flash - an XIP call in the middle of a FIFO drain. That
+     * is the same class of mistake as running a delay loop from flash, and it
+     * is why raising the clock produced garbage rather than an error: an
+     * overrun FIFO drops words silently.
+     *
+     * The ROM version stores words directly, so it needs an aligned
+     * destination; the open-coded loop below stays for the unaligned case. */
+    if (((uintptr_t)buf & 3u) == 0)
+        return ROM_SD_RD512(&sdh, buf);
+
     while (p < end) {
         uint32_t sta;
         t = 0;
@@ -574,7 +630,6 @@ static uint32_t SDICODE sd_read_fifo512(void *buf)
             if (sta & STA_RXREADY) break;
             if (++t > SD_SPIN) return 0x7d;
         }
-        /* ROM 0x4794 drains eight words per burst, then clears the flag. */
         for (t = 0; t < 8 && p < end; t++) {
             if ((err = sd_fifo_word(&w)) != 0)
                 return err;
