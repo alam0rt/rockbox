@@ -95,7 +95,10 @@
  * clock id, so selecting one is a thing you must do, not a thing you inherit. */
 #define SD_CLOCK_SRC 0x0au
 #define SD_DIV_ID   64u
-#define SD_DIV_DATA 4u          /* 24 MHz / 4 = 6 MHz, see below */
+/* DISABLED - equal to SD_DIV_ID means no speed change at all. Set to 4
+ * (6 MHz) or 2 (12 MHz) only alongside a verification that actually
+ * works; see the note below before changing it. */
+#define SD_DIV_DATA SD_DIV_ID
 /* Identification-speed divider (vendor: 0x40).
  *
  * And it is the ONLY divider this driver ever programs. sd_set_clock is called
@@ -115,15 +118,30 @@
  * rate, inside the spec's 400 kHz cap. That also settles that selecting source
  * 0x0a is right: it is the source the vendor's divider was chosen against.
  *
- * SD_DIV_DATA is the transfer divider, applied once the card is selected and
- * in transfer state, and then VERIFIED - see sd_init.
+ * SD_DIV_DATA would be the transfer divider. It is currently DISABLED, and
+ * the history is worth keeping because two hardware cycles went into it.
  *
- * 2 (12 MHz) was tried first and this board would not take it: the card went
- * unreadable the instant the clock changed. 4 gives 6 MHz, still a 16x
- * improvement on 375 kHz. Default speed permits 25 MHz, so the ceiling is not
- * the spec - it is this hardware, and where exactly is unmeasured. Raise it a
- * step at a time; the check below means a step too far costs a slow boot
- * rather than a card that reads as blank. */
+ * 12 MHz was tried first, unverified: the card went unreadable the instant the
+ * clock changed and the device booted to what looked like a blank volume.
+ * 6 MHz was tried next, with a check that raised the clock, read sector 0 and
+ * fell back if the read returned an error. The card was still blank.
+ *
+ * So the check was worthless, and the reason is the important part: at the
+ * wrong clock this controller does not report an error, it returns data. A
+ * read of sector 0 "succeeded" and handed back bytes that were not sector 0.
+ * Verifying the return code of a read proves nothing on hardware that fails
+ * this way; only verifying the CONTENT does.
+ *
+ * Worse, the failure destroys the evidence. The black box is written to the
+ * card, so a clock that makes the card unwritable produces no log of having
+ * done so - the two boots that broke this way left nothing behind at all.
+ *
+ * Before re-enabling, the verification has to check bytes it can predict -
+ * sector 0 ends in 0x55 0xAA on any card with a partition table - and it has
+ * to survive the log being unavailable, which means falling back must be the
+ * default outcome rather than the exceptional one. Slow and working beats fast
+ * and blank; 375 kHz is the known-good rate and it stays until something
+ * better is proved rather than assumed. */
 
 /* Boot ROM SD HAL. All of these take a handle whose first word is the base. */
 #define ROM_SD_CMD      ((void     (*)(void *, unsigned, uint32_t))0x40c5u)
@@ -488,10 +506,17 @@ int sd_init(void)
      * So: raise it, read a sector, and back out if that fails. One 512-byte
      * read against never shipping a silently unreadable card again. Falling
      * back is not a failure of sd_init - 375 kHz works, it is merely slow. */
-    sd_set_clock(SD_DIV_DATA);
-    if (sd_read_sectors(IF_MD(0,) 0, 1, sd_probe_buf) != 0) {
-        logf("sd: div %u unreadable, falling back to %u", SD_DIV_DATA, SD_DIV_ID);
-        sd_set_clock(SD_DIV_ID);
+    if (SD_DIV_DATA != SD_DIV_ID) {
+        sd_set_clock(SD_DIV_DATA);
+        /* Content, not just a return code - see the note by SD_DIV_DATA. The
+         * boot signature is the one thing every partitioned card's sector 0
+         * ends with, so garbage is recognisable as garbage. */
+        if (sd_read_sectors(IF_MD(0,) 0, 1, sd_probe_buf) != 0 ||
+            sd_probe_buf[510] != 0x55 || sd_probe_buf[511] != 0xaa) {
+            logf("sd: div %u bad (%02x %02x), back to %u", SD_DIV_DATA,
+                 sd_probe_buf[510], sd_probe_buf[511], SD_DIV_ID);
+            sd_set_clock(SD_DIV_ID);
+        }
     }
 
     return 0;
