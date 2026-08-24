@@ -430,40 +430,39 @@ static void sink_play(const void *addr, size_t size)
      * interrupt. Order matters - the vendor enables the channel before the
      * block, and the block before the NVIC. */
     AUDIO_CTRL    = (AUDIO_CTRL & ~0xf0u) | 0x11eu | 0x1u;
-    /* A CLEAN 0->1 EDGE, not an OR into bits that may already be set.
-     *
-     * This is what actually started the transfer. A probe that toggled ENABLE
-     * off and back on produced the first "audio irq" this port has ever seen;
-     * the same probe proved bits 2 and 3 of AUDIO_CTRL are simply not writable,
-     * so the earlier theory about a transmitter-enable bit was wrong.
-     *
-     * The vendor gets its edge for free: audio_start runs once per stream, with
-     * ENABLE at 0 beforehand. Ours was reading back en=00000003 already, so
-     * "|= 3" changed nothing and no transfer ever began. Subsequent buffers are
-     * re-armed from the ISR through yp3_dma_play alone, which is the same shape
-     * every other port uses - the STM32 driver re-arms only the DMA because the
-     * SAI stays enabled. */
     AUDIO_ENABLE &= ~0x3u;
     AUDIO_ENABLE |= 0x3u;
     yp3_irq_enable(IRQ_AUDIO, 8);
+
+    /* BIT 31 OF AUDIO_CTRL IS STICKY, AND WHILE IT IS SET VECTOR 43 NEVER
+     * FIRES. Clear it with a whole-word write; a read-modify-write preserves
+     * it forever, which is what every previous build did.
+     *
+     * Five boots of the black box say this and nothing else. The three runs
+     * that armed the DMA and stayed silent all read back ctrl=80041113 with
+     * irqst=00000004 - bit 31 set, an error bit posted, no interrupt. The one
+     * run that ever produced "audio irq" read back ctrl=00010113, irqst=0, and
+     * its probe log names the exact write that got it there:
+     *
+     *     lk try: retry=80041113 off=80041113 on=80041113 whole=00040113
+     *
+     * Toggling ENABLE off and back on left ctrl untouched at 80041113; only
+     * the whole-word store cleared bit 31. So the ENABLE edge below was not
+     * what started the transfer - this is. The edge is kept because it was
+     * present in the run that worked and costs nothing to reproduce.
+     *
+     * Bits 2 and 3 still refuse to latch after this, so they are not a
+     * transmitter enable; that theory is dead. Written as two stores because
+     * that is the sequence the working run executed, and the second one is
+     * what leaves bit 16 set. */
+    AUDIO_CTRL    = 0x11fu;
+    AUDIO_CTRL    = (AUDIO_CTRL & ~0xf0u) | 0x11eu | 0x1u;
+    AUDIO_ENABLE |= 0x3u;
 
     /* Amplifier last, once samples are already flowing, so it is not powered
      * up into a silent line. */
     yp3_speaker_pa(true);
 
-    /* Which enable bits actually latch.
-     *
-     * Every other Rockbox port enables the serial transmitter separately from
-     * arming the DMA, and with more than one bit: s5l8700 writes I2STXCOM with
-     * transmit-mode, interface-enable and DMA-request-enable as three distinct
-     * bits (and I2SCLKCON power-on before them), rk27xx has its own DMA-enable
-     * bit alongside separate I2S clock gates, and the STM32 SAI splits SAIEN
-     * from DMAEN. We write 0x11f to AUDIO_CTRL and read back 0x113 - bits 2 and
-     * 3 refuse to latch, and a DMA armed against a transmitter that is not
-     * enabled is exactly the symptom: armed, idle, no completion, no sound.
-     *
-     * So find out whether they can be set at all, and in what order. Setting a
-     * bit we already write in the line above cannot make anything worse. */
     /* The first two only: after that this is a per-buffer hot path. */
     if (pcm_plays < 2) {
         logf("pcm play #%lu addr=%08lx size=%lu mclk=%lu",
