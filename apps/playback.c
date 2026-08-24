@@ -86,10 +86,8 @@
  * for their correct seek target, 32k seems a good size */
 #define AUDIO_REBUFFER_GUESS_SIZE    (1024*32)
 
-/* Define LOGF_ENABLE to enable logf output in this file. A target can turn
- * the playback group on as a set with LOGF_ENABLE_PLAYBACK; see
- * firmware/export/config/yp3box.h. */
-#ifdef LOGF_ENABLE_PLAYBACK
+/* Define LOGF_ENABLE to enable logf output in this file */
+#if 0
 #define LOGF_ENABLE
 #endif
 #include "logf.h"

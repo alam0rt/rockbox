@@ -31,12 +31,8 @@
 #include "dsp_core.h"
 #include "codec_thread.h"
 
-/* Define LOGF_ENABLE to enable logf output in this file. A target can turn
- * the playback group on as a set with LOGF_ENABLE_PLAYBACK; see
- * firmware/export/config/yp3box.h. */
-#ifdef LOGF_ENABLE_PLAYBACK
-#define LOGF_ENABLE
-#endif
+/* Define LOGF_ENABLE to enable logf output in this file */
+/*#define LOGF_ENABLE*/
 #include "logf.h"
 #if (CONFIG_PLATFORM & PLATFORM_NATIVE)
 #include "cpu.h"
@@ -86,29 +82,27 @@ static inline unsigned int data_level(int quarter_secs)
 #define MIN_BUFFER_SIZE     (BYTERATE * 3)
 /* 1 seconds of buffer is low data */
 #define LOW_DATA            data_level(4)
-#elif MEMORYSIZE > 1
-#define PCMBUF_WATERMARK    (BYTERATE / 4)  /* 0.25 seconds */
-#define MIN_BUFFER_SIZE     (BYTERATE * 1)
-/* under watermark is low data */
-#define LOW_DATA            pcmbuf_watermark
 #else
-/* 512 KB targets. This ring is decoded-PCM LOOKAHEAD, not a buffer the
- * hardware needs: the DMA plays from pcm_dbl_buf, two 4 KB chunks. A second
- * of lookahead lets the codec run ahead and the disk rest, and on a 512 KB
- * device it simply does not fit - the whole audio arena is about 160 KB and
- * one second of 44.1 kHz stereo is 172 KB of ring before any file buffer.
+/* Seconds of decoded-PCM LOOKAHEAD, as a fraction. This ring is not a buffer
+ * the hardware needs - the DMA plays from the driver's own chunks - it is how
+ * far ahead the codec may run so the disk can rest. A target too small to
+ * afford a whole second can shorten it; one second of 44.1 kHz stereo is
+ * 172 KB, which on a 512 KB device is larger than the entire audio arena.
  *
- * Half a second, and the watermark DERIVED from the ring rather than stated
- * separately. That derivation is the point. These two constants have to stay
- * in proportion - playback only begins when unplayed data passes the
+ * The watermark stays DERIVED from the ring rather than stated beside it.
+ * That is the point of writing it this way: the two have to stay in
+ * proportion, because playback only begins once unplayed data passes the
  * watermark, so a watermark larger than the ring means playback can never
- * begin at all - and when they were independent this target got it wrong
- * twice: a ring of two chunks that could never close one, then a ring of five
- * against a watermark still sized for the full-rate one. Writing the
- * watermark as a fraction of MIN_BUFFER_SIZE makes that class of mistake
- * unrepresentable. */
-#define MIN_BUFFER_SIZE     (BYTERATE / 2)          /* ~10 chunks */
-#define PCMBUF_WATERMARK    (MIN_BUFFER_SIZE / 4)   /* a quarter of the ring */
+ * begin at all. Stated independently, that pairing has been got wrong twice.
+ */
+#ifndef PCMBUF_LOOKAHEAD_NUM
+#define PCMBUF_LOOKAHEAD_NUM 1
+#endif
+#ifndef PCMBUF_LOOKAHEAD_DEN
+#define PCMBUF_LOOKAHEAD_DEN 1
+#endif
+#define MIN_BUFFER_SIZE     (BYTERATE * PCMBUF_LOOKAHEAD_NUM / PCMBUF_LOOKAHEAD_DEN)
+#define PCMBUF_WATERMARK    (MIN_BUFFER_SIZE / 4)
 /* under watermark is low data */
 #define LOW_DATA            pcmbuf_watermark
 #endif

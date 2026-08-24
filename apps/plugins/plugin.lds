@@ -161,7 +161,11 @@ OUTPUT_FORMAT(elf32-littlemips)
  * Layout is .header|.text|.rodata then .data's initialiser image, contiguous,
  * so the whole flash payload for a codec is one objcopy range and .data's LMA
  * is simply the end of .rodata. */
+/* Enabled only with HAVE_CODEC_XIP, so the target header turns the whole
+ * split on and off in one place. */
+#ifdef HAVE_CODEC_XIP
 #define CODEC_XIP 1
+#endif
 
 #else
 # error "DRAM/IRAM memory map not defined!"
@@ -226,10 +230,17 @@ SECTIONS
     }
 
     .header : {
-        _plugin_start_addr = .;
-        plugin_start_addr = .;
         KEEP(*(.header))
     }
+
+    /* The header's load_addr is the codec's RAM base, NOT where the header
+     * itself lives: codec_load_ram() checks `hdr->load_addr != codecbuf` and
+     * rejects the codec if it differs. With the split the header is in flash,
+     * so point these at PLUGIN_RAM's origin, which is codecbuf, and is exactly
+     * where .data lands. The companion check on end_addr still guards a .bss
+     * that would overflow codecbuf. */
+    _plugin_start_addr = ORIGIN(PLUGIN_RAM);
+    plugin_start_addr = ORIGIN(PLUGIN_RAM);
 
     .text :
     {

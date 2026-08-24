@@ -46,7 +46,7 @@
  * make the next boot read the old ring at the new offset and dump convincing
  * garbage. A changed magic forces a clean cold init instead, costing exactly
  * one log - the one spanning the change, which is never the interesting one. */
-#define BLACKBOX_MAGIC      0x59503343u
+#define BLACKBOX_MAGIC      0x59503344u
 /* Stop a fault that reproduces immediately from rebooting for ever. */
 #define BLACKBOX_MAX_FAULTS 3
 
@@ -84,6 +84,13 @@ struct yp3_blackbox {
      * lines. Getting that backwards is how a log from an old image gets read
      * as evidence about a new one. */
     char     version[48];
+    /* Spare. Held the resume point for the audio module probe, which walked
+     * every module the vendor enables and proved none of them gates the audio
+     * block - it is a clock, not a module. The probe is gone; the field stays
+     * because removing it would move the logf ring behind it and force another
+     * BLACKBOX_MAGIC bump, costing the log that spans the change. Reuse it for
+     * the next probe that has to survive a reset. */
+    uint32_t probe_idx;
 };
 
 /* Placed by app.lds at the head of .persist; never defined in C, so nothing
@@ -114,6 +121,17 @@ static void bb_stamp_version(struct yp3_blackbox *bb)
     strlcpy(bb->version, rbversion, sizeof(bb->version));
     strlcat(bb->version, " ", sizeof(bb->version));
     strlcat(bb->version, YP3_BUILD_STAMP, sizeof(bb->version));
+}
+
+unsigned blackbox_probe_idx(void)
+{
+    return yp3_blackbox.magic == BLACKBOX_MAGIC ? yp3_blackbox.probe_idx : 0;
+}
+
+void blackbox_set_probe_idx(unsigned idx)
+{
+    if (yp3_blackbox.magic == BLACKBOX_MAGIC)
+        yp3_blackbox.probe_idx = idx;
 }
 
 void blackbox_init(void)

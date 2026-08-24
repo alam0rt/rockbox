@@ -25,6 +25,9 @@
 #include "pcm-internal.h"
 #include "pcm_sink.h"
 #include "sl6801-regs.h"
+#include "pcm_mixer.h"
+#include "kernel.h"
+#include "blackbox.h"
 #ifdef ROCKBOX_HAS_LOGF
 #define LOGF_ENABLE
 #endif
@@ -90,7 +93,15 @@ yp3_audio_pll(unsigned long rate)
     unsigned mult = f48 ? 12582u : 100034u;
     unsigned pre  = f48 ? 3u : 2u;
 
-    while (ACLK(0x14) & (1u << 11)) ;
+    /* Bounded. The vendor spins here unbounded (SRAM 0x80da4e); on a device
+     * with no console an unbounded wait is indistinguishable from a dead
+     * board, and this function is reached from the codec's own init. */
+    {
+        unsigned long spins = 0;
+        while ((ACLK(0x14) & (1u << 11)) && ++spins < 1000000) ;
+        if (spins >= 1000000)
+            logf("pll: BUSY never cleared, 14=%08lx", (unsigned long)ACLK(0x14));
+    }
     ACLK(0x10) = (ACLK(0x10) & 0xfc1f0000u) | 0x3000u | (pre << 5);
     ACLK(0x14) = (ACLK(0x14) & 0x3800u) | 0x80000000u | 0x400u | (mult << 14);
     yp3_audio_mclk = f48 ? 24576000ul : 22579000ul;
@@ -112,6 +123,12 @@ yp3_audio_pll(unsigned long rate)
 #define AUDIO_CLK_B     0x38
 #define AUDIO_CLK_SRC   0x39
 #define AUDIO_CLK_SRC_FROM 0x2a         /* cpu pll */
+/* Ruled out: clock 0x21. It is started at FIRM 0xd66196, which sits near
+ * audio_start and looked like the audio block's missing clock. It is not - the
+ * enclosing function's strings are 'malloc err.' and 'pin = 0x%x, port = %d.',
+ * so it is a GPIO pin-mux routine and 0x21 is almost certainly the GPIO
+ * controller's clock. Tried on hardware anyway: 0x40040300 still read back
+ * zero. Recorded so nobody spends another boot on it. */
 
 #define CODEC(o) (*(volatile uint32_t *)(0x4009b000u + (o)))
 
@@ -125,6 +142,31 @@ yp3_codec_enable(unsigned long rate)
         ROM_CLK_ENABLE(AUDIO_MODULE);
     ROM_CLK_APPLY(AUDIO_CLK_A);
     ROM_CLK_APPLY(AUDIO_CLK_B);
+
+    /* READ ONLY. Do not write these.
+     *
+     * A sweep that set gate bits for all 96 module ids hard-hung the device
+     * twice, before it could even log its first line. The bits at 0x40080000
+     * gate every peripheral including the SPI NOR controller this build
+     * executes from, so writing an unknown one stops instruction fetch: the
+     * CPU dies on its next instruction with no fault, no timeout and nothing
+     * in the ring. CLAUDE.md already records a blind module sweep hanging this
+     * device; removing the ROM's acknowledge spin made the sweep survivable in
+     * one way and left the real hazard untouched.
+     *
+     * What is safe, and still worth having, is reading them: this is the first
+     * look at which modules are actually powered in our configuration.
+     * base 0x40080000, three banks of 32 - 0x70/0x74/0x78 gate, 0x60/0x64/0x68
+     * release. ROM 0x2518 reports a module on only when BOTH bits are set. */
+    {
+        volatile unsigned long *ck = (volatile unsigned long *)0x40080000;
+        logf("gate: rel  60=%08lx 64=%08lx 68=%08lx",
+             ck[0x60/4], ck[0x64/4], ck[0x68/4]);
+        logf("gate: gate 70=%08lx 74=%08lx 78=%08lx",
+             ck[0x70/4], ck[0x74/4], ck[0x78/4]);
+    }
+
+    logf("codec: ctrl=%08lx (nonzero = block alive)", (unsigned long)AUDIO_CTRL);
 
     CODEC(0x4c) = (CODEC(0x4c) & ~0x0f000000u) | 0x0e000000u;
     CODEC(0x50) = 27;
@@ -276,6 +318,18 @@ static void sink_init(void)
 
 static void sink_postinit(void)
 {
+    /* Empty, and two traps worth recording for whoever fills it.
+     *
+     * Do NOT start playback here. pcm_postinit() sets pcm_is_ready[] only
+     * after this returns, so a play request made from this hook is silently
+     * dropped and the audio thread stalls before its queue loop ever runs -
+     * that hung the device on the loading screen.
+     *
+     * Do NOT hook probes to sink_play() either: whether it is reached at all
+     * is a race, because pcmbuf_play_start() starts the mixer only once a full
+     * 8 KiB chunk is committed, and on some boots the codec has produced less
+     * than that when it fires. Reading registers here is fine; blocking is
+     * not. */
 }
 
 static bool codec_running;
@@ -323,7 +377,11 @@ static void sink_play(const void *addr, size_t size)
         logf("pcm play #%lu addr=%08lx size=%lu mclk=%lu",
              (unsigned long)pcm_plays, (unsigned long)addr,
              (unsigned long)size, yp3_audio_mclk);
-        logf("pcm mod: dma21=%d codec57=%d",
+        /* 0x21 is the GENERAL DMA engine at 0x40001000 (dma_open, FIRM
+         * 0xd7d7f0), not this block - it is on because SD and the LCD use it,
+         * and it has never been evidence about 0x40040000. Kept only so the
+         * old logs stay comparable; the probe above is what answers it. */
+        logf("pcm mod: gen-dma21=%d codec57=%d (neither gates 0x40040000)",
              ROM_CLK_IS_ON(AUDIO_DMA_MODULE), ROM_CLK_IS_ON(AUDIO_MODULE));
         /* Readback. Zeroes here mean the module is off; correct values with
          * no completion mean the clock was never committed. */

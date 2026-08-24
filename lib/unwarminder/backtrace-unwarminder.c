@@ -25,7 +25,6 @@
 #include "backtrace.h"
 #include "safe_read.h"
 
-
 /***************************************************************************
  * Prototypes
  ***************************************************************************/
@@ -82,7 +81,6 @@ static Boolean CliReport(void *data, Int32 address)
               (address & 0x1) ? 'T' : 'A',
               address & (~0x1));
     lcd_update();
-
 
     return TRUE;
 }

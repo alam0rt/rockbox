@@ -31,12 +31,19 @@ void blackbox_record_panic(const char *msg);
  * file could not be opened. */
 bool blackbox_dump(void);
 
+/* Resume point for the audio module probe, kept in the region that survives a
+ * reset. See the probe in pcm-yp3box.c. */
+unsigned blackbox_probe_idx(void);
+void blackbox_set_probe_idx(unsigned idx);
+
 #else
 
 static inline void blackbox_init(void) { }
 static inline void blackbox_boot_dump(void) { }
 static inline void blackbox_record_panic(const char *msg) { (void)msg; }
 static inline bool blackbox_dump(void) { return false; }
+static inline unsigned blackbox_probe_idx(void) { return 0; }
+static inline void blackbox_set_probe_idx(unsigned idx) { (void)idx; }
 
 #endif /* HAVE_BLACKBOX */
 

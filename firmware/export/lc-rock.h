@@ -22,6 +22,15 @@
 
 #include "system.h"
 
+#ifdef HAVE_LC_OPEN_TARGET
+/* A target whose binaries are already resident in memory - executing in place
+ * from NOR, say - provides its own lc_open() and decides per binary whether
+ * there is anything to load at all. The stock card loader is still built,
+ * under this name, so that target can fall back to it for everything that is
+ * not resident. */
+void *lc_open_from_file(const char *filename, unsigned char *buf, size_t buf_size);
+#endif
+
 void *lc_open(const char *filename, unsigned char *buf, size_t buf_size);
 
 #if defined(HAVE_LC_OPEN_FROM_MEM)

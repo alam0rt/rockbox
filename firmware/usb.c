@@ -23,20 +23,6 @@
  *
  ****************************************************************************/
 #include "config.h"
-/* A target can turn this file's logf group on with LOGF_ENABLE_USB; see
- * firmware/export/config/yp3box.h. The connect handshake is otherwise
- * invisible on a device with no console, and "every thread has to acknowledge
- * before slave mode starts" is exactly the kind of thing that looks like a
- * broken USB driver.
- *
- * This has to sit above the other includes: logf.h defines logf() inside its
- * include guard but re-runs the per-file "not enabled, stub it out" tail on
- * every include, so a gate placed after some other header has already pulled
- * logf.h in only stops the stub from being re-applied - the stub is already
- * there. */
-#ifdef LOGF_ENABLE_USB
-#define LOGF_ENABLE
-#endif
 #include "cpu.h"
 #include "kernel.h"
 #include "thread.h"
@@ -78,7 +64,6 @@
 #if (!defined(BOOTLOADER) || defined(HAVE_BOOTLOADER_USB_MODE))
 #define USB_FULL_INIT
 #endif
-
 
 /* USB detect debouncing interval (200ms taken from the usb polling code) */
 #define USB_DEBOUNCE_POLL (200*HZ/1000)

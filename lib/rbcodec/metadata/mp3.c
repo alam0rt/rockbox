@@ -33,11 +33,6 @@
 #include <stdbool.h>
 #include "string-extra.h"
 #include "config.h"
-/* A target can enable this file's logf group with LOGF_ENABLE_PLAYBACK;
- * see firmware/export/config/yp3box.h. */
-#ifdef LOGF_ENABLE_PLAYBACK
-#define LOGF_ENABLE
-#endif
 #include "logf.h"
 #include "platform.h"
 

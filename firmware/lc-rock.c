@@ -24,13 +24,14 @@
 #include "file.h"
 #include "debug.h"
 #include "load_code.h"
-#ifdef ROCKBOX_HAS_LOGF
-#define LOGF_ENABLE
-#endif
 #include "logf.h"
 
 /* load binary blob from disk to memory, returning a handle */
+#ifdef HAVE_LC_OPEN_TARGET
+void * lc_open_from_file(const char *filename, unsigned char *buf, size_t buf_size)
+#else
 void * lc_open(const char *filename, unsigned char *buf, size_t buf_size)
+#endif
 {
     int fd = open(filename, O_RDONLY);
     ssize_t read_size;

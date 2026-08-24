@@ -127,14 +127,28 @@
  *     vorbis        172     (90,192 of text+rodata, all now in flash)
  *
  * See apps/plugins/plugin.lds (SL6801 branch), tools/codec_slots.txt for the
- * slot addresses, and tools/gen_codec_slots.py which feeds both the link flags
- * and the loader's table. */
+ * slot addresses, and tools/gen_codec_slots.py which feeds the link flags and
+ * this target's slot table. The runtime half is target/arm/smartlink/yp3box/
+ * lc-yp3box.c: it owns lc_open(), so nothing in apps/ or lib/rbcodec knows
+ * this target keeps codecs in flash.
+ *
+ * This is the default for this target. Known open issue: codecs linked into
+ * flash slots load and enter, and the device has been seen to hard-hang inside
+ * the codec entry point. The black box is the instrument for that; see
+ * docs/ROADMAP.md. The two defines below turn on together. */
 #define HAVE_CODEC_XIP
 
+/* lc-yp3box.c provides lc_open(); the stock card loader in lc-rock.c is still
+ * built, as lc_open_from_file(), and every PLUGIN falls through to it. Codecs
+ * do not: see the note on the fallback in lc-yp3box.c. Only meaningful
+ * together with HAVE_CODEC_XIP. */
+#define HAVE_LC_OPEN_TARGET
+
 /* 0x13000 is 77,824: clears spc, the worst writable footprint, by 1,044
- * bytes. Before the XIP split this had to be 0x1b000 to hold mpa's
- * 105,784-byte total. Dropping spc, atrac3 and tta - the call already
- * made for cook, ay and gbs - would let it fall to 0xb000. */
+ * bytes. Without the XIP split this has to be 0x1b000 to hold mpa's
+ * 105,784-byte total - so turning HAVE_CODEC_XIP off means putting this back.
+ * Dropping spc, atrac3 and tta - the call already made for cook, ay and gbs -
+ * would let it fall to 0xb000. */
 #define CODEC_SIZE          0x13000
 
 /* The tree cache is allocated before playback. The generic 1,000-entry default
@@ -144,13 +158,17 @@
  * compressed-input reserve. Existing settings are clamped at tree init. */
 #define MAX_FILES_IN_DIR_LIMIT 200
 
-/* No PCM_MIN_BUFFER_DIVISOR here, and none in apps/pcmbuf.c either.
- * That knob was invented by this port and existed on no other target, so
- * nothing upstream ever exercised the code path and it broke twice in a row:
- * two 8 KiB chunks could never close a chunk, and five could never reach a
- * watermark that was still sized against the full-rate ring. Use the sizing
- * every other target uses and solve the memory problem as a memory problem.
- */
+/* Half a second of decoded-PCM lookahead instead of a whole one. A second is
+ * 172 KB at 44.1 kHz stereo and the entire audio arena here is about 160 KB.
+ *
+ * This replaced PCM_MIN_BUFFER_DIVISOR, a knob this port invented that existed
+ * on no other target, so nothing upstream ever exercised the path and it broke
+ * twice in a row: two 8 KiB chunks could never close a chunk, and five could
+ * never reach a watermark still sized against the full-rate ring. The fraction
+ * below is stated once and pcmbuf.c derives the watermark from it, so the two
+ * cannot drift apart again. */
+#define PCMBUF_LOOKAHEAD_DEN   2
+
 #define AUDIO_BUFFER_RESERVE   0x4000
 /* A 128x160 RGB565 default backdrop costs 40 KiB in core buflib. Keep that
  * memory available for the PCM ring and compressed-file buffer. */
@@ -184,9 +202,13 @@
  *
  * 16 KB of ring is not affordable here - the entire core buffer is 79 KB - so
  * the ring is 6 KB, which holds a few hundred lines: enough for one track
- * load. LOGF_ENABLE_PLAYBACK turns on the playback, buffering and codec-thread
- * log groups together, which is the set that says why a track failed to
- * start. */
+ * load.
+ *
+ * Which files log is decided in tools/40_build.sh, which passes -DLOGF_ENABLE
+ * per object. Rockbox's own convention is a commented-out #define at the top
+ * of each file, and following it would have meant editing seven shared files -
+ * playback, buffering, pcmbuf, codec_thread, metadata, mp3 and usb - to name
+ * this target in each. A per-object flag says the same thing from outside. */
 /* The black box. The log ring, the panic message and the fault registers live
  * in a linker region nothing clears, so they survive a panic, a hard fault, a
  * hang plus pinhole reset, and a watchdog reset; the next boot writes them to
@@ -203,8 +225,6 @@
 
 #ifdef ROCKBOX_HAS_LOGF
 #define MAX_LOGF_SIZE       6144
-#define LOGF_ENABLE_PLAYBACK
-#define LOGF_ENABLE_USB
 #endif
 
 #define HAVE_SEMAPHORE_OBJECTS
