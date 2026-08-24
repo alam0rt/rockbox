@@ -309,10 +309,15 @@ void yp3_audio_irq(void)
      *
      * logf from interrupt context is not something to leave in the tree, but
      * three bounded calls are worth one boot. */
-    if (pcm_irqs <= 3)
+    if (pcm_irqs <= 8)
         logf("audio irq #%lu status=%08lx", (unsigned long)pcm_irqs,
              (unsigned long)status);
 
+    /* The vendor dispatches bit 0 and bit 1 to two separate callbacks
+     * (SRAM 0x813774), and vectors-sl6801.S calls this "half/full transfer
+     * complete", so bit 0 is half and bit 1 is full. The first interrupt we
+     * ever saw carried status=0x05 - bit 0 and bit 2, no bit 1 - so if the
+     * stream stalls after one half-transfer this test is the next suspect. */
     if (status & 2u) {                  /* full transfer complete */
         const void *addr;
         size_t size;
@@ -425,6 +430,20 @@ static void sink_play(const void *addr, size_t size)
      * interrupt. Order matters - the vendor enables the channel before the
      * block, and the block before the NVIC. */
     AUDIO_CTRL    = (AUDIO_CTRL & ~0xf0u) | 0x11eu | 0x1u;
+    /* A CLEAN 0->1 EDGE, not an OR into bits that may already be set.
+     *
+     * This is what actually started the transfer. A probe that toggled ENABLE
+     * off and back on produced the first "audio irq" this port has ever seen;
+     * the same probe proved bits 2 and 3 of AUDIO_CTRL are simply not writable,
+     * so the earlier theory about a transmitter-enable bit was wrong.
+     *
+     * The vendor gets its edge for free: audio_start runs once per stream, with
+     * ENABLE at 0 beforehand. Ours was reading back en=00000003 already, so
+     * "|= 3" changed nothing and no transfer ever began. Subsequent buffers are
+     * re-armed from the ISR through yp3_dma_play alone, which is the same shape
+     * every other port uses - the STM32 driver re-arms only the DMA because the
+     * SAI stays enabled. */
+    AUDIO_ENABLE &= ~0x3u;
     AUDIO_ENABLE |= 0x3u;
     yp3_irq_enable(IRQ_AUDIO, 8);
 
@@ -445,39 +464,6 @@ static void sink_play(const void *addr, size_t size)
      *
      * So find out whether they can be set at all, and in what order. Setting a
      * bit we already write in the line above cannot make anything worse. */
-    if (pcm_plays < 2) {
-        uint32_t a, b, c, d;
-
-        /* 1. Straight retry, now that the DMA is armed and ENABLE is 3. */
-        AUDIO_CTRL |= 0xcu;
-        a = AUDIO_CTRL;
-
-        /* 2. With the block disabled. Plenty of serial transmitters only
-         *    accept configuration while they are stopped - the STM32 SAI is
-         *    documented that way, and s5l8700 writes its whole I2STXCOM word
-         *    in one go rather than setting bits into a running block. */
-        AUDIO_ENABLE &= ~0x3u;
-        AUDIO_CTRL   |= 0xcu;
-        b = AUDIO_CTRL;
-        AUDIO_ENABLE |= 0x3u;
-        c = AUDIO_CTRL;
-
-        /* 3. The whole word at once rather than read-modify-write, in case
-         *    the bits are only honoured as part of a complete configuration. */
-        AUDIO_CTRL = 0x11fu;
-        d = AUDIO_CTRL;
-
-        logf("blk try: retry=%08lx off=%08lx on=%08lx whole=%08lx",
-             (unsigned long)a, (unsigned long)b, (unsigned long)c,
-             (unsigned long)d);
-
-        /* Leave the block in the best state any of those reached: if bits 2
-         * and 3 took at any point, keep them. This is a probe that is allowed
-         * to succeed - if the transmitter comes up, sound comes out. */
-        AUDIO_CTRL   = (AUDIO_CTRL & ~0xf0u) | 0x11eu | 1u;
-        AUDIO_ENABLE |= 0x3u;
-    }
-
     /* The first two only: after that this is a per-buffer hot path. */
     if (pcm_plays < 2) {
         logf("pcm play #%lu addr=%08lx size=%lu mclk=%lu",
