@@ -446,12 +446,36 @@ static void sink_play(const void *addr, size_t size)
      * So find out whether they can be set at all, and in what order. Setting a
      * bit we already write in the line above cannot make anything worse. */
     if (pcm_plays < 2) {
-        uint32_t a, b, c;
-        AUDIO_CTRL |= 4u;   a = AUDIO_CTRL;
-        AUDIO_CTRL |= 8u;   b = AUDIO_CTRL;
-        AUDIO_CTRL |= 0xcu; c = AUDIO_CTRL;
-        logf("blk bits: |4=%08lx |8=%08lx |c=%08lx",
-             (unsigned long)a, (unsigned long)b, (unsigned long)c);
+        uint32_t a, b, c, d;
+
+        /* 1. Straight retry, now that the DMA is armed and ENABLE is 3. */
+        AUDIO_CTRL |= 0xcu;
+        a = AUDIO_CTRL;
+
+        /* 2. With the block disabled. Plenty of serial transmitters only
+         *    accept configuration while they are stopped - the STM32 SAI is
+         *    documented that way, and s5l8700 writes its whole I2STXCOM word
+         *    in one go rather than setting bits into a running block. */
+        AUDIO_ENABLE &= ~0x3u;
+        AUDIO_CTRL   |= 0xcu;
+        b = AUDIO_CTRL;
+        AUDIO_ENABLE |= 0x3u;
+        c = AUDIO_CTRL;
+
+        /* 3. The whole word at once rather than read-modify-write, in case
+         *    the bits are only honoured as part of a complete configuration. */
+        AUDIO_CTRL = 0x11fu;
+        d = AUDIO_CTRL;
+
+        logf("blk try: retry=%08lx off=%08lx on=%08lx whole=%08lx",
+             (unsigned long)a, (unsigned long)b, (unsigned long)c,
+             (unsigned long)d);
+
+        /* Leave the block in the best state any of those reached: if bits 2
+         * and 3 took at any point, keep them. This is a probe that is allowed
+         * to succeed - if the transmitter comes up, sound comes out. */
+        AUDIO_CTRL   = (AUDIO_CTRL & ~0xf0u) | 0x11eu | 1u;
+        AUDIO_ENABLE |= 0x3u;
     }
 
     /* The first two only: after that this is a per-buffer hot path. */
