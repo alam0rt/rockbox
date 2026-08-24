@@ -40,15 +40,53 @@
 #define WDOG_FEED       REG32(WDOG_BASE + 0x04)
 #define WDOG_LOAD       REG32(WDOG_BASE + 0x14)
 #define WDOG_CTRL       REG32(WDOG_BASE + 0x18)
-/* audio */
-#define AUDIO_CTRL      REG32(0x40040300)
-#define AUDIO_ENABLE    REG32(0x40040304)
-#define AUDIO_IRQSTAT   REG32(0x40040308)
-#define AUDIO_DMA(ch)   (0x40040200 + (ch) * 0x10)
-#define AUDIO_DMA_CTRL(ch) REG16(AUDIO_DMA(ch) + 0x04)
-#define AUDIO_DMA_ADDR(ch) REG32(AUDIO_DMA(ch) + 0x08)
-#define AUDIO_DMA_LEN(ch)  REG32(AUDIO_DMA(ch) + 0x0c)
-#define IRQ_AUDIO       43
+/* Audio. 0x40009000, module 0x25, clock 0x13 - NOT 0x40040300, which is the
+ * USB mass-storage controller. See docs/AUDIO.md for how that was established
+ * and what it cost; the short version is that FIRM 0xd66fe4 reads exactly like
+ * audio_start and lives inside driver_usbd_msc_param_init. */
+#define AUDIO_BASE      0x40009000
+#define AUD(o)          REG32(AUDIO_BASE + (o))
+#define AUDIO_MODULE    0x25u       /* FIRM 0xd7d5d0, audio_hw_init          */
+#define AUDIO_CLK       0x13u       /* FIRM 0xd7d5d6                         */
+#define AUDIO_MCLK      0x00u       /* the PLL output; set_pll then apply(0) */
+#define ASRC_MODULE     0x20u       /* held only while zeroing 0x40009400    */
+#define ASRC_CLK        0x2du
+/* The playback (TX) group. +0x20c is the FIFO the DMA engine writes into. */
+#define AUD_TX_CTRL     AUD(0x200)  /* [0] enable [1] run [11:8] rate code   */
+#define AUD_TX_FMT      AUD(0x208)  /* [2] stereo, [7] always set            */
+#define AUD_TX_FIFO     0x4000920cu
+#define AUD_TX_CH(n)    (0x220u + (n) * 0x30u)      /* n = 0..3              */
+#define AUD_TX_MUTE(n)  AUD(AUD_TX_CH(n) + 4)       /* bit 16                */
+#define AUD_TX_VOL(n)   AUD(AUD_TX_CH(n) + 8)       /* [8:0], 0 = silent     */
+/* The capture (RX) group, mirror image; +0x10c is its FIFO. */
+#define AUD_RX_CTRL     AUD(0x100)
+#define AUD_RX_FIFO     0x4000910cu
+#define AUD_RX_CH(n)    (0x130u + (n) * 0x20u)      /* n = 0..2; 0x110 is a
+                                                     * group register, not a
+                                                     * channel               */
+#define AUD_RX_MUTE(n)  AUD(AUD_RX_CH(n) + 4)       /* bit 16                */
+#define AUD_RX_VOL(n)   AUD(AUD_RX_CH(n) + 8)       /* [8:0]                 */
+#define AUD_VOL_MAX     0x1ffu
+
+/* The general DMA engine: eight channels, module 0x21, IRQ 60 + channel.
+ * Fully decoded in docs/DMA.md and confirmed against probe/dma_work.bin. */
+#define DMA_BASE        0x40001000
+#define DMA_MODULE      0x21u
+#define DMA_CHANNELS    8
+#define DMA_CH_BASE(ch) (DMA_BASE + (ch) * 0x40)
+#define DMA_CTRL(ch)    REG32(DMA_CH_BASE(ch) + 0x00)
+#define DMA_DST(ch)     REG32(DMA_CH_BASE(ch) + 0x04)
+#define DMA_SRC(ch)     REG32(DMA_CH_BASE(ch) + 0x08)
+#define DMA_LEN(ch)     REG32(DMA_CH_BASE(ch) + 0x0c)
+#define DMA_CFG(ch)     REG32(DMA_CH_BASE(ch) + 0x20)
+#define DMA_IRQST(ch)   REG32(DMA_CH_BASE(ch) + 0x24)
+#define DMA_CTRL_GO     (1u << 30)
+#define DMA_CTRL_CONT   (1u << 29)  /* cleared by dma_start, set by the loop
+                                     * variant at SRAM 0x814cc0 [U]          */
+#define DMA_LEN_MASK    0x3ffffu    /* 18 bits: 262143 bytes per transfer    */
+#define DMA_IRQ(ch)     (60u + (ch))
+#define DMA_IRQST_A     1u          /* handle callback A [U]                 */
+#define DMA_IRQST_DONE  2u          /* handle callback B, transfer complete  */
 /* clock ids that more than one driver needs; the rest stay with their driver */
 #define NORF_CLK        0x2b        /* SPI flash - we execute through it */
 /* SDIO (ST-derived layout) */

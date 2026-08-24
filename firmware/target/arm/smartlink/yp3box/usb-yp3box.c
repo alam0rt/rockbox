@@ -464,14 +464,18 @@ usb_hw_enable(void)
 
 /* Teardown, FIRM 0xd66c3a: stop the clock, then drop the module.
  *
- * We stop the clock and LEAVE THE MODULE ON. Module 0x23 does not gate USB
- * alone - it gates the audio block at 0x40040000 too, proved by a probe that
- * walked nine candidates and found AUDIO_CTRL holding a value only once 0x23
- * was enabled (see pcm-yp3box.c). Dropping it here takes audio down with USB.
+ * We stop the clock and LEAVE THE MODULE ON, and the vendor does the same:
+ * 0x23 is on in probe/clk80_work.bin, the gate capture taken with its firmware
+ * running. Stopping the clock is enough to quiesce the controller.
  *
- * The vendor does not turn it off either: 0x23 is on in probe/clk80_work.bin,
- * the gate capture taken with its firmware running. Stopping the clock is
- * enough to quiesce the controller. */
+ * The reason this comment used to give was wrong. It said 0x23 gates "the
+ * audio block at 0x40040000" as well as USB, from a probe that walked nine
+ * candidates and found registers at 0x40040300 holding a value only once 0x23
+ * was enabled. Those registers are the USB mass-storage controller's, not
+ * audio's - the probe found the USB gate and was reading USB registers back.
+ * Audio is module 0x25 at 0x40009000 and is unaffected by anything in this
+ * file (docs/AUDIO.md). Leaving the module on is still right; it is just USB's
+ * own business. */
 static void __attribute__((section(".icode"), noinline))
 usb_hw_disable(void)
 {
@@ -491,8 +495,8 @@ void usb_init_device(void)
  * is ours to hand over. */
 /* The controller registers, for the probe below. The ROM's USB code reaches
  * 0x40040001 (0x5204), 0x4004000b (0x5572), 0x4004000e and 0x40040012
- * (0x5118..0x5136) - the same page pcm-yp3box.c writes for audio DMA, which
- * is worth knowing but is not in play here: nothing plays during USB mode. */
+ * (0x5118..0x5136). pcm-yp3box.c used to write this same page believing it was
+ * audio DMA; it no longer does, and this page belongs entirely to USB. */
 #define USBC(o)             REG8(0x40040000u + (o))
 
 #ifdef ROCKBOX_HAS_LOGF
