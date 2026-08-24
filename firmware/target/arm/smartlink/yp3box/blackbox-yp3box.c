@@ -157,19 +157,47 @@ void blackbox_set_probe_idx(unsigned idx)
  * Bounded on purpose. The ring is 6 KB and wraps, so an unbounded beacon
  * would eventually be the only thing in it; BB_TICK_MAX seconds is longer
  * than any boot we are trying to explain and stops well before that. */
-#define BB_TICK_MAX 400
+/* Report SILENCE, not time.
+ *
+ * A line per second buried the interesting boot: the ring is 6 KB, it carries
+ * several runs, and 75 t= lines per boot pushed the slow run off the front -
+ * the one boot we needed was the one that got overwritten.
+ *
+ * So watch logfindex instead. If it has not moved since the last tick, nothing
+ * logged that second; when it moves again, emit one line naming how long the
+ * quiet lasted. A busy boot produces almost nothing and a stalled one produces
+ * exactly the line that brackets the stall, next to the log entry that ended
+ * it. */
+#define BB_GAP_MIN 2            /* seconds of silence worth reporting */
 
 static long bb_tick_next;
-static int  bb_tick_left = BB_TICK_MAX;
+static int  bb_last_index;
+static int  bb_quiet;
 
 static void bb_tick_beacon(void)
 {
-    if (bb_tick_left <= 0 || TIME_BEFORE(current_tick, bb_tick_next))
+    if (TIME_BEFORE(current_tick, bb_tick_next))
         return;
-
     bb_tick_next = current_tick + HZ;
-    bb_tick_left--;
-    logf("t=%ld", (long)(current_tick / HZ));
+
+#ifdef ROCKBOX_HAS_LOGF
+    if (logfindex == bb_last_index) {
+        bb_quiet++;
+        return;
+    }
+    bb_last_index = logfindex;
+
+    if (bb_quiet >= BB_GAP_MIN) {
+        int q = bb_quiet;
+        bb_quiet = 0;
+        /* logf moves the index, so re-sync after it or the next tick counts
+         * this line as activity that already happened. */
+        logf("... %ds quiet, now t=%ld", q, (long)(current_tick / HZ));
+        bb_last_index = logfindex;
+        return;
+    }
+    bb_quiet = 0;
+#endif
 }
 
 void blackbox_init(void)
