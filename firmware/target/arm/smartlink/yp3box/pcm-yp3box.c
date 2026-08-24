@@ -300,6 +300,19 @@ void yp3_audio_irq(void)
 
     pcm_irqs++;
 
+    /* The first three only. "pcm stop:" already reports plays against irqs,
+     * but it needs a clean stop and no run has yet reached one - they end on a
+     * pin reset or a USB unplug. This says the same thing without waiting for
+     * that: no line at all means vector 43 never fires, so the DMA is armed
+     * and not running. A line with bit 1 clear means it fires but never
+     * signals completion, which is a different fault entirely.
+     *
+     * logf from interrupt context is not something to leave in the tree, but
+     * three bounded calls are worth one boot. */
+    if (pcm_irqs <= 3)
+        logf("audio irq #%lu status=%08lx", (unsigned long)pcm_irqs,
+             (unsigned long)status);
+
     if (status & 2u) {                  /* full transfer complete */
         const void *addr;
         size_t size;
