@@ -654,8 +654,11 @@ Lyre prototype 1 */
 # define HAVE_LC_OPEN_FROM_MEM
 #endif
 
-/* Codec buffering requires the ability to load code from RAM */
-#if defined(HAVE_LC_OPEN_FROM_MEM)
+/* Codec buffering requires the ability to load code from RAM, and is pointless
+ * when the codecs are already resident and execute in place: there is nothing
+ * to load, so buffering the file only spends audio buffer on a copy that the
+ * loader will reject and then ignore. */
+#if defined(HAVE_LC_OPEN_FROM_MEM) && !defined(HAVE_CODEC_XIP)
 # define HAVE_CODEC_BUFFERING
 #endif
 
