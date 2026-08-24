@@ -95,7 +95,21 @@
  * clock id, so selecting one is a thing you must do, not a thing you inherit. */
 #define SD_CLOCK_SRC 0x0au
 #define SD_DIV_ID   64u
-/* Identification-speed divider (vendor: 0x40). */
+/* Identification-speed divider (vendor: 0x40).
+ *
+ * And it is the ONLY divider this driver ever programs. sd_set_clock is called
+ * once, from sd_init, before sd_power_on - then identification finishes, CMD7
+ * selects the card, SET_BLOCKLEN runs, sd_ok goes true, and the clock is left
+ * where it was. The SD spec caps identification at 400 kHz and allows 25 MHz
+ * for transfer, so every data read on this device - the FAT mount, every track,
+ * and every sector the ROM's BOT target moves during USB mass storage - runs at
+ * the identification rate. That is the obvious suspect for "USB access is very
+ * slow", and it is not the audio/USB module sharing.
+ *
+ * Not changed yet, on purpose: the transfer divider wants a measurement, not a
+ * guess. Too fast is CRC failures on a path that currently works. The log line
+ * in sd_set_clock reports what 64 actually yields and what the source runs at,
+ * which is the number to divide down from. */
 
 /* Boot ROM SD HAL. All of these take a handle whose first word is the base. */
 #define ROM_SD_CMD      ((void     (*)(void *, unsigned, uint32_t))0x40c5u)
@@ -141,6 +155,7 @@
 #define ROM_CLK_ENABLE  ((void (*)(unsigned))0x2565u)
 #define ROM_CLK_DISABLE ((void (*)(unsigned))0x2571u)
 #define ROM_GPIO_CFG1   ((void (*)(unsigned))0x7adu)
+#define ROM_CLK_FREQ    ((uint32_t (*)(unsigned))0x3851u)  /* docs/ROM-API.md */
 
 /* ROM entry points only dereference handle[0]. */
 static struct { volatile uint32_t *base; } sdh;
@@ -197,6 +212,13 @@ static void SDICODE sd_set_clock(unsigned div)
     ROM_CLK_DIV(SD_CLOCK, div);
     sd_mdelay(100);
     ROM_CLK_APPLY(SD_CLOCK);
+
+    /* get_clock_freq computes from the dividers and does not look at the gate,
+     * so this reports a configured rate rather than a proven-running one -
+     * which is exactly what is wanted here. */
+    logf("sd: clk=%lu Hz src%#x=%lu Hz div=%u",
+         (unsigned long)ROM_CLK_FREQ(SD_CLOCK), SD_CLOCK_SRC,
+         (unsigned long)ROM_CLK_FREQ(SD_CLOCK_SRC), div);
 }
 
 
