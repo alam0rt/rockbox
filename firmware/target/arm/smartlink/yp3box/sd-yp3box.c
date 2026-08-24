@@ -137,6 +137,10 @@ static tCardInfo sd_card;
 #define SDICODE __attribute__((section(".icode"), noinline))
 
 #define SPIN_PER_US 80u
+/* From SRAM this is a real bound, not a flash-fetch crawl. 4 million iterations
+ * per wait, executed from flash, across the reads a FAT mount performs, is
+ * minutes - which looks exactly like a hang. */
+#define SD_SPIN 400000u
 
 static void SDICODE sd_busywait(uint32_t n)
 {
@@ -171,10 +175,17 @@ static void SDICODE sd_set_clock(unsigned div)
 /* The response flag handling below mirrors the ROM's return codes. */
 static uint32_t SDICODE sd_wait_r1_idx(unsigned idx)
 {
-    uint32_t sta;
+    uint32_t sta, t = 0;
 
+    /* Bounded like every other wait in this driver. This one was not, and it
+     * is the wait CMD55 uses - so a card that stopped answering APP_CMD hung
+     * the storage thread here for ever, with no console to say so. The card
+     * failing to answer is exactly what "sd: no card (power_on=4)" reports,
+     * which means we have been one unlucky timing difference away from a
+     * silent hang on the USB-eject path. */
     while (!(R(SD_STA) & STA_DONE))
-        ;
+        if (++t > SD_SPIN)
+            return 0x7f;                     /* same code sd_wait_data uses */
 
     if (R(SD_STA) & STA_ERRMASK)  { return 32; }
     sta = R(SD_STA);
@@ -193,7 +204,7 @@ static uint32_t SDICODE sd_wait_r1_idx(unsigned idx)
 static uint32_t sd_power_on(void)
 {
     uint32_t arg41 = 0x00100000u;    /* OCR voltage window */
-    uint32_t ocr;
+    uint32_t ocr, err;
     int tries;
 
     sd_cardtype = 0;
@@ -213,8 +224,18 @@ static uint32_t sd_power_on(void)
     /* The vendor allows 500ms; ACMD41 is polled until the card clears busy. */
     for (tries = 0; tries < 600; tries++) {   /* vendor allows 500 ms */
         ROM_SD_CMD(&sdh, 55, 0);             /* APP_CMD */
-        if (sd_wait_r1_idx(55))
+        err = sd_wait_r1_idx(55);
+        if (err) {
+            /* "power_on=4" collapsed four different faults into one number:
+             * 0x7f the wait timing out (no clock, or no card at all), 32 a
+             * controller error flag, 3 a response timeout, 1 a CRC failure -
+             * which is a signal-integrity answer, not a missing-card one - and
+             * 16 the card answering with the wrong index. They want different
+             * fixes, so say which. */
+            logf("sd: CMD55 fail sub=%lu try=%d type=%lu",
+                 (unsigned long)err, tries, (unsigned long)sd_cardtype);
             return 4;
+        }
 
         ROM_SD_CMD(&sdh, 41, arg41);         /* SD_SEND_OP_COND, replies R3 */
         if (ROM_SD_WAIT_R3(&sdh))
@@ -386,11 +407,6 @@ int sd_init(void)
  * Both ROM routines can spin forever. These bounded equivalents return an error
  * instead, so disk_mount_all cannot hang without reporting a failure.
  */
-/* From SRAM this is a real bound, not a flash-fetch crawl. 4 million iterations
- * per wait, executed from flash, across the reads a FAT mount performs, is
- * minutes - which looks exactly like a hang. */
-#define SD_SPIN 400000u
-
 static uint32_t SDICODE sd_wait_data(unsigned idx)
 {
     uint32_t sta, t = 0;
