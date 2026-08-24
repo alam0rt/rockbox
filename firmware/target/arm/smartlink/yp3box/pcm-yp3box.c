@@ -222,18 +222,50 @@ yp3_codec_enable(unsigned long rate)
 
 /* --- DMA ------------------------------------------------------------------
  *
- * The vendor's audio_dma_setup writes three pieces of state before arming
- * channel 0: format/mode at 0x4004000e, the playback configuration halfword
- * at 0x40040016, and the channel registers. The observed playback caller at
- * SRAM 0x813738 passes dir=0, mode=1, flag=1. The old port only programmed the
- * channel registers with mode=0, flag=0, leaving the audio block unconfigured.
+ * THIS IS A MENTOR/INVENTRA MUSB CONTROLLER, AND THE AUDIO PATH SHARES IT.
+ *
+ * 0x40040000 is the USB block - usb-yp3box.c has been writing FADDR at 0x00,
+ * POWER at 0x01, INTRUSBE at 0x0b, INDEX at 0x0e, TXCSR at 0x12 and DEVCTL at
+ * 0x60 the whole time, which is the MUSB common register map exactly. That is
+ * also why module 0x23 gates "the audio block" and the USB device together:
+ * it is one peripheral, and the nine-way probe found the right gate for the
+ * wrong reason.
+ *
+ * Once the map is named, every register here decodes:
+ *
+ *   0x0e   INDEX          selects which endpoint 0x10-0x1f address
+ *   0x12   TXCSR          indexed, transmit  (memory -> peripheral)
+ *   0x16   RXCSR          indexed, receive   (peripheral -> memory)
+ *   0x204  DMA_CNTL       bit 0 ENABLE, 1 DIRECTION, 2 MODE, 3 IRQENABLE,
+ *                         bits 4-7 ENDPOINT, bit 8 BUSERROR
+ *   0x208  DMA_ADDR
+ *   0x20c  DMA_COUNT
+ *
+ * and the vendor's dma_start at FIRM 0xd7eda4 is textbook MUSB: TXCSR gets
+ * 0x9400 (AUTOSET | DMAReqMode | DMAReqEnab) on the transmit branch, RXCSR
+ * gets 0xa000 (AUTOCLEAR | DMAReqEnab) on the receive branch.
+ *
+ * WE TOOK THE RECEIVE BRANCH. dir was 0, so DMA_CNTL bit 1 was clear and the
+ * configuration halfword went to RXCSR - we were asking the controller to
+ * move 1024 bytes OUT of a USB endpoint FIFO and INTO memory. There is no
+ * host, no enumerated endpoint and nothing in that FIFO, so the transfer was
+ * armed and could never finish: every register read back perfectly and no
+ * transfer ever completed, which is row two of the table in CLAUDE.md and was
+ * read for several cycles as a missing clock.
+ *
+ * Playback is memory -> peripheral, so it is the transmit branch: DIRECTION
+ * set, and TXCSR rather than RXCSR.
+ *
+ * The channel register index stays 0. In the vendor that index is not the
+ * endpoint - it is derived separately and comes out 0 for every endpoint
+ * except 2 (0xd7edba/0xd7edda), so 0x204/0x208/0x20c is right either way.
  */
 #define AUDIO_DMA_PLAY_CH   0
-#define AUDIO_DMA_MODE      1u
-#define AUDIO_DMA_DIR       0u
+#define AUDIO_DMA_EP        1u          /* INDEX, and DMA_CNTL bits 4-7 */
+#define AUDIO_DMA_DIR       1u          /* 1 = transmit, memory -> peripheral */
 #define AUDIO_DMA_FLAG      1u
-#define AUDIO_DMA_FORMAT    REG8(0x4004000e)
-#define AUDIO_DMA_PLAY_CFG  REG16(0x40040016)
+#define AUDIO_DMA_INDEX     REG8(0x4004000e)
+#define AUDIO_DMA_TXCSR     REG16(0x40040012)
 
 #define AUDIO_DMA_MODULE   0x21u        /* FIRM 0xd7d834: dma_open */
 
@@ -249,14 +281,16 @@ yp3_dma_enable(void)
 
 static void yp3_dma_play(const void *addr, size_t size)
 {
-    uint16_t cfg, ctrl;
+    uint16_t csr, ctrl;
 
     yp3_dma_enable();
 
-    /* Faithful dir=0/mode=1/flag=1 branch of audio_dma_setup. */
-    AUDIO_DMA_FORMAT = AUDIO_DMA_MODE;
-    cfg = AUDIO_DMA_PLAY_CFG & ~0x800u;
-    AUDIO_DMA_PLAY_CFG = cfg | 0xa000u;
+    /* The transmit branch of dma_start, FIRM 0xd7edae..0xd7edb8: select the
+     * endpoint, then set AUTOSET | DMAReqMode | DMAReqEnab in TXCSR. The
+     * vendor does no read-clear here - it ORs into whatever TXCSR holds. */
+    AUDIO_DMA_INDEX = AUDIO_DMA_EP;
+    csr = AUDIO_DMA_TXCSR;
+    AUDIO_DMA_TXCSR = csr | 0x9400u;
 
     AUDIO_DMA_ADDR(AUDIO_DMA_PLAY_CH) = (uint32_t)addr;
     AUDIO_DMA_LEN(AUDIO_DMA_PLAY_CH)  = size;
@@ -265,7 +299,7 @@ static void yp3_dma_play(const void *addr, size_t size)
     ctrl = (ctrl & ~0x6u) | (AUDIO_DMA_DIR << 1);
     if (AUDIO_DMA_FLAG)
         ctrl |= 4u;
-    ctrl = (ctrl & ~0xf0u) | 8u | (AUDIO_DMA_MODE << 4);
+    ctrl = (ctrl & ~0xf0u) | 8u | (AUDIO_DMA_EP << 4);
     AUDIO_DMA_CTRL(AUDIO_DMA_PLAY_CH) = ctrl | 1u;
 }
 
@@ -500,11 +534,11 @@ static void sink_play(const void *addr, size_t size)
              ROM_CLK_IS_ON(AUDIO_DMA_MODULE), ROM_CLK_IS_ON(AUDIO_MODULE));
         /* Readback. Zeroes here mean the module is off; correct values with
          * no completion mean the clock was never committed. */
-        logf("pcm dma: addr=%08lx len=%lu ctrl=%04x fmt=%02x cfg=%04x",
+        logf("pcm dma: addr=%08lx len=%lu ctrl=%04x idx=%02x txcsr=%04x",
              (unsigned long)AUDIO_DMA_ADDR(AUDIO_DMA_PLAY_CH),
              (unsigned long)AUDIO_DMA_LEN(AUDIO_DMA_PLAY_CH),
              AUDIO_DMA_CTRL(AUDIO_DMA_PLAY_CH),
-             AUDIO_DMA_FORMAT, AUDIO_DMA_PLAY_CFG);
+             AUDIO_DMA_INDEX, AUDIO_DMA_TXCSR);
         logf("pcm blk: ctrl=%08lx en=%08lx irqst=%08lx iser1=%08lx",
              (unsigned long)AUDIO_CTRL, (unsigned long)AUDIO_ENABLE,
              (unsigned long)AUDIO_IRQSTAT,
