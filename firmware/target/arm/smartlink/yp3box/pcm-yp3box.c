@@ -313,12 +313,23 @@ void yp3_audio_irq(void)
         logf("audio irq #%lu status=%08lx", (unsigned long)pcm_irqs,
              (unsigned long)status);
 
-    /* The vendor dispatches bit 0 and bit 1 to two separate callbacks
-     * (SRAM 0x813774), and vectors-sl6801.S calls this "half/full transfer
-     * complete", so bit 0 is half and bit 1 is full. The first interrupt we
-     * ever saw carried status=0x05 - bit 0 and bit 2, no bit 1 - so if the
-     * stream stalls after one half-transfer this test is the next suspect. */
-    if (status & 2u) {                  /* full transfer complete */
+    /* BIT 0 IS OUR COMPLETION, NOT BIT 1.
+     *
+     * Two interrupts have ever reached this port and both carried bit 0 with
+     * bit 1 clear - status=0x05 on a13ac321d9 and status=0x01 on 4d9f090271.
+     * Testing bit 1 meant both were counted, logged and then dropped: the
+     * callback never ran, the next buffer was never armed, and playback
+     * stopped after a single 1024-byte transfer. That is exactly the "fires
+     * but never signals completion" case the log line above was written to
+     * tell apart, and the log told us.
+     *
+     * The vendor dispatches bit 0 and bit 1 to two separate callbacks (SRAM
+     * 0x813774) and vectors-sl6801.S calls the vector "half/full transfer
+     * complete", so the two-callback shape is real - but we arm one buffer at
+     * a time rather than running a circular transfer, so whichever half the
+     * hardware thinks it finished, the buffer we handed it is done. Take
+     * either bit as completion. */
+    if (status & 3u) {
         const void *addr;
         size_t size;
 
@@ -423,6 +434,19 @@ static void sink_play(const void *addr, size_t size)
 {
     if (!codec_running)
         sink_set_freq(0);
+
+    /* Clear anything the block has latched before arming.
+     *
+     * Bits 0, 1 and 2 of IRQSTAT are all write-1-to-clear - the vendor ISR
+     * acknowledges the three together with "status | 7" (SRAM 0x81379a) and
+     * has no handler for bit 2 at all, which makes bit 2 a flag the block
+     * raises and the driver is expected to drop.
+     *
+     * Every run that produced no interrupt read back irqst=00000004 at this
+     * point, and every run that DID interrupt read back 0. A stale bit 2 is
+     * the one state those runs have in common, so clear it on the way in
+     * rather than arming a block that is still holding one. */
+    AUDIO_IRQSTAT = 7u;
 
     yp3_dma_play(addr, size);
 

@@ -61,6 +61,18 @@
 #include "iap.h"
 #endif
 
+/* A target whose only storage is a removable card can be running with no card
+ * in it. That is a supported state elsewhere - storage_init() reports success
+ * with no medium and disk_mount_all() returning <= 0 puts the player on the
+ * info screen - but the USB paths below treat an unmountable volume as fatal,
+ * so pulling the card and then plugging in USB panics a player that was
+ * working fine a moment earlier. Let those targets carry on unmounted. */
+#ifdef HAVE_STORAGE_MAY_BE_ABSENT
+#define USB_MOUNT_FAILED(rc)  logf("usb: no volume to mount (%d)", (rc))
+#else
+#define USB_MOUNT_FAILED(rc)  panicf("mount: %d", (rc))
+#endif
+
 #if (!defined(BOOTLOADER) || defined(HAVE_BOOTLOADER_USB_MODE))
 #define USB_FULL_INIT
 #endif
@@ -260,6 +272,8 @@ static inline void usb_configure_drivers(int for_state)
         break;
         /* USB_INSERTED: */
 
+
+
     case USB_EXTRACTED:
         /* do not call usb_release_exclusive_storage.
          * usb core handles it */
@@ -281,7 +295,7 @@ static inline void usb_slave_mode(bool on)
         /* Entered exclusive mode */
         rc = disk_mount_all();
         if(rc <= 0) /* no partition */
-            panicf("mount: %d",rc);
+            USB_MOUNT_FAILED(rc);
     }
 }
 
@@ -392,7 +406,7 @@ static inline void usb_slave_mode(bool on)
             sleep(HZ/10);
             rc = disk_mount_all();
             if(rc <= 0) /* no partition */
-                panicf("mount: %d",rc);
+                USB_MOUNT_FAILED(rc);
 
             logf("usb out: storage_init=%ld mount=%ld ticks (HZ=%d)",
                  t1 - t0, current_tick - t1, HZ);

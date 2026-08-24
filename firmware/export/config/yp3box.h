@@ -32,6 +32,10 @@
 #define CONFIG_KEYPAD       YP3BOX_PAD
 
 #define CONFIG_STORAGE      STORAGE_SD
+
+/* The microSD slot is the only storage and there is no card-detect line, so
+ * the player can legitimately be running with no medium. */
+#define HAVE_STORAGE_MAY_BE_ABSENT
 #define HAVE_HOTSWAP
 #define HAVE_HOTSWAP_STORAGE_AS_MAIN
 #define HAVE_MULTIVOLUME
