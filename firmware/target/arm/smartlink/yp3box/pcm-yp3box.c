@@ -432,6 +432,28 @@ static void sink_play(const void *addr, size_t size)
      * up into a silent line. */
     yp3_speaker_pa(true);
 
+    /* Which enable bits actually latch.
+     *
+     * Every other Rockbox port enables the serial transmitter separately from
+     * arming the DMA, and with more than one bit: s5l8700 writes I2STXCOM with
+     * transmit-mode, interface-enable and DMA-request-enable as three distinct
+     * bits (and I2SCLKCON power-on before them), rk27xx has its own DMA-enable
+     * bit alongside separate I2S clock gates, and the STM32 SAI splits SAIEN
+     * from DMAEN. We write 0x11f to AUDIO_CTRL and read back 0x113 - bits 2 and
+     * 3 refuse to latch, and a DMA armed against a transmitter that is not
+     * enabled is exactly the symptom: armed, idle, no completion, no sound.
+     *
+     * So find out whether they can be set at all, and in what order. Setting a
+     * bit we already write in the line above cannot make anything worse. */
+    if (pcm_plays < 2) {
+        uint32_t a, b, c;
+        AUDIO_CTRL |= 4u;   a = AUDIO_CTRL;
+        AUDIO_CTRL |= 8u;   b = AUDIO_CTRL;
+        AUDIO_CTRL |= 0xcu; c = AUDIO_CTRL;
+        logf("blk bits: |4=%08lx |8=%08lx |c=%08lx",
+             (unsigned long)a, (unsigned long)b, (unsigned long)c);
+    }
+
     /* The first two only: after that this is a per-buffer hot path. */
     if (pcm_plays < 2) {
         logf("pcm play #%lu addr=%08lx size=%lu mclk=%lu",
