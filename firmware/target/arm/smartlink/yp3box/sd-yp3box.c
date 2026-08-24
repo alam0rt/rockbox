@@ -1,34 +1,68 @@
 /* SD driver for the SL6801.
  *
- * Reversed from the vendor bootloader's sdmmc_wrap_init (SRAM 0x8224d4) and the
- * SD HAL that lives in the boot ROM. The controller is NOT an STM32 SDIO block
- * despite the vendor's ST-style "HAL_SD_Init_new" naming - the register map
- * below comes from the ROM accessors themselves:
+ * The controller at 0x40003000 is a **DesignWare Mobile Storage Host**
+ * (`dw_mmc`) with a partly remapped register file. That identification is the
+ * whole reason this file can now drive the card at full rate, and it came from
+ * matching offsets and magic constants against the published IP rather than
+ * from any new hardware cycle - the same move CLAUDE.md records for the MUSB
+ * block at 0x40040000. What matches at the standard offset:
  *
- *   0x000 CTRL      bits 0-2 self-clearing reset (ROM 0x3d58)
- *                   bit  2   + bit 25 enable internal DMA (ROM 0x46f4)
- *   0x004 CMD       bit 31 = start/busy (ROM 0x40a2)
- *   0x008 ARG       (ROM 0x40a2)
- *   0x00c BLKSIZE   (ROM 0x40b6)
- *   0x010 DATALEN   (ROM 0x40b6)
- *   0x014 DTIMER    (ROM 0x40b6)
- *   0x034 STATUS    write-1-to-clear (ROM 0x419a)
- *   0x038 RESP0..3  at 0x38/0x3c/0x40/0x44 (ROM 0x4186: base+(i+14)*4)
- *   0x048 FIFOSTA   bit 2 = RX empty, bit 3 = TX full (ROM 0x4602/0x4610)
- *                   bits 11:16 = index of the responding command (ROM 0x4190)
- *   0x04c CLKCFG    (ROM 0x3d6a)
- *   0x200 FIFO      read and write data port (ROM 0x4602/0x4610)
+ *   0x014 TMOUT    [31:8] data timeout, [7:0] response timeout
+ *   0x018 CTYPE    bit 0 = card 0 is 4-bit; [31:16] would be 8-bit
+ *   0x048 STATUS   bit 2 FIFO_EMPTY, bit 3 FIFO_FULL, [16:11] response index
+ *   0x04c FIFOTH   [30:28] DMA msize, [27:16] RX watermark, [11:0] TX
+ *   0x080 BMOD / 0x084 PLDMND / 0x088 DBADDR / 0x090 IDINTEN   internal DMA
+ *   0x200 FIFO
  *
- * The previous revision of this file assumed the documented STM32 layout, which
- * put ARG at 0x08 and CMD at 0x0c - it would have written the argument into the
- * command register. It could never have worked.
+ * and what this part moved:
  *
- * Commands go through the ROM's own send/wait helpers rather than open-coded
- * register writes: ROM 0x40c4 owns the table mapping a command index to its
- * controller-specific command word (response length, data direction and so on),
- * and reimplementing that table would be guesswork for no gain.
+ *   0x004 CMD      (std 0x2c) bit 31 start
+ *   0x008 ARG      (std 0x28)
+ *   0x00c BLKSIZ   (std 0x1c)
+ *   0x010 BYTCNT   (std 0x20)
+ *   0x034 RINTSTS  (std 0x44) write-1-to-clear
+ *   0x038 RESP0..3 (std 0x30)
  *
- * Polled, no DMA and no interrupts. The goal is a correct read, not throughput.
+ * The CMD word is the stock dw_mmc encoding, which is what ROM 0x40c4's
+ * command table has been handing out all along:
+ *
+ *   [5:0] index  6 response_expect  7 response_long  8 check_response_crc
+ *   9 data_expected  10 write  12 send_auto_stop  13 wait_prvdata_complete
+ *   14 stop_abort_cmd  15 send_initialization  21 update_clock_only  31 start
+ *
+ * so CMD17 is 0x2351, CMD24 0x2758, and the vendor's own send wrapper at SRAM
+ * 0x823092 emits CMD18 as 0x3352 and CMD25 as 0x3759 - the same words with bit
+ * 12 set - whenever its handle asks for hardware auto-stop. That is where the
+ * multi-block paths below come from.
+ *
+ * RINTSTS is the standard interrupt set too, which is why the masks this file
+ * inherited from the ROM line up exactly: bit 2 CD, 3 DTO, 4 TXDR, 5 RXDR,
+ * 6 RCRC, 8 RTO, 9 DRTO, 14 ACD, and 0xbfc2 is precisely "every error".
+ *
+ * Two things this identification corrected, both of which had cost cycles:
+ *
+ *   - 0x04c is FIFOTH, not a clock register. It had been called CLKCFG, and
+ *     the note that "the card rate lives in the controller, not the module
+ *     divider" followed from that name. It does not: the card clock IS the
+ *     module clock on tree id 0x11, and the reason two earlier attempts at a
+ *     higher divider produced an unreadable card was the memcpy-per-word FIFO
+ *     drain overrunning, not the divider. Both are fixed here.
+ *   - 0x018 bit 0 is CTYPE, the 4-bit bus enable. This file cleared it at
+ *     init and never set it again, so every transfer this port has ever done
+ *     ran one bit wide. The vendor sets it from HAL_SD_Init_new (SRAM
+ *     0x828bec) after an ACMD6, and that is the 4x this driver was missing.
+ *
+ * Commands still go through the ROM's send/wait helpers wherever the ROM has
+ * the right word for them: ROM 0x40c4 owns the index-to-command-word table and
+ * ROM 0x419a..0x4400 own one wait per response type, and the masks genuinely
+ * differ per type. The two auto-stop words the ROM table does not carry are
+ * sent through ROM 0x40a2, which is the raw "write ARG, wait, write CMD" the
+ * vendor's own wrapper calls.
+ *
+ * Polled, no interrupts. The controller has an internal DMA engine (BMOD at
+ * 0x80, descriptor base at 0x88) and the vendor uses it; at 4-bit/24 MHz a
+ * block arrives in 43 us and the drain below costs a few, so the CPU is not
+ * the limit and the descriptor machinery is not worth its risk yet.
  */
 #include "config.h"
 #include "system.h"
@@ -56,12 +90,18 @@
 #define SD_BLKSIZE  0x00c
 #define SD_DATALEN  0x010
 #define SD_DTIMER   0x014
-#define SD_REG18    0x018
-#define SD_DCTRL    0x02c
+#define SD_CTYPE    0x018      /* bit 0: card 0 runs a 4-bit data bus */
+#define SD_XFERCTL  0x02c      /* bit 3 data transfer, bit 14 multi-block */
 #define SD_STA      0x034
 #define SD_FIFOSTA  0x048
-#define SD_CLKCFG   0x04c
+#define SD_FIFOTH   0x04c
 #define SD_FIFO     0x200
+
+#define CTYPE_4BIT      1u
+#define XFER_DATA       (1u << 3)
+#define XFER_MULTI      (1u << 14)
+#define FIFOSTA_EMPTY   (1u << 2)
+#define FIFOSTA_FULL    (1u << 3)
 
 /* STATUS bits, from the ROM's error decoding (0x419a, 0x4bc0, 0x4794) */
 #define STA_DONE      (1u << 2)    /* command/response complete   */
@@ -69,9 +109,13 @@
 #define STA_RXREADY   (1u << 5)    /* RX FIFO has a burst ready   */
 #define STA_CRCFAIL   (1u << 6)
 #define STA_TIMEOUT   (1u << 8)
+#define STA_AUTOCMD   (1u << 14)   /* ACD: the auto-stop CMD12 finished */
 #define STA_ERRMASK   0x300u       /* the pair the ROM treats as fatal */
 #define STA_ALLERR    0xbfc2u      /* every error bit, no DONE    */
-#define STA_ALLFLAGS  0xbfc6u      /* clear-all                   */
+/* The vendor's clear-all is 0xbfc6, which predates this driver using the
+ * hardware auto-stop: it leaves ACD latched. Clearing it too keeps a stale
+ * bit from being read as the next transfer's auto-stop completing. */
+#define STA_ALLFLAGS  (0xbfc6u | STA_AUTOCMD)
 
 /* Clock/module ids: the vendor resets module 0x24 and drives clock 0x11. */
 #define SD_MODULE   0x24u
@@ -93,10 +137,15 @@
  * stopped clock, the card never sees CMD0 or CMD55, and sd_power_on reports
  * "no card". CLAUDE.md has the rule this broke: a source number is itself a
  * clock id, so selecting one is a thing you must do, not a thing you inherit. */
-/* CLKCFG as the ROM's own speed switch writes it (ROM 0x46de). The bitfields
- * ROM_SD_CFG builds at init - 0x20000000, a 6-bit field at bit 16, a byte at
- * bit 4 and a nibble at bit 0 - are the same ones this word replaces. */
-#define SD_CLKCFG_FAST 0x1003000cu
+/* FIFOTH for the transfer phase, as the ROM's own post-identification switch
+ * writes it (ROM 0x46de) and as the vendor's handle carries it (SRAM 0x822570:
+ * msize field 0x10000000, RX watermark 3, TX watermark 0xc). ROM_SD_CFG builds
+ * the same three fields at init from its arg3/arg5/arg4, which is what leaves
+ * 0x20070008 behind - msize 2, RX watermark 7, TX watermark 8.
+ *
+ * This is a FIFO threshold register, not a clock. It was called CLKCFG here,
+ * and that name is why the divider was believed not to matter. */
+#define SD_FIFOTH_XFER 0x1003000cu
 
 #define SD_CLOCK_SRC 0x0au
 #define SD_DIV_ID   64u
@@ -135,7 +184,50 @@
  * card, so a clock that makes the card unwritable produces no log of having
  * done so - the two boots that broke this way left nothing behind at all.
  * That is why the ladder ends at a rung equal to identification: falling all
- * the way back is a reachable outcome, not an exceptional one. */
+ * the way back is a reachable outcome, not an exceptional one.
+ *
+ * What the ladder can NOT do is go above 24 MHz. Source 0x0a is 24 MHz and the
+ * SD default-speed ceiling is 25 MHz, so the divider is already at the last
+ * useful rung; 50 MHz needs CMD6 SWITCH_FUNC to put the card in high speed,
+ * and neither command table in the vendor's firmware has a CMD6 word with the
+ * data bit set (ROM 0x40c4 emits 0x2546, the vendor's wrapper 0x2446, both no
+ * data phase). The vendor never runs this card in high speed, so there is no
+ * vendor code to read for it - which by this port's rules puts it behind a
+ * hardware cycle, not in this change. The width below is the 4x that is
+ * actually documented in the vendor's own init. */
+
+/* Bus width. The vendor decides this at SRAM 0x828bec and it is the single
+ * biggest thing this driver was leaving on the table:
+ *
+ *     if (bus_widths_supports_4bit) {
+ *         send_cmd(handle, 6, 2);        ; 0x823092 -> CMD word 0x2446
+ *         wait_r1_idx(handle, 6);        ; 0x828796, ported as sd_wait_r1_idx
+ *         base[0x18] |= 1;               ; CTYPE: card 0 is 4-bit
+ *     } else {
+ *         base[0x18] &= ~1;
+ *     }
+ *
+ * Note the ORDER - the card is told first, the controller second - and note
+ * that the vendor's CMD6 word is 0x2446 rather than the ROM table's 0x2546.
+ * The difference is bit 8, check_response_crc. That is the same class of
+ * choice as picking the right response wait: use the word the vendor uses for
+ * that command, not the one that looks equivalent.
+ *
+ * The vendor reaches the 4-bit test by reading the SCR with ACMD51 and
+ * checking SD_BUS_WIDTHS. This driver does not, for two reasons. Its ACMD51
+ * path sets BYTCNT to 512 for an 8-byte register (SRAM 0x828cbc) and would
+ * stall on any card that answered it, so it is not code to copy. And 4-bit is
+ * mandatory for every SD memory card, so the interesting question is not
+ * whether the card claims it but whether this board's traces carry it - which
+ * only a content check can answer, and there is already one. */
+#define SD_CMDW_ACMD6      0x2446u   /* SET_BUS_WIDTH, R1, no data phase   */
+#define SD_CMDW_READ_MULTI 0x3352u   /* CMD18 + send_auto_stop (bit 12)    */
+#define SD_CMDW_WRITE_MULTI 0x3759u  /* CMD25 + send_auto_stop             */
+
+/* Sectors per multi-block command. Rockbox's buffering asks for runs far
+ * larger than this; the cap keeps one command's data phase, and so one
+ * software timeout, to something a stalled card cannot stretch into minutes. */
+#define SD_MULTI_MAX 128
 
 /* Boot ROM SD HAL. All of these take a handle whose first word is the base. */
 #define ROM_SD_CMD      ((void     (*)(void *, unsigned, uint32_t))0x40c5u)
@@ -162,7 +254,11 @@
 #define ROM_SD_CFG      ((void (*)(void *, uint32_t, uint32_t, uint32_t, \
                                    uint32_t, uint32_t, uint32_t))0x3d6bu)
 #define ROM_SD_RD512    ((uint32_t (*)(void *, void *))0x4795u)
-#define ROM_FIFO_WR     ((void (*)(void *, const uint32_t *))0x4611u)
+/* Raw send: takes the BASE, not the handle, and a {arg, cmdword} pair. It is
+ * what the vendor's own send wrapper at SRAM 0x823092 tail-calls once it has
+ * picked a command word, and it is the way in for the two auto-stop words the
+ * ROM's table (0x40c4) does not carry. */
+#define ROM_SD_SEND_RAW ((void (*)(volatile uint32_t *, const uint32_t *))0x40a3u)
 #define ROM_UDELAY      ((void (*)(unsigned))0xb765u)
 #define ROM_CLK_STOP    ((void (*)(unsigned))0x2a7du)
 #define ROM_CLK_DIV     ((void (*)(unsigned, unsigned))0x2d59u)
@@ -192,8 +288,10 @@ static const unsigned sd_pins[] = {
     0x00033d8bu, 0x0003458bu, 0x00034d8bu,
 };
 
-static uint32_t sd_clkcfg_id;        /* CLKCFG as identification left it */
+static uint32_t sd_fifoth_id;        /* FIFOTH as identification left it */
 static bool     sd_ok;
+static bool     sd_wide;             /* CTYPE bit 0: the bus is 4 data lines */
+static bool     sd_multi;            /* CMD18/CMD25 with hardware auto-stop */
 static uint32_t sd_rca;
 static uint32_t sd_cardtype;         /* 1 = SDv2, 2 = SDHC/SDXC */
 static uint32_t sd_numblocks;
@@ -281,18 +379,16 @@ static uint32_t SDICODE sd_wait_r1_idx(unsigned idx)
     return 0;
 }
 
-int SDICODE sd_read_sectors(IF_MD(int drive,)
-                            sector_t start, int count, void *buf);
-static bool SDICODE sd_verify(void);
-
-/* One sector, for the post-identification speed check. .bss, not const: it is
- * a DMA-free PIO read, but keeping card buffers out of flash is the standing
- * rule in this port. */
-static uint8_t sd_probe_buf[512];
 int SDICODE sd_read_sectors(IF_MD(int drive,) sector_t start, int count,
                             void *buf);
 
-/* Does this rate actually work? Content, never a return code.
+/* Two sectors, for the post-identification checks. .bss, not const: it is a
+ * DMA-free PIO read, but keeping card buffers out of flash is the standing
+ * rule in this port. Two, because proving a multi-block transfer needs the
+ * SECOND block to land in the right place, which one sector cannot show. */
+static uint8_t sd_probe_buf[1024];
+
+/* Does this bus width and rate actually work? Content, never a return code.
  *
  * Sector 0's boot signature is the one byte pair every partitioned card is
  * guaranteed to end its first sector with, so garbage is recognisable as
@@ -310,6 +406,74 @@ static bool SDICODE sd_verify(void)
             return false;
     }
     return true;
+}
+
+static uint32_t SDICODE sd_sum(const uint8_t *p)
+{
+    uint32_t i, sum = 0;
+
+    for (i = 0; i < 512; i++)
+        sum = (sum << 1) + (sum >> 31) + p[i];
+    return sum;
+}
+
+/* Does the hardware auto-stop path work? Same rule: content.
+ *
+ * A multi-block read can be wrong in a way a single-block read cannot - the
+ * command succeeds, the first block is perfect, and every block after it is
+ * short, duplicated or absent because BYTCNT, the block boundary or the
+ * auto-stop is wrong. So read sector 1 on its own, remember what it looked
+ * like, then read sectors 0 and 1 as one transfer and require BOTH halves:
+ * the boot signature at the end of the first block, and the second block
+ * matching the sector that was already read by itself. */
+static bool SDICODE sd_verify_multi(void)
+{
+    uint32_t sum1;
+
+    if (sd_read_sectors(IF_MD(0,) (sector_t)1, 1, sd_probe_buf) != 0)
+        return false;
+    sum1 = sd_sum(sd_probe_buf);
+
+    sd_multi = true;                     /* the path under test */
+    if (sd_read_sectors(IF_MD(0,) (sector_t)0, 2, sd_probe_buf) != 0)
+        return false;
+    /* sd_read_sectors falls back to single blocks and clears sd_multi when a
+     * multi-block transfer fails, and then RETURNS SUCCESS with correct data.
+     * That is right for a running player and wrong for a test: the content
+     * check below would pass on bytes the path under test never carried. So
+     * ask whether the path is still enabled, not just whether the read
+     * worked. */
+    if (!sd_multi)
+        return false;
+    if (sd_probe_buf[510] != 0x55 || sd_probe_buf[511] != 0xaa)
+        return false;
+    return sd_sum(sd_probe_buf + 512) == sum1;
+}
+
+/* ACMD6, then CTYPE - the vendor's order at SRAM 0x828bec, and the command
+ * word is the vendor's 0x2446 rather than the ROM table's 0x2546. Returns the
+ * card's own refusal, so a card that will not widen falls back rather than
+ * being driven four bits wide while it answers on one. */
+static uint32_t SDICODE sd_set_bus_width(bool wide)
+{
+    uint32_t cmd[2], err;
+
+    R(SD_STA) = STA_ALLFLAGS;
+    ROM_SD_CMD(&sdh, 55, sd_rca << 16);          /* APP_CMD */
+    if ((err = sd_wait_r1_idx(55)) != 0)
+        return err;
+
+    cmd[0] = wide ? 2u : 0u;                     /* 2 = 4 bit, 0 = 1 bit */
+    cmd[1] = SD_CMDW_ACMD6;
+    ROM_SD_SEND_RAW(sdh.base, cmd);
+    if ((err = sd_wait_r1_idx(6)) != 0)
+        return err;
+
+    if (wide)
+        R(SD_CTYPE) |= CTYPE_4BIT;
+    else
+        R(SD_CTYPE) &= ~CTYPE_4BIT;
+    return 0;
 }
 
 /* CMD0, CMD8 and the ACMD41 negotiation - vendor sd_power_on at 0x8288c4. */
@@ -462,9 +626,14 @@ int sd_init(void)
     /* Vendor constants from HAL_SD_Init_new (0x828b54): the trailing three are
      * stack arguments landing in CLKCFG and the 0x64 register. */
     ROM_SD_CFG(&sdh, 0, 0, 0x20000000u, 8, 7, 0xfffu);
-    sd_clkcfg_id = R(SD_CLKCFG);
+    sd_fifoth_id = R(SD_FIFOTH);
 
-    R(SD_REG18) &= ~1u;
+    /* One data line until the card has been asked for four - the vendor's
+     * HAL_SD_Init_new clears CTYPE here too, and identification is single
+     * ended on DAT0 whatever the card ends up doing. */
+    sd_wide  = false;
+    sd_multi = false;
+    R(SD_CTYPE) &= ~CTYPE_4BIT;
     R(SD_DTIMER) = 0xffffff40u;
     R(SD_CTRL)   = 0x40000000u;
 
@@ -513,53 +682,84 @@ int sd_init(void)
 
     sd_ok = true;
 
-    /* Identification is over, so leave 375 kHz behind - by asking the ROM
-     * what "fast" means on this controller rather than guessing a divider.
+    /* Identification is over. Two things change now, and the bigger one is
+     * not the clock:
      *
-     * ROM 0x4690 is the vendor's own post-identification switch, and the one
-     * line in it that is not about the internal DMA is:
+     *   - the bus goes from one data line to four (CTYPE, after an ACMD6),
+     *     which the vendor does at SRAM 0x828bec and this driver never did;
+     *   - the module clock leaves the 375 kHz identification divider.
      *
-     *     0x46de:  str r2, [r3, #76]     ; CLKCFG = 0x1003000c
+     * ROM 0x4690 is the vendor's own post-identification switch, and the line
+     * in it that is not about the internal DMA is
      *
-     * against the 0x20070008 that ROM_SD_CFG leaves behind at init. So the
-     * card clock is not the module divider alone: the controller has its own
-     * rate field at 0x4c, and the vendor's SD bring-up (FIRM 0xd67f26) never
-     * calls clk_div at all - it selects source 0x0a, starts clock 0x11, and
-     * lets CLKCFG do the dividing. Our divide-by-64 was compensating for a
-     * register we never wrote.
+     *     0x46de:  str r2, [r3, #76]     ; FIFOTH = 0x1003000c
      *
-     * Two earlier attempts raised the module divider blind and shipped a card
-     * that read as an empty volume, so this walks a ladder from fastest to
-     * slowest and keeps the first rung that DEMONSTRABLY reads. Every rung is
-     * verified by content, not by a return code - at the wrong rate this
-     * controller returns data rather than an error, which is exactly how a
-     * silently unreadable card got shipped twice. */
+     * against the 0x20070008 ROM_SD_CFG leaves at init. That register is the
+     * FIFO threshold, not a clock - see the head of this file - so it is set
+     * once here and the divider does the rate.
+     *
+     * Two earlier attempts raised the divider blind and shipped a card that
+     * read as an empty volume, so this walks a ladder from fastest to slowest
+     * and keeps the first rung that DEMONSTRABLY reads. Every rung is verified
+     * by content, not by a return code - at the wrong rate this controller
+     * returns data rather than an error, which is exactly how a silently
+     * unreadable card got shipped twice.
+     *
+     * The width is the outer loop and the divider the inner one, so a board
+     * whose DAT1-3 will not carry 24 MHz still gets 24 MHz on DAT0 rather
+     * than falling back to 375 kHz for want of three traces.
+     *
+     * Every width change is issued at the identification divider, never at
+     * the rate that just failed: ACMD6 sent into a clock this card cannot
+     * follow fails for the wrong reason, and the ladder would then blame the
+     * width. */
     {
-        static const struct { uint32_t clkcfg; unsigned div; } ladder[] = {
-            { SD_CLKCFG_FAST, 1u  },        /* 24 MHz module clock */
-            { SD_CLKCFG_FAST, 2u  },        /* 12 MHz */
-            { SD_CLKCFG_FAST, 8u  },        /*  3 MHz */
-            { SD_CLKCFG_FAST, 64u },        /* vendor CLKCFG, identification divider */
-        };
-        unsigned i;
+        static const unsigned divs[] = { 1u, 2u, 8u };
+        unsigned w;
 
-        for (i = 0; i < sizeof(ladder) / sizeof(ladder[0]); i++) {
-            R(SD_CLKCFG) = ladder[i].clkcfg;
-            sd_set_clock(ladder[i].div);
-            if (sd_verify()) {
-                logf("sd: fast ok clkcfg=%08lx div=%u",
-                     (unsigned long)ladder[i].clkcfg, ladder[i].div);
+        R(SD_FIFOTH) = SD_FIFOTH_XFER;
+
+        for (w = 0; w < 2; w++) {
+            bool wide = (w == 0);
+
+            sd_set_clock(SD_DIV_ID);
+            if ((err = sd_set_bus_width(wide)) != 0) {
+                logf("sd: width %d refused (%lu)", wide ? 4 : 1,
+                     (unsigned long)err);
+                continue;
+            }
+
+            for (i = 0; i < sizeof(divs) / sizeof(divs[0]); i++) {
+                sd_set_clock(divs[i]);
+                if (!sd_verify()) {
+                    logf("sd: rate bad width=%d div=%u", wide ? 4 : 1, divs[i]);
+                    continue;
+                }
+                sd_wide  = wide;
+                /* Only now, on a bus that is proven to read, is it worth
+                 * asking whether the hardware auto-stop works. It sets
+                 * sd_multi itself so the path can be exercised. */
+                sd_multi = sd_verify_multi();
+                if (!sd_multi)
+                    logf("sd: multi-block bad, one CMD17 per sector");
+                logf("sd: %d-bit div=%u multi=%d", wide ? 4 : 1, divs[i],
+                     sd_multi);
                 return 0;
             }
-            logf("sd: fast bad clkcfg=%08lx div=%u",
-                 (unsigned long)ladder[i].clkcfg, ladder[i].div);
+
+            /* Nothing at this width held up. Put the clock somewhere the card
+             * answers before the next ACMD6 goes out. */
+            sd_set_clock(SD_DIV_ID);
         }
 
-        /* Nothing on the ladder held up: back to the state that identified the
-         * card, which is known to work and is merely slow. */
-        R(SD_CLKCFG) = sd_clkcfg_id;
+        /* Neither width held up at any rate: back to the state that
+         * identified the card, which is known to work and is merely slow. */
+        sd_multi = false;
+        sd_wide  = false;
+        (void)sd_set_bus_width(false);
+        R(SD_FIFOTH) = sd_fifoth_id;
         sd_set_clock(SD_DIV_ID);
-        logf("sd: fast none, back to div=%u", SD_DIV_ID);
+        logf("sd: no rate held, 1-bit div=%u", SD_DIV_ID);
     }
 
     return 0;
@@ -592,51 +792,60 @@ static uint32_t SDICODE sd_wait_data(unsigned idx)
     return 0;
 }
 
-static uint32_t SDICODE sd_fifo_word(uint32_t *out)
+/* Drain `len` bytes out of the RX FIFO. `len` is always a multiple of 32.
+ *
+ * Shaped like ROM 0x4794, which was written by the people who built the
+ * controller: one error-and-watermark check per eight-word burst, and inside
+ * the burst nothing but a poll on FIFO_EMPTY and a store. What it must NOT do
+ * is call anything - `memcpy` for every four bytes was the previous version of
+ * this loop, and memcpy lives in flash, so the drain was taking an XIP fetch
+ * per word. An overrun FIFO drops words silently, so the symptom was garbage
+ * data rather than an error, and it is what made a raised clock look like a
+ * broken clock.
+ *
+ * ROM 0x4794 is no longer used, for two reasons: it drains exactly 512 bytes,
+ * which a multi-block transfer is not, and its waits are unbounded, which is
+ * the thing this driver spent a hardware cycle removing everywhere else.
+ *
+ * The unaligned case stores bytes rather than reaching for memcpy. Rockbox
+ * hands this word-aligned buffers in practice; the path exists so that a
+ * caller that does not cannot corrupt anything. */
+static uint32_t SDICODE sd_read_fifo(void *buf, uint32_t len)
 {
-    uint32_t t = 0;
-    /* Bit 2 set means the RX FIFO is empty. */
-    while (R(SD_FIFOSTA) & (1u << 2))
-        if (++t > SD_SPIN)
-            return 0x7e;
-    *out = R(SD_FIFO);
-    return 0;
-}
+    uint8_t *p = buf;
+    uint32_t left = len;
+    bool aligned = (((uintptr_t)buf & 3u) == 0);
 
-static uint32_t SDICODE sd_read_fifo512(void *buf)
-{
-    uint8_t *p = buf, *end = p + 512;
-    uint32_t t, w, err;
+    while (left) {
+        uint32_t sta, t = 0, n;
 
-    /* ROM 0x4794 is this loop, written by the people who built the controller:
-     * it drains eight words per burst with a post-indexed word store and no
-     * call per word. Ours went through memcpy() for every four bytes, and
-     * memcpy lives in flash - an XIP call in the middle of a FIFO drain. That
-     * is the same class of mistake as running a delay loop from flash, and it
-     * is why raising the clock produced garbage rather than an error: an
-     * overrun FIFO drops words silently.
-     *
-     * The ROM version stores words directly, so it needs an aligned
-     * destination; the open-coded loop below stays for the unaligned case. */
-    if (((uintptr_t)buf & 3u) == 0)
-        return ROM_SD_RD512(&sdh, buf);
-
-    while (p < end) {
-        uint32_t sta;
-        t = 0;
         for (;;) {
             sta = R(SD_STA);
             if (sta & STA_ERRMASK) { R(SD_STA) = STA_ERRMASK; return 32; }
             if (sta & STA_RXREADY) break;
             if (++t > SD_SPIN) return 0x7d;
         }
-        for (t = 0; t < 8 && p < end; t++) {
-            if ((err = sd_fifo_word(&w)) != 0)
-                return err;
-            memcpy(p, &w, 4);                /* buf is not guaranteed aligned */
-            p += 4;
+
+        for (n = 0; n < 8 && left; n++, left -= 4, p += 4) {
+            uint32_t w;
+
+            t = 0;
+            /* FIFOSTA bit 2 set means the RX FIFO is empty. */
+            while (R(SD_FIFOSTA) & FIFOSTA_EMPTY)
+                if (++t > SD_SPIN)
+                    return 0x7e;
+            w = R(SD_FIFO);
+
+            if (aligned) {
+                *(uint32_t *)p = w;
+            } else {
+                p[0] = (uint8_t)w;
+                p[1] = (uint8_t)(w >> 8);
+                p[2] = (uint8_t)(w >> 16);
+                p[3] = (uint8_t)(w >> 24);
+            }
         }
-        R(SD_STA) = STA_RXREADY;
+        R(SD_STA) = STA_RXREADY;             /* ROM clears it after the burst */
     }
     return 0;
 }
@@ -648,11 +857,45 @@ static uint32_t sd_addr(sector_t sector)
     return (sd_cardtype == 2) ? (uint32_t)sector : (uint32_t)(sector << 9);
 }
 
-static void sd_setup_data(uint32_t len)
+/* BLKSIZ stays 512 and BYTCNT carries the whole transfer - which is exactly
+ * what the vendor's data setup at SRAM 0x823106 does, and why its multi-block
+ * caller passes `nblocks << 9`. */
+static void SDICODE sd_setup_data(uint32_t len)
 {
     R(SD_DTIMER)  = 0xffffff40u;
     R(SD_BLKSIZE) = 512;
     R(SD_DATALEN) = len;
+}
+
+/* The transfer-control register the vendor touches before every data command:
+ * bit 3 for a data transfer at SRAM 0x8227fa, bit 14 as well for a multi-block
+ * one at 0x82283a. The vendor only ever ORs, because its own operating-mode
+ * switch (ROM 0x4690) rewrites the register wholesale first; here bit 14 is
+ * set and cleared explicitly, so a single-block read that follows a multi
+ * cannot inherit it. */
+static void SDICODE sd_xfer_ctl(bool multi)
+{
+    uint32_t v = R(SD_XFERCTL) | XFER_DATA;
+
+    if (multi)
+        v |= XFER_MULTI;
+    else
+        v &= ~XFER_MULTI;
+    R(SD_XFERCTL) = v;
+}
+
+/* The auto-stop CMD12 the controller issues for us finishes after the data
+ * does, and latches ACD. Leaving it latched is harmless today but would make
+ * the next transfer's ACD unreadable. */
+static uint32_t SDICODE sd_wait_autostop(void)
+{
+    uint32_t t = 0;
+
+    while (!(R(SD_STA) & STA_AUTOCMD))
+        if (++t > SD_SPIN)
+            return 0x78;
+    R(SD_STA) = STA_AUTOCMD;
+    return 0;
 }
 
 /* Wait for the controller to finish the block it just handed us, and clear
@@ -681,61 +924,115 @@ static uint32_t SDICODE sd_wait_dataend(void)
     return 0;
 }
 
+/* Recover the CARD, not just the controller.
+ *
+ * Clearing the controller flags leaves a card that is still in a data state
+ * exactly as stuck as it was, so the storage layer's retry re-issues the same
+ * command into the same condition and fails identically. That is visible in
+ * the log as the same LBA failing seven times with the same code and nothing
+ * changing in between.
+ *
+ * So abort any transfer the card thinks is running, then wait for it to report
+ * ready again. Both results are ignored deliberately - this is a best-effort
+ * cleanup on a path that has already failed, and the caller's retry is what
+ * decides the outcome. */
+static void SDICODE sd_recover(void)
+{
+    R(SD_STA) = STA_ALLFLAGS;
+    ROM_SD_CMD(&sdh, 12, 0);                 /* STOP_TRANSMISSION */
+    (void)sd_wait_data(12);
+    R(SD_STA) = STA_ALLFLAGS;
+    (void)sd_wait_ready();
+}
+
+static uint32_t SDICODE sd_read_one(sector_t start, void *buf)
+{
+    uint32_t err;
+
+    R(SD_STA) = STA_ALLFLAGS;
+    sd_xfer_ctl(false);
+    sd_setup_data(512);
+
+    ROM_SD_CMD(&sdh, 17, sd_addr(start));    /* READ_SINGLE_BLOCK */
+    if ((err = sd_wait_data(17)) != 0)
+        return err;
+    if ((err = sd_read_fifo(buf, 512)) != 0)
+        return err;
+    return sd_wait_dataend();
+}
+
+/* CMD18 with the controller's own auto-stop.
+ *
+ * One command for the whole run instead of one per sector. The command word
+ * is 0x3352 - the ROM table's CMD18 with bit 12, send_auto_stop - which is
+ * exactly what the vendor's send wrapper at SRAM 0x823092 emits when its
+ * handle asks for hardware stop, and the vendor correspondingly skips its own
+ * CMD12 in that mode (SRAM 0x82289a bics #2). The ROM's table has no entry
+ * with bit 12 set, so this goes out through the raw send the vendor's wrapper
+ * itself calls. */
+static uint32_t SDICODE sd_read_multi(sector_t start, int count, void *buf)
+{
+    uint32_t cmd[2], err;
+
+    R(SD_STA) = STA_ALLFLAGS;
+    sd_xfer_ctl(true);
+    sd_setup_data((uint32_t)count * 512u);
+
+    cmd[0] = sd_addr(start);
+    cmd[1] = SD_CMDW_READ_MULTI;
+    ROM_SD_SEND_RAW(sdh.base, cmd);
+
+    if ((err = sd_wait_data(18)) != 0)
+        return err;
+    if ((err = sd_read_fifo(buf, (uint32_t)count * 512u)) != 0)
+        return err;
+    if ((err = sd_wait_dataend()) != 0)
+        return err;
+    return sd_wait_autostop();
+}
+
 int SDICODE sd_read_sectors(IF_MD(int drive,)
                             sector_t start, int count, void *buf)
 {
     uint8_t *p = buf;
 
-
     IF_MD((void)drive;)
     if (!sd_ok)
         return -1;
 
-    while (count--) {
+    while (count > 0) {
         uint32_t err;
+        int n = 1;
 
-        R(SD_STA) = STA_ALLFLAGS;
-        /* The controller needs data mode enabled for every single-block read. */
-        R(SD_DCTRL) |= 8u;
-        sd_setup_data(512);
+        if (sd_multi && count > 1) {
+            n = (count > SD_MULTI_MAX) ? SD_MULTI_MAX : count;
+            err = sd_read_multi(start, n, p);
+            if (err) {
+                /* Do not fail the request: the single-block path is still
+                 * there and is known to work, since the ladder proved it
+                 * before it ever tried this one. Turn multi-block off for the
+                 * rest of this boot rather than paying the failure on every
+                 * subsequent run, and say so once - a stream of these would
+                 * mean the auto-stop path is wrong, which is a different bug
+                 * from a card going away. */
+                SD_LOG_FAIL("read multi", start, n, (int)err);
+                logf("sd: multi-block off, one CMD17 per sector from here");
+                sd_multi = false;
+                sd_recover();
+                continue;
+            }
+        } else {
+            err = sd_read_one(start, p);
+            if (err) {
+                SD_LOG_FAIL("read", start, count, (int)err);
+                sd_recover();
+                return (err == 0x7f) ? -2 : -3;
+            }
+        }
 
-        ROM_SD_CMD(&sdh, 17, sd_addr(start));    /* READ_SINGLE_BLOCK */
-        if ((err = sd_wait_data(17)) != 0) {
-            SD_LOG_FAIL("read cmd", start, count + 1, (int)err);
-            goto fail;
-        }
-        if ((err = sd_read_fifo512(p)) != 0) {
-            SD_LOG_FAIL("read fifo", start, count + 1, (int)err);
-            goto fail;
-        }
-        if ((err = sd_wait_dataend()) != 0) {
-            SD_LOG_FAIL("read end", start, count + 1, (int)err);
-            goto fail;
-        }
-        p += 512;
-        start++;
-        continue;
-
-fail:
-        /* Recover the CARD, not just the controller.
-         *
-         * Clearing the controller flags leaves a card that is still in a data
-         * state exactly as stuck as it was, so the storage layer's retry
-         * re-issues CMD17 into the same condition and fails identically. That
-         * is visible in the log as the same LBA failing seven times with the
-         * same code and nothing changing in between.
-         *
-         * So do what the write path has always done and the read path never
-         * did: abort any transfer the card thinks is running, then wait for it
-         * to report ready again. Both results are ignored deliberately - this
-         * is a best-effort cleanup on a path that has already failed, and the
-         * caller's retry is what decides the outcome. */
-        R(SD_STA) = STA_ALLFLAGS;
-        ROM_SD_CMD(&sdh, 12, 0);            /* STOP_TRANSMISSION */
-        (void)sd_wait_data(12);
-        R(SD_STA) = STA_ALLFLAGS;
-        (void)sd_wait_ready();
-        return (err == 0x7f) ? -2 : -3;
+        p     += (uint32_t)n * 512u;
+        start += n;
+        count -= n;
     }
     return 0;
 }
@@ -768,29 +1065,47 @@ static uint32_t SDICODE sd_wait_ready(void)
     return 0x29;                               /* the ROM's own timeout code */
 }
 
-/* The data half of a block write, modelled on ROM 0x483a. Two things this does
- * that simply pushing 128 words does not: it checks the data error bits between
- * words, waits for DATAEND, and clears the status afterwards.
- * wait is NOT a substitute - it reports on the command, not on the data. */
-static uint32_t SDICODE sd_write_fifo512(const void *buf)
+/* The data half of a write, modelled on ROM 0x483a. Two things this does that
+ * simply pushing words does not: it checks the data error bits between bursts,
+ * waits for DATAEND, and clears the status afterwards. The command wait is NOT
+ * a substitute - it reports on the command, not on the data.
+ *
+ * Same shape as the read drain and for the same reason: neither the per-word
+ * memcpy nor the ROM's per-word push (0x4610, an unbounded spin behind a call)
+ * belongs inside a FIFO loop on an XIP build. */
+static uint32_t SDICODE sd_write_fifo(const void *buf, uint32_t len)
 {
-    const uint8_t *p = buf, *end = p + 512;
-    uint32_t t;
+    const uint8_t *p = buf;
+    uint32_t left = len, t;
+    bool aligned = (((uintptr_t)buf & 3u) == 0);
 
-    while (p < end) {
-        uint32_t w, sta;
+    while (left) {
+        uint32_t sta, n;
 
         t = 0;
         for (;;) {
             sta = R(SD_STA);
             if (sta & STA_ERRMASK) { R(SD_STA) = STA_ERRMASK; return 32; }
-            if (sta & (1u << 4)) break;        /* TX ready, ROM 0x4850 */
+            if (sta & (1u << 4)) break;        /* TXDR, ROM 0x4850 */
             if (++t > SD_SPIN) return 0x7b;
         }
-        /* buf is not guaranteed to be aligned. */
-        memcpy(&w, p, 4);
-        ROM_FIFO_WR(&sdh, &w);
-        p += 4;
+
+        for (n = 0; n < 8 && left; n++, left -= 4, p += 4) {
+            uint32_t w;
+
+            if (aligned)
+                w = *(const uint32_t *)p;
+            else
+                w = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+
+            t = 0;
+            /* FIFOSTA bit 3 set means the TX FIFO is full. */
+            while (R(SD_FIFOSTA) & FIFOSTA_FULL)
+                if (++t > SD_SPIN)
+                    return 0x7b;
+            R(SD_FIFO) = w;
+        }
     }
 
     t = 0;
@@ -803,7 +1118,51 @@ static uint32_t SDICODE sd_write_fifo512(const void *buf)
     return 0;
 }
 
-/* The write path is placed in SRAM because it spins on FIFO flags. */
+static uint32_t SDICODE sd_write_one(sector_t start, const void *buf)
+{
+    uint32_t err;
+
+    R(SD_STA) = STA_ALLFLAGS;
+    sd_xfer_ctl(false);
+    sd_setup_data(512);
+
+    ROM_SD_CMD(&sdh, 24, sd_addr(start));    /* WRITE_BLOCK */
+    if ((err = sd_wait_data(24)) != 0)
+        return err;
+    return sd_write_fifo(buf, 512);
+}
+
+/* CMD25 with the controller's own auto-stop - 0x3759, the ROM table's CMD25
+ * with bit 12, and the word the vendor's wrapper emits at SRAM 0x8230f4. */
+static uint32_t SDICODE sd_write_multi(sector_t start, int count,
+                                       const void *buf)
+{
+    uint32_t cmd[2], err;
+
+    R(SD_STA) = STA_ALLFLAGS;
+    sd_xfer_ctl(true);
+    sd_setup_data((uint32_t)count * 512u);
+
+    cmd[0] = sd_addr(start);
+    cmd[1] = SD_CMDW_WRITE_MULTI;
+    ROM_SD_SEND_RAW(sdh.base, cmd);
+
+    if ((err = sd_wait_data(25)) != 0)
+        return err;
+    if ((err = sd_write_fifo(buf, (uint32_t)count * 512u)) != 0)
+        return err;
+    return sd_wait_autostop();
+}
+
+/* The write path is placed in SRAM because it spins on FIFO flags.
+ *
+ * Multi-block writes ride on the same sd_multi the read ladder proved. That is
+ * an inference rather than its own check - the command word, the transfer
+ * register and the auto-stop are the same three mechanisms, only the direction
+ * bit differs - and it is deliberately not verified by writing to the card,
+ * because a verification write has to put bytes somewhere and there is nowhere
+ * on a user's card that is safe to spend. A card that cannot do it falls back
+ * on the first failure, exactly as the read path does. */
 int SDICODE sd_write_sectors(IF_MD(int drive,)
                              sector_t start, int count, const void *buf)
 {
@@ -813,24 +1172,36 @@ int SDICODE sd_write_sectors(IF_MD(int drive,)
     if (!sd_ok)
         return -1;
 
-    while (count--) {
+    while (count > 0) {
         uint32_t err;
+        int n = 1;
 
-        /* The card may still be busy from the previous block. */
-        if ((err = sd_wait_ready()) != 0)
+        /* The card may still be committing the previous block. */
+        if (sd_wait_ready() != 0)
             return -4;
 
-        R(SD_STA) = STA_ALLFLAGS;
-        R(SD_DCTRL) |= 8u;
-        sd_setup_data(512);
+        if (sd_multi && count > 1) {
+            n = (count > SD_MULTI_MAX) ? SD_MULTI_MAX : count;
+            err = sd_write_multi(start, n, p);
+            if (err) {
+                SD_LOG_FAIL("write multi", start, n, (int)err);
+                logf("sd: multi-block off, one CMD24 per sector from here");
+                sd_multi = false;
+                sd_recover();
+                continue;
+            }
+        } else {
+            err = sd_write_one(start, p);
+            if (err) {
+                SD_LOG_FAIL("write", start, count, (int)err);
+                sd_recover();
+                return (err == 0x7f) ? -2 : -3;
+            }
+        }
 
-        ROM_SD_CMD(&sdh, 24, sd_addr(start));    /* WRITE_BLOCK */
-        if ((err = sd_wait_data(24)) != 0)
-            return -2;
-        if ((err = sd_write_fifo512(p)) != 0)
-            return -3;
-        p += 512;
-        start++;
+        p     += (uint32_t)n * 512u;
+        start += n;
+        count -= n;
     }
 
     /* Do not return while the card is committing the last block. */
