@@ -59,6 +59,8 @@
 #endif
 
 #define BLACKBOX_NEWEST     ROCKBOX_DIR "/blackbox.txt"
+/* Written to first, renamed into place last; see blackbox_dump. */
+#define BLACKBOX_PENDING    ROCKBOX_DIR "/blackbox.new"
 /* The digit's position in the template below, patched in place rather than
  * formatted: this runs from panic and fault context. */
 #define BLACKBOX_ROTATED    ROCKBOX_DIR "/blackbox.0.txt"
@@ -294,14 +296,19 @@ bool blackbox_dump(void)
      * recurse through system_exception_wait back into it. */
     blackbox_written = true;
 
-    /* Rotate first so the newest name is free. With no card these are five
-     * failing calls that change nothing; with a card they are the rotation.
-     * Deliberately not gated on a probe - opendir would take an entry out of
-     * the disk cache, and running that out IS a panic (see
+    /* Write to a scratch name, and only rotate once it is safely closed.
+     *
+     * This used to rotate first, "so the newest name is free". That loses a
+     * run whenever the write fails after the renames: the card had
+     * blackbox.1..4 and no blackbox.txt at all, because the rotation succeeded
+     * and the write into the freed name did not. Which is the worst possible
+     * time to lose a log - the write failed because something had just gone
+     * wrong, and that run is the one worth reading.
+     *
+     * The rename is deliberately not gated on a probe - opendir would take an
+     * entry out of the disk cache, and running that out IS a panic (see
      * DC_NUM_ENTRIES_OVERRIDE in the target config). */
-    bb_rotate();
-
-    fd = open(BLACKBOX_NEWEST, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    fd = open(BLACKBOX_PENDING, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0)
         return false;       /* no card, no filesystem, full card: all fine */
 
@@ -341,6 +348,13 @@ bool blackbox_dump(void)
     bb_puts(fd, "--- log ---\n");
     bb_write_log(fd);
     close(fd);
+
+    /* Everything is on the card under the scratch name. Now shuffle the old
+     * runs down and put this one at the head. A failure anywhere above leaves
+     * the previous set completely untouched. */
+    bb_rotate();
+    if (rename(BLACKBOX_PENDING, BLACKBOX_NEWEST) < 0)
+        return false;
 
     /* Consumed. Keep the magic so the next reset is still recognised as warm,
      * but start the ring and the record clean. */

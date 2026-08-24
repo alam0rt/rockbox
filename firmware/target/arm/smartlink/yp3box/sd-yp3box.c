@@ -95,7 +95,7 @@
  * clock id, so selecting one is a thing you must do, not a thing you inherit. */
 #define SD_CLOCK_SRC 0x0au
 #define SD_DIV_ID   64u
-#define SD_DIV_DATA 2u          /* 24 MHz / 2 = 12 MHz, see below */
+#define SD_DIV_DATA 4u          /* 24 MHz / 4 = 6 MHz, see below */
 /* Identification-speed divider (vendor: 0x40).
  *
  * And it is the ONLY divider this driver ever programs. sd_set_clock is called
@@ -116,11 +116,14 @@
  * 0x0a is right: it is the source the vendor's divider was chosen against.
  *
  * SD_DIV_DATA is the transfer divider, applied once the card is selected and
- * in transfer state. 2 gives 12 MHz. Default speed allows 25 MHz, so 1 (24 MHz)
- * is legal and available if it proves reliable - but this board has already
- * produced controller error flags on reads (rc=32), and doubling the clock is
- * a poor thing to combine with an unexplained CRC. 12 MHz is a 32x improvement
- * with a full octave of margin; take that first and measure again. */
+ * in transfer state, and then VERIFIED - see sd_init.
+ *
+ * 2 (12 MHz) was tried first and this board would not take it: the card went
+ * unreadable the instant the clock changed. 4 gives 6 MHz, still a 16x
+ * improvement on 375 kHz. Default speed permits 25 MHz, so the ceiling is not
+ * the spec - it is this hardware, and where exactly is unmeasured. Raise it a
+ * step at a time; the check below means a step too far costs a slow boot
+ * rather than a card that reads as blank. */
 
 /* Boot ROM SD HAL. All of these take a handle whose first word is the base. */
 #define ROM_SD_CMD      ((void     (*)(void *, unsigned, uint32_t))0x40c5u)
@@ -264,6 +267,13 @@ static uint32_t SDICODE sd_wait_r1_idx(unsigned idx)
     R(SD_STA) = STA_DONE | STA_ERRMASK;
     return 0;
 }
+
+/* One sector, for the post-identification speed check. .bss, not const: it is
+ * a DMA-free PIO read, but keeping card buffers out of flash is the standing
+ * rule in this port. */
+static uint8_t sd_probe_buf[512];
+int SDICODE sd_read_sectors(IF_MD(int drive,) sector_t start, int count,
+                            void *buf);
 
 /* CMD0, CMD8 and the ACMD41 negotiation - vendor sd_power_on at 0x8288c4. */
 static uint32_t sd_power_on(void)
@@ -457,12 +467,6 @@ int sd_init(void)
     if (ROM_SD_WAIT(&sdh, 16))
         return -4;
 
-    /* Identification is over and the card is selected, so leave 375 kHz behind.
-     * Every data read on this device - the FAT mount, every track, and every
-     * sector the boot ROM's BOT target moves during USB mass storage - has been
-     * running at the identification rate because this call was never made. */
-    sd_set_clock(SD_DIV_DATA);
-
     sd_card.initialized = 1;
     sd_card.numblocks   = sd_numblocks;
     sd_card.blocksize   = 512;
@@ -470,6 +474,26 @@ int sd_init(void)
     sd_card.sd2plus     = (sd_cardtype >= 1);
 
     sd_ok = true;
+
+    /* Identification is over and the card is selected, so leave 375 kHz behind
+     * - but PROVE the card still answers before keeping the faster clock.
+     *
+     * The first attempt at this did not, and 12 MHz was too fast for this
+     * board: the log ended on the line announcing the new rate, and the card
+     * then read as an empty volume. That failure mode is nasty precisely
+     * because it is silent - the card identifies at 375 kHz, sd_ok is already
+     * true, and every subsequent read returns nothing rather than an error,
+     * so the device boots to what looks like a blank card.
+     *
+     * So: raise it, read a sector, and back out if that fails. One 512-byte
+     * read against never shipping a silently unreadable card again. Falling
+     * back is not a failure of sd_init - 375 kHz works, it is merely slow. */
+    sd_set_clock(SD_DIV_DATA);
+    if (sd_read_sectors(IF_MD(0,) 0, 1, sd_probe_buf) != 0) {
+        logf("sd: div %u unreadable, falling back to %u", SD_DIV_DATA, SD_DIV_ID);
+        sd_set_clock(SD_DIV_ID);
+    }
+
     return 0;
 }
 
