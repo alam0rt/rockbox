@@ -227,6 +227,19 @@ extern void audio_pcmbuf_sync_position(void);
 /* start PCM if callback says it's alright */
 static void start_audio_playback(void)
 {
+    /* Scaffolding. "pcmbuf start: widx=0 ridx=0" says playback never armed but
+     * not why, and the two reasons need opposite fixes: may_play false is the
+     * playback engine's state machine, data_critical true is simply not enough
+     * PCM yet. Rate limited because this is called from get_write_buffer. */
+    {
+        static unsigned declines;
+        if (!audio_pcmbuf_may_play() &&
+            (declines < 3 || (declines % 100) == 0))
+            logf("start declined (#%u): widx=%d ridx=%d", declines,
+                 (int)chunk_widx, (int)chunk_ridx);
+        declines++;
+    }
+
      if (audio_pcmbuf_may_play())
         pcmbuf_play_start();
 }
@@ -458,13 +471,15 @@ static void * get_write_buffer(size_t *size)
 /* Commit outstanding data leaving less than a chunk size remaining */
 static void commit_write_buffer(size_t size)
 {
-    /* The first few only: this is per-chunk. If none of these ever appear,
-     * the codec produced no PCM and the search moves off the audio path
-     * entirely and into the codec's output. */
+    /* The first few, then every 50th. Logging only the first four hid the
+     * number that matters: whether committed data ever reaches the watermark
+     * that start_audio_playback gates on. It never appeared to, but the log
+     * stopped before it could have. */
     {
         static int commits;
-        if (commits < 4)
-            logf("pcmbuf commit #%d size=%lu", commits, (unsigned long)size);
+        if (commits < 4 || (commits % 50) == 0)
+            logf("pcmbuf commit #%d size=%lu widx=%d ridx=%d", commits,
+                 (unsigned long)size, (int)chunk_widx, (int)chunk_ridx);
         commits++;
     }
 
