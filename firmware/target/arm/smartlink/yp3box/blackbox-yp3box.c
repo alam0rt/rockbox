@@ -36,6 +36,9 @@
 #include "string-extra.h"
 #include "blackbox.h"
 #include "sl6801-regs.h"
+#ifdef ROCKBOX_HAS_LOGF
+#define LOGF_ENABLE
+#endif
 #include "kernel.h"
 #include "logf.h"
 #include "version.h"
