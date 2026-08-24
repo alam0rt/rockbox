@@ -36,6 +36,7 @@
 #include "string-extra.h"
 #include "blackbox.h"
 #include "sl6801-regs.h"
+#include "kernel.h"
 #include "logf.h"
 #include "version.h"
 #include "yp3-buildstamp.h"
@@ -136,6 +137,38 @@ void blackbox_set_probe_idx(unsigned idx)
         yp3_blackbox.probe_idx = idx;
 }
 
+
+/* A clock in the log.
+ *
+ * The ring records the ORDER of events and nothing about their spacing, so a
+ * boot that takes three minutes and a boot that takes three seconds produce
+ * the same lines. "Slow somewhere between storage_init and the file browser"
+ * is not a finding, and the two counters we do print - storage_init=169
+ * mount=12 ticks - account for under two seconds of it.
+ *
+ * So put one line per second into the same ring everything else uses. It
+ * interleaves with the existing logf output, which turns every gap into a
+ * number without touching shared logf.c: the last t= line before a stall and
+ * the first one after it bracket whatever ran in between.
+ *
+ * Bounded on purpose. The ring is 6 KB and wraps, so an unbounded beacon
+ * would eventually be the only thing in it; BB_TICK_MAX seconds is longer
+ * than any boot we are trying to explain and stops well before that. */
+#define BB_TICK_MAX 400
+
+static long bb_tick_next;
+static int  bb_tick_left = BB_TICK_MAX;
+
+static void bb_tick_beacon(void)
+{
+    if (bb_tick_left <= 0 || TIME_BEFORE(current_tick, bb_tick_next))
+        return;
+
+    bb_tick_next = current_tick + HZ;
+    bb_tick_left--;
+    logf("t=%ld", (long)(current_tick / HZ));
+}
+
 void blackbox_init(void)
 {
     struct yp3_blackbox *bb = &yp3_blackbox;
@@ -151,6 +184,7 @@ void blackbox_init(void)
         bb->magic = BLACKBOX_MAGIC;
         bb->boots = 1;
         bb_stamp_version(bb);
+        tick_add_task(bb_tick_beacon);
         return;
     }
 
@@ -186,6 +220,8 @@ void blackbox_init(void)
      * in the ring itself rather than making the reader guess. */
     logf("--- boot %lu ---", (unsigned long)bb->boots);
 #endif
+
+    tick_add_task(bb_tick_beacon);
 }
 
 /* Formatting by hand: this runs from panic and fault context, where the
