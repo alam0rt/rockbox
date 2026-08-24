@@ -95,6 +95,7 @@
  * clock id, so selecting one is a thing you must do, not a thing you inherit. */
 #define SD_CLOCK_SRC 0x0au
 #define SD_DIV_ID   64u
+#define SD_DIV_DATA 2u          /* 24 MHz / 2 = 12 MHz, see below */
 /* Identification-speed divider (vendor: 0x40).
  *
  * And it is the ONLY divider this driver ever programs. sd_set_clock is called
@@ -106,10 +107,20 @@
  * the identification rate. That is the obvious suspect for "USB access is very
  * slow", and it is not the audio/USB module sharing.
  *
- * Not changed yet, on purpose: the transfer divider wants a measurement, not a
- * guess. Too fast is CRC failures on a path that currently works. The log line
- * in sd_set_clock reports what 64 actually yields and what the source runs at,
- * which is the number to divide down from. */
+ * Measured, and the guess would have been wrong:
+ *
+ *     sd: clk=375000 Hz src0xa=24000000 Hz div=64
+ *
+ * so the source is 24 MHz and 64 lands exactly on 375 kHz - the identification
+ * rate, inside the spec's 400 kHz cap. That also settles that selecting source
+ * 0x0a is right: it is the source the vendor's divider was chosen against.
+ *
+ * SD_DIV_DATA is the transfer divider, applied once the card is selected and
+ * in transfer state. 2 gives 12 MHz. Default speed allows 25 MHz, so 1 (24 MHz)
+ * is legal and available if it proves reliable - but this board has already
+ * produced controller error flags on reads (rc=32), and doubling the clock is
+ * a poor thing to combine with an unexplained CRC. 12 MHz is a 32x improvement
+ * with a full octave of margin; take that first and measure again. */
 
 /* Boot ROM SD HAL. All of these take a handle whose first word is the base. */
 #define ROM_SD_CMD      ((void     (*)(void *, unsigned, uint32_t))0x40c5u)
@@ -445,6 +456,12 @@ int sd_init(void)
     ROM_SD_CMD(&sdh, 16, 512);               /* SET_BLOCKLEN */
     if (ROM_SD_WAIT(&sdh, 16))
         return -4;
+
+    /* Identification is over and the card is selected, so leave 375 kHz behind.
+     * Every data read on this device - the FAT mount, every track, and every
+     * sector the boot ROM's BOT target moves during USB mass storage - has been
+     * running at the identification rate because this call was never made. */
+    sd_set_clock(SD_DIV_DATA);
 
     sd_card.initialized = 1;
     sd_card.numblocks   = sd_numblocks;
