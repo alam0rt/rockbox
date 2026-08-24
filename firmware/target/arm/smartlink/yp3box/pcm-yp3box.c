@@ -107,6 +107,95 @@ yp3_audio_pll(unsigned long rate)
     yp3_audio_mclk = f48 ? 24576000ul : 22579000ul;
 }
 
+/* --- the audio block's missing module -------------------------------------
+ *
+ * 0x40040000 will not hold a value: AUDIO_CTRL and AUDIO_ENABLE read back zero
+ * immediately after being written, and the DMA channel reads back zero after
+ * being programmed. That is the "module is off" signature from CLAUDE.md, and
+ * no amount of protocol work will move it.
+ *
+ * Which module gates the block is not derivable from the vendor's code: the
+ * audio driver (/dev/audio0, handler FIRM 0xd6746c) enables only 0x57, and the
+ * register map is confirmed correct - audio_dma_setup at FIRM 0xd7eda4 uses
+ * 0x4004000e/0x12/0x16 and 0x40040208/0x20c, exactly our AUDIO_DMA layout. So
+ * whatever powers the block is enabled somewhere we cannot see statically.
+ *
+ * The gate registers answer it by comparison instead. probe/clk80_work.bin is
+ * a capture of 0x40080000 with the VENDOR firmware running; the black box logs
+ * the same six words from ours. Decoding both into module ids:
+ *
+ *   vendor  00 01 21 22 23 24 25 27 28 44 45 46 4a 54 58 5a 5c
+ *   ours       01 21       24       44 45 46    54    57    5c
+ *
+ * leaving exactly nine the vendor holds on and we do not. Enabling all nine is
+ * not a blind sweep - it reproduces a configuration the vendor demonstrably
+ * runs in, which is what makes it safe. The sweep that hung this device twice
+ * set gate bits for all 96 ids, including the SPI NOR controller we execute
+ * from; none of these nine can be that, because the vendor runs with all nine
+ * on and its own firmware is XIP from the same flash.
+ *
+ * Each step logs BEFORE it acts, so if one of them does wedge the bus the last
+ * line in the black box names it. And each logs AUDIO_CTRL's readback after,
+ * so a single boot says which module woke the block: the first row whose
+ * readback is nonzero is the answer, and the rest can then be dropped.
+ *
+ * Known already: 0x23 is the USB device (FIRM 0xd66d98,
+ * driver_usbd_params_init) and 0x4a is the UART at 0x40092000 (FIRM 0xd7ec30,
+ * which configures a driver struct holding that base). Both are kept in the
+ * list anyway - cheap, and the point of this boot is to remove the guessing. */
+static void __attribute__((section(".icode"), noinline))
+yp3_audio_try(unsigned mod)
+{
+    if (ROM_CLK_IS_ON(mod))
+    {
+        logf("blk: %02x already on", mod);
+        return;
+    }
+    logf("blk: enabling %02x", mod);          /* before, so a hang names it */
+    ROM_CLK_ENABLE(mod);
+    AUDIO_CTRL = 0x11eu | 1u;
+    logf("blk: %02x -> ctrl=%08lx", mod, (unsigned long)AUDIO_CTRL);
+}
+
+static void __attribute__((section(".icode"), noinline))
+yp3_audio_block_enable(void)
+{
+    AUDIO_CTRL = 0x11eu | 1u;
+    logf("blk: before any module, ctrl=%08lx", (unsigned long)AUDIO_CTRL);
+
+    /* Unrolled with immediates on purpose. A `static const` table would live
+     * in .rodata, which is SPI NOR, and this function is in .icode precisely
+     * so that a clock or gate change cannot stall on an instruction or data
+     * fetch from the controller it just perturbed. docs/XIP.md records a probe
+     * that read its addresses from exactly such a table and ended up measuring
+     * itself.
+     *
+     * Ordered by likelihood, then by how well characterised each one is. The
+     * module id is NOT derivable from the register base - the pairs we know
+     * settle that, because 0x40095000 is module 0x5c while 0x40096000, the
+     * very next page, is 0x54 - but it does cluster:
+     *
+     *   0x40001000 DMA   0x21     0x40092000 UART  0x4a
+     *   0x40003000 SD    0x24     0x40095000 LCDC  0x5c
+     *                             0x40096000 ADC   0x54
+     *                             0x4009b000 codec 0x57
+     *
+     * The low-page peripherals take 0x2x ids and the 0x4009xxxx group takes
+     * 0x4a-0x5c. The audio block sits at 0x40040000, below that second group,
+     * so the unaccounted 0x2x ids are tried first. 0x00 goes last: it is the
+     * one candidate nothing anywhere identifies, and an id that low could
+     * plausibly gate something the CPU is standing on. */
+    yp3_audio_try(0x25);
+    yp3_audio_try(0x27);
+    yp3_audio_try(0x28);
+    yp3_audio_try(0x22);
+    yp3_audio_try(0x5a);        /* nothing in FIRM, SRAM or ROM enables it */
+    yp3_audio_try(0x58);
+    yp3_audio_try(0x4a);        /* UART, FIRM 0xd7ec30 */
+    yp3_audio_try(0x23);        /* USB device, FIRM 0xd66d98 */
+    yp3_audio_try(0x00);        /* least characterised - last on purpose */
+}
+
 /* --- codec block ----------------------------------------------------------
  *
  * FIRM 0xd7e844, the /dev/audio0 ioctl 3 handler ("enable"), and its mirror at
@@ -171,6 +260,8 @@ yp3_codec_enable(unsigned long rate)
     CODEC(0x4c) = (CODEC(0x4c) & ~0x0f000000u) | 0x0e000000u;
     CODEC(0x50) = 27;
     CODEC(0x40) |= 0x80000000u | 1u;    /* run */
+
+    yp3_audio_block_enable();
 }
 
 /* --- DMA ------------------------------------------------------------------
