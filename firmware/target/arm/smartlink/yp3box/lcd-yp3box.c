@@ -144,8 +144,11 @@ static void __attribute__((section(".icode"), noinline)) lcd_clock_bringup(void)
     /* Apply the vendor pixel clock after its source has been enabled. */
 #define YP3_VENDOR_PIXEL_CLOCK 1
 #if YP3_VENDOR_PIXEL_CLOCK
-    ROM_CLK_APPLY(8);
-    ROM_CLK_SRC(LCD_CLOCK, 8);
+    /* This was the wrapper's own logic written out by hand - start source 8,
+     * then select it - which is correct, and is also precisely the shape that
+     * gets copied to a site where the pre-start is forgotten. Use the wrapper:
+     * identical behaviour, and one less trap. */
+    ROM_CLK_SET_SRC(LCD_CLOCK, 8);
     ROM_CLK_DIV(LCD_CLOCK, 6);
 #endif
     ROM_CLK_APPLY(LCD_CLOCK);

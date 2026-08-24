@@ -23,10 +23,10 @@
  *     base = 0x40084020 + ch*32                   ch3 -> 0x40084080
  * Without the MODULE enable the PWM registers do not hold a value - exactly the
  * symptom the LCDC had before clk_enable(0x5c). */
-#define ROM_CLK_IS_ON  ((int  (*)(unsigned))0x2519u)
-#define ROM_CLK_ENABLE ((void (*)(unsigned))0x2565u)
-#define ROM_CLK_SRC    ((void (*)(unsigned, unsigned))0x3119u)
-#define ROM_CLK_APPLY  ((void (*)(unsigned))0x27a1u)
+/* Bindings come from sl6801-regs.h rather than a local copy: it carries
+ * ROM_CLK_SET_SRC, and a safety wrapper that exists in three hand-copies is
+ * a wrapper waiting to be forgotten in one of them. */
+#include "sl6801-regs.h"
 
 /* THE PWM OUTPUT PIN.
  *
@@ -107,7 +107,11 @@ bool backlight_hw_init(void)
 
     if (!ROM_CLK_IS_ON(PWM_MODULE))
         ROM_CLK_ENABLE(PWM_MODULE);
-    ROM_CLK_SRC(PWM_CLOCK, 16);
+    /* Through the wrapper. Source 16 needs no pre-start, so this is exactly
+     * what the raw call did - but the raw form is the one that has frozen this
+     * device twice when the source happened to be 8 or 9, so it does not stay
+     * in the tree. tools/check_clock_rules.py enforces that. */
+    ROM_CLK_SET_SRC(PWM_CLOCK, 16);
     ROM_CLK_APPLY(PWM_CLOCK);
     for (d = 0; d < 5000; d++) ;
 

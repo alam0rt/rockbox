@@ -76,6 +76,24 @@
 /* Clock/module ids: the vendor resets module 0x24 and drives clock 0x11. */
 #define SD_MODULE   0x24u
 #define SD_CLOCK    0x11u
+/* The SOURCE for that clock. The vendor's own SD bring-up (FIRM 0xd67f14) sets
+ * it every time, immediately before starting the clock:
+ *
+ *     d67f26  movs r1, #10          ; src 0x0a
+ *     d67f28  movs r0, #17          ; clk 0x11
+ *     d67f2a  bl   0x8050f2         ; clk_set_source
+ *     d67f2e  movs r0, #17
+ *     d67f30  bl   0x8051ec         ; clk_start
+ *
+ * We never did, which is why the card comes back after a boot but not after a
+ * USB eject: at boot the source is whatever the ROM left while loading from
+ * the card, and it is right. The ROM's own BOT target drives the card during
+ * mass storage and does not put it back, so our re-init restored the divider
+ * onto a source that is no longer feeding anything. A stopped source is a
+ * stopped clock, the card never sees CMD0 or CMD55, and sd_power_on reports
+ * "no card". CLAUDE.md has the rule this broke: a source number is itself a
+ * clock id, so selecting one is a thing you must do, not a thing you inherit. */
+#define SD_CLOCK_SRC 0x0au
 #define SD_DIV_ID   64u
 /* Identification-speed divider (vendor: 0x40). */
 
@@ -109,6 +127,17 @@
 #define ROM_CLK_STOP    ((void (*)(unsigned))0x2a7du)
 #define ROM_CLK_DIV     ((void (*)(unsigned, unsigned))0x2d59u)
 #define ROM_CLK_APPLY   ((void (*)(unsigned))0x27a1u)
+#define ROM_CLK_SRC     ((void (*)(unsigned, unsigned))0x3119u)
+/* The vendor's source-select wrapper. sl6801-regs.h carries the canonical copy
+ * and the reasoning; this file keeps its own ROM bindings rather than including
+ * that header, so the wrapper is repeated here with it. Never call ROM_CLK_SRC
+ * directly: a source number is itself a clock id, and 8 and 9 have to be
+ * started before they can be selected. 0x0a is neither, but the guard stays so
+ * that changing SD_CLOCK_SRC later cannot quietly reintroduce the trap. */
+#define ROM_CLK_SET_SRC(id, src) do {                       \
+        if ((src) == 8 || (src) == 9) ROM_CLK_APPLY(src);   \
+        ROM_CLK_SRC((id), (src));                           \
+    } while (0)
 #define ROM_CLK_ENABLE  ((void (*)(unsigned))0x2565u)
 #define ROM_CLK_DISABLE ((void (*)(unsigned))0x2571u)
 #define ROM_GPIO_CFG1   ((void (*)(unsigned))0x7adu)
@@ -162,6 +191,9 @@ static void SDICODE sd_module_reset(void)
 static void SDICODE sd_set_clock(unsigned div)
 {
     ROM_CLK_STOP(SD_CLOCK);
+    /* Source before divider and apply, which is the vendor's order. Through
+     * the wrapper, never ROM_CLK_SRC directly - see sl6801-regs.h. */
+    ROM_CLK_SET_SRC(SD_CLOCK, SD_CLOCK_SRC);
     ROM_CLK_DIV(SD_CLOCK, div);
     sd_mdelay(100);
     ROM_CLK_APPLY(SD_CLOCK);
