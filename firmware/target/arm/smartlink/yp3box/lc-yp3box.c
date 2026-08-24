@@ -155,6 +155,17 @@ static void * lc_open_resident(const char *name, unsigned char *buf,
 
         commit_discard_idcache();
 
+        /* Log the hit, not just the failures. The line immediately after this
+         * one in the ring is codec_load_ram's "calling entrypoint", so a log
+         * that stops between the two says the codec was entered and did not
+         * come back - which is the difference between a loader fault and a
+         * fault inside the codec, and the log ring survives a hang plus reset
+         * in the black box. */
+        logf("lc_open: %s resident %08lx, .data %lu, hdr %08lx", name,
+             (unsigned long)codec_slots[i].base,
+             (unsigned long)(d->data_end - d->data_start),
+             (unsigned long)(d + 1));
+
         /* The header follows the descriptor; see the .codecxip and .header
          * output sections in plugin.lds. */
         return (void *)(d + 1);
