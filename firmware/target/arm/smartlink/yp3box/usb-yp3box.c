@@ -462,12 +462,20 @@ usb_hw_enable(void)
     ROM_GPIO_CFG1(USB_PIN_DM);          /* FIRM 0xd66dc4 */
 }
 
-/* Teardown, FIRM 0xd66c3a: stop the clock, then drop the module. */
+/* Teardown, FIRM 0xd66c3a: stop the clock, then drop the module.
+ *
+ * We stop the clock and LEAVE THE MODULE ON. Module 0x23 does not gate USB
+ * alone - it gates the audio block at 0x40040000 too, proved by a probe that
+ * walked nine candidates and found AUDIO_CTRL holding a value only once 0x23
+ * was enabled (see pcm-yp3box.c). Dropping it here takes audio down with USB.
+ *
+ * The vendor does not turn it off either: 0x23 is on in probe/clk80_work.bin,
+ * the gate capture taken with its firmware running. Stopping the clock is
+ * enough to quiesce the controller. */
 static void __attribute__((section(".icode"), noinline))
 usb_hw_disable(void)
 {
     ROM_CLK_STOP(USB_CLOCK);
-    ROM_CLK_DISABLE(USB_MODULE);
 }
 
 
