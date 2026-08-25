@@ -356,10 +356,22 @@ static void yp3_analog_enable(unsigned mask)
  *   - a playback channel word is 3, not 5. 0xd7b390..0xd7b398 ORs 2 (or 6)
  *     and then 1; the 5 came from the capture loop at 0xd7b56e.
  */
+/* Readback tracing. The first hardware run of this path logged
+ * `tx ctrl=00300800` at the END of this function - bits 0 and 1 clear, when
+ * 0xd7b1a0 had written bit 0 - and there was no way to tell WHEN it was lost.
+ * A write that never latches and a bit that clears itself two writes later are
+ * different faults with the same footprint at the end. Only the self-test
+ * turns this on; normal playback is not a place to log six lines. */
+static bool yp3_tx_trace;
+#define TXTRACE(tag) do { if (yp3_tx_trace) \
+        logf("tx: %s 200=%08lx", tag, (unsigned long)AUD_TX_CTRL); } while (0)
+
 static void yp3_tx_enable(unsigned long rate, bool stereo)
 {
     unsigned n;
     uint32_t v;
+
+    TXTRACE("entry");
 
     /* 0xd7b0e4 .. 0xd7b0fe - global, and ahead of everything else. */
     AUD(0x00) |= 0x80000022u;
@@ -381,15 +393,19 @@ static void yp3_tx_enable(unsigned long rate, bool stereo)
     /* 0xd7b194 / 0xd7b1a0 - stop, then enable. Bit 0 is the enable for this
      * file; bit 1 stays clear. */
     AUD_TX_CTRL &= ~2u;
+    TXTRACE("clr1");
     AUD_TX_CTRL |= 1u;
+    TXTRACE("set0");
 
     /* 0xd7b1a8 - all four channel volumes, not three. */
     for (n = 0; n < 4; n++)
         field_set(&AUD_TX_VOL(n), AUD_VOL_MAX, AUD_VOL_MAX);
+    TXTRACE("vols");
 
     /* 0xd7b24c - rate code into [11:8], everything else preserved. */
     AUD_TX_CTRL = (AUD_TX_CTRL & ~0xf00u)
                 | ((uint32_t)yp3_rate_code(rate) << 8);
+    TXTRACE("rate");
 
     /* 0xd7b25c - bit 2 is stereo, bit 7 is unconditional. */
     AUD_TX_FMT = (AUD_TX_FMT & ~4u) | (stereo ? 4u : 0u) | 0x80u;
@@ -435,6 +451,7 @@ static void yp3_tx_enable(unsigned long rate, bool stereo)
      * nothing else, so that is what happens here. */
     v = AUD(0x410);
     AUD(0x410) = v | 0x40000000u;
+    TXTRACE("r410");
 
     logf("aud: tx ctrl=%08lx fmt=%08lx code=%u vol=%08lx",
          (unsigned long)AUD_TX_CTRL, (unsigned long)AUD_TX_FMT,
@@ -874,18 +891,29 @@ static void st_set_gain(unsigned mask, unsigned g)
     if (mask & 4u) field_set(&AUD(0x2c), 0x001f0000u, g);
 }
 
+/* Poke the enable bit on its own and say what came back. Split out because it
+ * is called from three different points in the ladder below and the whole
+ * value of the ladder is that each rung reports the same way. */
+static uint32_t st_poke(const char *tag, uint32_t set, uint32_t clr)
+{
+    uint32_t after;
+
+    AUD_TX_CTRL = (AUD_TX_CTRL & ~clr) | set;
+    after = AUD_TX_CTRL;                        /* immediately, same domain */
+    logf("st: poke %s -> 200=%08lx bit0=%d bit1=%d", tag,
+         (unsigned long)after, (int)(after & 1u), (int)((after >> 1) & 1u));
+    return after;
+}
+
 void yp3_audio_selftest(void)
 {
-    static const unsigned char masks[3] = { 3u, 4u, 7u };
-    static const unsigned short freqs[3] = { 1000u, 500u, 2000u };
-    static const unsigned char gains[4] = { 0u, 8u, 16u, 31u };
-    unsigned pass, i, g;
+    unsigned i;
+    uint32_t c0, c1, c2;
 
-    logf("st: ==== audio self-test ====");
+    logf("st: ==== audio self-test v2 ====");
 
-    /* S0. Raw, uninterpreted. The GPIO register layout beyond +0x10 is [U],
-     * so this dumps the window rather than pretending to decode it - and a
-     * dump can be re-read against a later decode, which a decode cannot. */
+    /* S0. Raw, uninterpreted - the GPIO layout past +0x10 is [U], and a dump
+     * can be re-read against a later decode while a decode cannot. */
     for (i = 0; i < 16; i += 4)
         logf("st: gpio1[%02x] %08lx %08lx %08lx %08lx", i * 4,
              (unsigned long)REG32(GPIO_PORT(1) + i * 4),
@@ -893,70 +921,105 @@ void yp3_audio_selftest(void)
              (unsigned long)REG32(GPIO_PORT(1) + (i + 2) * 4),
              (unsigned long)REG32(GPIO_PORT(1) + (i + 3) * 4));
 
-    /* S1 and S2. Both log their own readbacks. */
     if (!audio_block_up)
         yp3_audio_block_init();
+
+    /* S1. The master clock, observed rather than computed.
+     *
+     * The v1 run logged mclk=22579000 and that number is arithmetic: it is
+     * what this driver INTENDED, and CLAUDE.md's own warning is that
+     * get_clock_freq derives a rate from the dividers without looking at the
+     * gate, so a plausible reading is not evidence that a clock runs. These
+     * are the PLL's own registers before and after programming, plus the busy
+     * bit that 0x80da4e spins on. If 0x14 bit 11 is still set afterwards the
+     * PLL never settled, and every enable bit below is being written into a
+     * register file with no clock in its domain - which is the leading
+     * explanation for what v1 saw. */
+    logf("st: pll before 10=%08lx 14=%08lx",
+         (unsigned long)ACLK(0x10), (unsigned long)ACLK(0x14));
     yp3_audio_pll(SAMPR_44);
     ROM_CLK_APPLY(AUDIO_MCLK);
-    logf("st: mclk=%lu mod25=%d mod21=%d", yp3_audio_mclk,
-         ROM_CLK_IS_ON(AUDIO_MODULE), ROM_CLK_IS_ON(DMA_MODULE));
+    logf("st: pll after  10=%08lx 14=%08lx busy=%d",
+         (unsigned long)ACLK(0x10), (unsigned long)ACLK(0x14),
+         (int)((ACLK(0x14) >> 11) & 1u));
+    st_wait_ms(10);
+    logf("st: pll +10ms  14=%08lx busy=%d mclk=%lu",
+         (unsigned long)ACLK(0x14), (int)((ACLK(0x14) >> 11) & 1u),
+         yp3_audio_mclk);
+    logf("st: mod25=%d mod21=%d", ROM_CLK_IS_ON(AUDIO_MODULE),
+         ROM_CLK_IS_ON(DMA_MODULE));
 
-    for (pass = 0; pass < 3; pass++) {
-        unsigned mask = masks[pass];
-
-        logf("st: --- pass %u: analog mask %u, %u Hz ---",
-             pass, mask, freqs[pass]);
-        st_fill(SAMPR_44, freqs[pass]);
-
-        /* S3 and S4. yp3_tx_enable logs the TX file and the analogue stage,
-         * bit 29 included. */
-        yp3_analog_mask = mask;
-        yp3_tx_enable(SAMPR_44, true);
-        logf("st: up? 50=%d 54=%d 58=%d",
-             !!(AUD(0x50) & (1u << 29)), !!(AUD(0x54) & (1u << 29)),
-             !!(AUD(0x58) & (1u << 29)));
-
-        /* S5. One transfer, then a bounded wait. 20 ms of audio should
-         * complete in 20 ms; 200 ms of patience is forty times the margin and
-         * still finite, which is the whole difference between a probe and a
-         * hang. */
-        yp3_dma_open();
-        st_irqs = 0;
-        st_active = true;
-        yp3_dma_play(st_tone, sizeof st_tone);
-        yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);
-        for (i = 0; i < 200 && st_irqs == 0; i++)
-            st_wait_ms(1);
-        logf("st: first xfer irqs=%lu after %ums residue=%lu st=%08lx",
-             (unsigned long)st_irqs, i,
-             (unsigned long)(DMA_LEN(PCM_DMA_CH) & DMA_LEN_MASK),
-             (unsigned long)DMA_IRQST(PCM_DMA_CH));
-
-        /* S6. Four bursts. The gap is silence at gain 0, not a stopped
-         * transfer: stopping and restarting the DMA between bursts would put
-         * a second variable into the one stage that is read by ear. */
-        yp3_speaker_pa(true);
-        for (g = 0; g < 4; g++) {
-            st_set_gain(mask, gains[g]);
-            logf("st: pass %u burst %u gain=%u LISTEN", pass, g, gains[g]);
-            st_wait_ms(1000);
-            st_set_gain(mask, 0);
-            st_wait_ms(250);
-        }
-        yp3_speaker_pa(false);
-
-        logf("st: pass %u done irqs=%lu", pass, (unsigned long)st_irqs);
-
-        st_active = false;
-        yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));
-        DMA_CTRL(PCM_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
-        yp3_tx_disable();
-    }
-
-    /* Leave nothing behind for the normal path: it re-runs the whole bring-up
-     * from sink_set_freq, and it expects the stereo pair. */
+    /* S2. The bring-up, now tracing every write to 0x200 as it happens. */
+    st_fill(SAMPR_44, 1000);
     yp3_analog_mask = 3u;
-    logf("st: ==== self-test complete ====");
+    yp3_tx_trace = true;
+    yp3_tx_enable(SAMPR_44, true);
+    yp3_tx_trace = false;
+    logf("st: up? 50=%d 54=%d 58=%d",
+         !!(AUD(0x50) & (1u << 29)), !!(AUD(0x54) & (1u << 29)),
+         !!(AUD(0x58) & (1u << 29)));
+
+    /* S3. The enable-bit ladder.
+     *
+     * v1 could not distinguish two faults that look identical at the end of
+     * yp3_tx_enable: a bit that never latches (no clock in that domain) and a
+     * bit that latches and is then cleared by a later write in the sequence.
+     * The trace above separates those. This asks the third question - whether
+     * ORDER is what matters - by setting the bit AFTER everything else is
+     * configured, which is not what the vendor does but costs nothing to try
+     * in the same boot.
+     *
+     * Each rung reports its own readback, so a rung that works names itself. */
+    c0 = st_poke("bit0-late", 1u, 0u);
+    c1 = st_poke("bit1-too", 2u, 0u);
+    c2 = st_poke("both", 3u, 0u);
+    logf("st: ladder %08lx %08lx %08lx", (unsigned long)c0,
+         (unsigned long)c1, (unsigned long)c2);
+
+    /* S4. Arm one transfer and read the CHANNEL back.
+     *
+     * v1 never logged DMA_CTRL after arming, and that is the gap that let two
+     * explanations survive: a transmitter that never runs (so the peripheral
+     * never requests, and the count sits full) versus a channel whose GO bit
+     * does not stick (so the engine never runs at all). Both give
+     * irqs=0, residue=full, status=0. The GO bit readback tells them apart. */
+    yp3_dma_open();
+    st_irqs = 0;
+    st_active = true;
+    yp3_dma_play(st_tone, sizeof st_tone);
+    yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);
+    logf("st: armed ctrl=%08lx go=%d len=%08lx st=%08lx",
+         (unsigned long)DMA_CTRL(PCM_DMA_CH),
+         (int)((DMA_CTRL(PCM_DMA_CH) >> 30) & 1u),
+         (unsigned long)DMA_LEN(PCM_DMA_CH),
+         (unsigned long)DMA_IRQST(PCM_DMA_CH));
+    for (i = 0; i < 200 && st_irqs == 0; i++)
+        st_wait_ms(1);
+    logf("st: xfer irqs=%lu after %ums residue=%lu go=%d st=%08lx",
+         (unsigned long)st_irqs, i,
+         (unsigned long)(DMA_LEN(PCM_DMA_CH) & DMA_LEN_MASK),
+         (int)((DMA_CTRL(PCM_DMA_CH) >> 30) & 1u),
+         (unsigned long)DMA_IRQST(PCM_DMA_CH));
+    logf("st: tx now 200=%08lx 208=%08lx fifo-src=%08lx",
+         (unsigned long)AUD_TX_CTRL, (unsigned long)AUD_TX_FMT,
+         (unsigned long)DMA_SRC(PCM_DMA_CH));
+
+    /* S5. Two seconds at full gain with the amplifier on, in case any of the
+     * rungs above took. No sweep: nothing has made a sound yet, so there is
+     * nothing to calibrate, and a 20-second boot bought no information. */
+    st_set_gain(3u, 31u);
+    yp3_speaker_pa(true);
+    logf("st: LISTEN 2s, 1 kHz, gain 31");
+    st_wait_ms(2000);
+    yp3_speaker_pa(false);
+
+    st_active = false;
+    yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));
+    DMA_CTRL(PCM_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
+    yp3_tx_disable();
+    st_set_gain(3u, YP3_ANALOG_GAIN);
+
+    logf("st: ==== done irqs=%lu ====", (unsigned long)st_irqs);
 }
 #endif /* YP3_AUDIO_SELFTEST */
 
