@@ -999,32 +999,52 @@ static void st_gpio_dump(const char *tag)
              (unsigned long)REG32(GPIO_PORT(1) + (i + 1) * 4),
              (unsigned long)REG32(GPIO_PORT(1) + (i + 2) * 4),
              (unsigned long)REG32(GPIO_PORT(1) + (i + 3) * 4));
-    logf("st: g1 %s [200] %08lx %08lx %08lx %08lx", tag,
-         (unsigned long)REG32(GPIO_PORT(1) + 0x200),
-         (unsigned long)REG32(GPIO_PORT(1) + 0x204),
-         (unsigned long)REG32(GPIO_PORT(1) + 0x208),
-         (unsigned long)REG32(GPIO_PORT(1) + 0x20c));
-    logf("st: g1 %s [210] %08lx %08lx %08lx %08lx", tag,
-         (unsigned long)REG32(GPIO_PORT(1) + 0x210),
-         (unsigned long)REG32(GPIO_PORT(1) + 0x214),
-         (unsigned long)REG32(GPIO_PORT(1) + 0x218),
-         (unsigned long)REG32(GPIO_PORT(1) + 0x21c));
 }
+
+/* THE ALTERNATE-FUNCTION REGISTERS, decoded from ROM 0x5ae `[C]` and confirmed
+ * against this board `[L]`. They were in the dump all along.
+ *
+ * ROM 0x5ae(base, pin, value) does:
+ *
+ *     w     = base + (pin >> 4) * 4
+ *     shift = (pin & 15) * 2
+ *     w[0x24] = (w[0x24] & ~(3 << shift)) | ((value & 3) << shift)
+ *     w[0x2c] = (w[0x2c] & ~(3 << shift)) | (((value >> 16) & 3) << shift)
+ *
+ * so the alt is TWO two-bit fields per pin: +0x24/+0x2c for pins 0-15 and
+ * +0x28/+0x30 for pins 16-31. `value` is not the alt index - ROM 0x7ac maps
+ * the index through a twelve-entry table at ROM 0x9c4 covering alts 4..15,
+ * with anything else becoming 0x80000000. Port bases are the table at ROM
+ * 0x9b4: 0x40081000 + 0x40 * port.
+ *
+ * The v4 run proves the decode `[L]`. P1.10's field held 2 in BOTH +0x24 and
+ * +0x2c before its walk, which is table entry 0x80020002 - index 11 - and
+ * BOARD-PINS decodes lcd-yp3box.c's panel-reset descriptor 0x000150cb as alt
+ * 11. Exactly the same number, from two unrelated directions.
+ *
+ * AND THE SAME DUMP SHOWS P1.11..P1.15 ALREADY AT ALT 0. Their fields read
+ * zero before any walk, so walking channels 1 and 2 changed no alt at all -
+ * the only thing those walks altered was the PULL field. Whatever made v3
+ * audible, it was not an alt change.
+ *
+ * The +0x200..+0x21c window this driver went looking in is not involved:
+ * +0x218 held 0x800 before and after, and everything else there read zero. */
 
 void yp3_audio_selftest(void)
 {
-    /* Descending, because that is the direction the question points. v3
-     * produced audible sound with this field at 31 and it was very faint, and
-     * nothing establishes which end of a 5-bit analogue gain field is loud -
-     * YP3_ANALOG_GAIN has been [U] since this driver was written, and the one
-     * earlier sweep of it ran while the DMA was moving no bytes, so it
-     * measured nothing. If 31 is maximum ATTENUATION rather than maximum gain,
-     * this sweep gets louder as it goes and the answer is the first thing
-     * anyone hears. */
-    static const unsigned char gains[6] = { 31u, 24u, 16u, 8u, 4u, 0u };
+    /* Four steps, three phases. The open question is still which end of the
+     * 5-bit analogue field is loud - v3 was faint at 31 and the only earlier
+     * sweep ran with no bytes moving, so it measured nothing.
+     *
+     * The phases exist because the v4 dump killed the theory the walks were
+     * doing what this driver thought. Channels 1 and 2 were ALREADY at alt 0
+     * and mode 15 before any walk; their walk only cleared pull. So phase A
+     * plays with the pads exactly as the boot ROM left them, and if A sounds
+     * the same as B then the walk was never the thing. */
+    static const unsigned char gains[4] = { 31u, 16u, 8u, 0u };
     unsigned i, k;
 
-    logf("st: ==== audio self-test v4: the gain direction ====");
+    logf("st: ==== audio self-test v5: gain direction, and do walks matter ====");
 
     if (!audio_block_up)
         yp3_audio_block_init();
@@ -1038,17 +1058,6 @@ void yp3_audio_selftest(void)
          !!(AUD(0x50) & (1u << 29)), !!(AUD(0x54) & (1u << 29)),
          !!(AUD(0x58) & (1u << 29)));
 
-    /* All three channels' pads, walked up front. v3 established that sound
-     * comes out with these walked; WHICH channel carries it is a separate
-     * question, and folding it in would put two variables into a test that is
-     * read by ear. Channel 0 is still walked last - its pads are the panel
-     * reset - so the display disturbance v3 showed is expected here too. */
-    st_gpio_dump("pre ");
-    st_pad_walk(2);
-    st_pad_walk(1);
-    st_pad_walk(0);
-    st_gpio_dump("post");
-
     yp3_dma_open();
     st_irqs = 0;
     st_active = true;
@@ -1058,16 +1067,46 @@ void yp3_audio_selftest(void)
         st_wait_ms(1);
     logf("st: digital irqs=%lu after %ums 200=%08lx", (unsigned long)st_irqs,
          i, (unsigned long)AUD_TX_CTRL);
-
     yp3_speaker_pa(true);
-    for (k = 0; k < 6; k++) {
-        st_set_gain(7u, gains[k]);
-        logf("st: step %u gain=%u 2c=%08lx 30=%08lx", k, gains[k],
-             (unsigned long)AUD(0x2c), (unsigned long)AUD(0x30));
-        st_wait_ms(2000);
-    }
-    yp3_speaker_pa(false);
 
+    st_gpio_dump("boot");
+    for (k = 0; k < 4; k++) {
+        st_set_gain(7u, gains[k]);
+        logf("st: A no-walk gain=%u", gains[k]);
+        st_wait_ms(1200);
+    }
+
+    st_pad_walk(2);
+    st_gpio_dump("ch2 ");
+    for (k = 0; k < 4; k++) {
+        st_set_gain(7u, gains[k]);
+        logf("st: B ch2-walked gain=%u", gains[k]);
+        st_wait_ms(1200);
+    }
+
+    st_pad_walk(1);
+    st_gpio_dump("ch1 ");
+    for (k = 0; k < 4; k++) {
+        st_set_gain(7u, gains[k]);
+        logf("st: C ch1-walked gain=%u", gains[k]);
+        st_wait_ms(1200);
+    }
+
+    /* D. Channel 0 last, deliberately, to turn a strong inference into a
+     * demonstrated cause. v4 walked it before listening and lost the sound v3
+     * had; its pads carry alt 11, the panel reset, in the vendor's own
+     * configuration - so this board does not output audio on channel 0 and
+     * this walk hands the DAC an LCD reset line. The display is expected to
+     * go. If the tone goes with it, that is the whole v3-to-v4 regression. */
+    logf("st: D walking channel 0 - display expected to go. TONE TOO?");
+    st_set_gain(7u, 0u);
+    st_wait_ms(1500);
+    st_pad_walk(0);
+    logf("st: D walked - still playing?");
+    st_wait_ms(3000);
+    st_gpio_dump("ch0 ");
+
+    yp3_speaker_pa(false);
     st_active = false;
     yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));
     DMA_CTRL(PCM_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
