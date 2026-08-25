@@ -1032,19 +1032,46 @@ static void st_gpio_dump(const char *tag)
 
 void yp3_audio_selftest(void)
 {
-    /* Four steps, three phases. The open question is still which end of the
-     * 5-bit analogue field is loud - v3 was faint at 31 and the only earlier
-     * sweep ran with no bytes moving, so it measured nothing.
+    /* THE ANALOGUE OUTPUT IS NEVER TURNED ON. That is what v5 finally makes
+     * plain: 1268 DMA completions, every register reading back exactly as
+     * written, all three channels reporting bit 29 "up", and no sound at any
+     * gain with the pads in any state. Registers correct and nothing coming
+     * out is the second row of CLAUDE.md's table, and the row's own warning is
+     * to ask what the engine was actually told to DO.
      *
-     * The phases exist because the v4 dump killed the theory the walks were
-     * doing what this driver thought. Channels 1 and 2 were ALREADY at alt 0
-     * and mode 15 before any walk; their walk only cleared pull. So phase A
-     * plays with the pads exactly as the boot ROM left them, and if A sounds
-     * the same as B then the walk was never the thing. */
-    static const unsigned char gains[4] = { 31u, 16u, 8u, 0u };
+     * It was told half of it. The vendor's analogue power-on is audio_ioctl
+     * 67 at FIRM 0xd7cd3a, and this driver reproduces its first three lines
+     * and then stops:
+     *
+     *   0xd7cd3e  clk_enable(0x25), clk_start(0x13)          <- we do
+     *   0xd7cd4a  AUD(0x00) |= 0x80000022                    <- we do
+     *   0xd7cd54  FIELD_SET(AUD(0x00), 0x01000000, 1)        <- WE DO NOT
+     *   0xd7cd60  FIELD_SET(AUD(0x00), 0x02000000, 1)        <- WE DO NOT
+     *   0xd7cd80  channel 2's pad walk, gated on ctx[0xf3]   <- we do, late
+     *   0xd7cd84  AUD(0x0c) |= 0x43                          <- WE DO NOT
+     *   0xd7cda2  clk_enable(2), clk_div(0x2c, 8),
+     *             clk_start(0x2c)                            <- WE DO NOT
+     *
+     * Bits 24 and 25 of AUD(0x00) are the per-output enables - docs/AUDIO.md
+     * has always said so, and v5's log reads 00=c0000022 with both of them
+     * clear. AUD(0x0c) is the third analogue output path, enabled by exactly
+     * this 0x43 and disabled by the same mask at 0xd7ce34. And a whole module
+     * and clock go up at the tail, which is the oldest rule this port has:
+     * a peripheral needs BOTH a module enable and a clock.
+     *
+     * Staged, one addition per step, tone running throughout and nothing else
+     * changing, so whichever step makes sound names itself. Gain is parked at
+     * 31 - the value that was audible in v3 - because the sweep in v5 showed
+     * no gain produces sound while the output stage is off, so gain is not the
+     * variable here.
+     *
+     * Channel 0's pads are never walked. Its P1.10 carries alt 11, the panel
+     * reset, in the vendor's own configuration; v4 walked it and lost the
+     * sound v3 had. */
     unsigned i, k;
+    static const unsigned char gains[4] = { 31u, 16u, 8u, 0u };
 
-    logf("st: ==== audio self-test v5: gain direction, and do walks matter ====");
+    logf("st: ==== v6: the analogue output was never enabled ====");
 
     if (!audio_block_up)
         yp3_audio_block_init();
@@ -1054,9 +1081,7 @@ void yp3_audio_selftest(void)
     st_fill(SAMPR_44, 1000);
     yp3_analog_mask = 7u;
     yp3_tx_enable(SAMPR_44, true);
-    logf("st: up? 50=%d 54=%d 58=%d",
-         !!(AUD(0x50) & (1u << 29)), !!(AUD(0x54) & (1u << 29)),
-         !!(AUD(0x58) & (1u << 29)));
+    st_set_gain(7u, 31u);
 
     yp3_dma_open();
     st_irqs = 0;
@@ -1065,46 +1090,46 @@ void yp3_audio_selftest(void)
     yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);
     for (i = 0; i < 200 && st_irqs == 0; i++)
         st_wait_ms(1);
-    logf("st: digital irqs=%lu after %ums 200=%08lx", (unsigned long)st_irqs,
-         i, (unsigned long)AUD_TX_CTRL);
+    logf("st: digital irqs=%lu 00=%08lx 0c=%08lx", (unsigned long)st_irqs,
+         (unsigned long)AUD(0x00), (unsigned long)AUD(0x0c));
     yp3_speaker_pa(true);
 
-    st_gpio_dump("boot");
-    for (k = 0; k < 4; k++) {
-        st_set_gain(7u, gains[k]);
-        logf("st: A no-walk gain=%u", gains[k]);
-        st_wait_ms(1200);
-    }
+    logf("st: A baseline - as v5 ended. Expect silence.");
+    st_wait_ms(2500);
 
+    /* B. 0xd7cd54 and 0xd7cd60 - the two per-output enables. */
+    field_set(&AUD(0x00), 0x01000000u, 1);
+    field_set(&AUD(0x00), 0x02000000u, 1);
+    logf("st: B out-enables 00=%08lx  LISTEN", (unsigned long)AUD(0x00));
+    st_wait_ms(2500);
+
+    /* C. 0xd7cd84 - the third analogue output path. */
+    AUD(0x0c) |= 0x43u;
+    logf("st: C path3 0c=%08lx  LISTEN", (unsigned long)AUD(0x0c));
+    st_wait_ms(2500);
+
+    /* D. 0xd7cda2 - module 2 and clock 0x2c at divider 8. Role [U], but the
+     * vendor brings it up at the tail of the analogue power-on and this port
+     * has lost three multi-cycle detours to a missing clock. */
+    if (!ROM_CLK_IS_ON(2u))
+        ROM_CLK_ENABLE(2u);
+    ROM_CLK_DIV(0x2cu, 8u);
+    ROM_CLK_APPLY(0x2cu);
+    logf("st: D mod2=%d clk2c up  LISTEN", ROM_CLK_IS_ON(2u));
+    st_wait_ms(2500);
+
+    /* E. Channel 2's pads, which ioctl 67 walks at 0xd7cd80. */
     st_pad_walk(2);
     st_gpio_dump("ch2 ");
+    logf("st: E ch2 pads walked  LISTEN");
+    st_wait_ms(2500);
+
+    /* F. Only now is a gain sweep worth anything. */
     for (k = 0; k < 4; k++) {
         st_set_gain(7u, gains[k]);
-        logf("st: B ch2-walked gain=%u", gains[k]);
-        st_wait_ms(1200);
+        logf("st: F gain=%u", gains[k]);
+        st_wait_ms(1500);
     }
-
-    st_pad_walk(1);
-    st_gpio_dump("ch1 ");
-    for (k = 0; k < 4; k++) {
-        st_set_gain(7u, gains[k]);
-        logf("st: C ch1-walked gain=%u", gains[k]);
-        st_wait_ms(1200);
-    }
-
-    /* D. Channel 0 last, deliberately, to turn a strong inference into a
-     * demonstrated cause. v4 walked it before listening and lost the sound v3
-     * had; its pads carry alt 11, the panel reset, in the vendor's own
-     * configuration - so this board does not output audio on channel 0 and
-     * this walk hands the DAC an LCD reset line. The display is expected to
-     * go. If the tone goes with it, that is the whole v3-to-v4 regression. */
-    logf("st: D walking channel 0 - display expected to go. TONE TOO?");
-    st_set_gain(7u, 0u);
-    st_wait_ms(1500);
-    st_pad_walk(0);
-    logf("st: D walked - still playing?");
-    st_wait_ms(3000);
-    st_gpio_dump("ch0 ");
 
     yp3_speaker_pa(false);
     st_active = false;
