@@ -909,20 +909,6 @@ static void st_set_gain(unsigned mask, unsigned g)
     if (mask & 4u) field_set(&AUD(0x2c), 0x001f0000u, g);
 }
 
-/* Poke the enable bit on its own and say what came back. Split out because it
- * is called from three different points in the ladder below and the whole
- * value of the ladder is that each rung reports the same way. */
-static uint32_t st_poke(const char *tag, uint32_t set, uint32_t clr)
-{
-    uint32_t after;
-
-    AUD_TX_CTRL = (AUD_TX_CTRL & ~clr) | set;
-    after = AUD_TX_CTRL;                        /* immediately, same domain */
-    logf("st: poke %s -> 200=%08lx bit0=%d bit1=%d", tag,
-         (unsigned long)after, (int)(after & 1u), (int)((after >> 1) & 1u));
-    return after;
-}
-
 /* The analogue output pads, transcribed from the vendor's own walk.
  *
  * Each analogue channel owns TWO pads, which is what a differential output
