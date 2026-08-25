@@ -51,7 +51,31 @@
 #define AUDIO_MCLK      0x00u       /* the PLL output; set_pll then apply(0) */
 #define ASRC_MODULE     0x20u       /* held only while zeroing 0x40009400    */
 #define ASRC_CLK        0x2du
-/* The playback (TX) group. +0x20c is the FIFO the DMA engine writes into. */
+/* The playback (TX) group. +0x20c is the FIFO the DMA engine writes into.
+ *
+ * THIS MAP IS CORRECT AND WAS ONCE "FIXED" INTO BEING WRONG. The evidence, so
+ * nobody re-derives it a third time:
+ *
+ *  - The vendor's playback DMA wrapper is SRAM 0x814bd4. It calls dma_start
+ *    (SRAM 0x814c94) with the caller's buffer as SOURCE and **0x4000920c** as
+ *    DESTINATION. The capture wrapper at 0x814bec is its mirror image:
+ *    0x4000910c as source, the buffer as destination.
+ *  - dma_start stores its destination at channel +0x04 and its source at
+ *    +0x08, which probe/dma_work.bin confirms independently: the live LCD
+ *    channel has source request id 9 in CONTROL[16:12] with CONTROL bit 17
+ *    clear (source is a peripheral) and destination request id 0 with bit 5
+ *    set (destination is memory) - and it is +0x08 that holds 0x40095030.
+ *  - The playback stream control is base[0x200], not base[0x100]: FIRM
+ *    0xd7b190 does `base[0x200] &= ~2` then `|= 1`, and its four channel
+ *    volumes are the literals at 0xd7b3dc..0xd7b3e8 - 0x40009228, 0x258,
+ *    0x288, 0x2b8. Stride 0x30 from 0x220, volume at +8, exactly as below.
+ *  - base[0x100] is the same register file for CAPTURE. FIRM 0xd7b46c drives
+ *    it with an identical stop/enable/rate sequence, which is why it reads
+ *    like a transmitter enable and is not one.
+ *
+ * The two blocks are identical in shape, so a function that touches one looks
+ * exactly like a function that touches the other. Only the DMA direction tells
+ * them apart. Check the FIFO address before believing anything else. */
 #define AUD_TX_CTRL     AUD(0x200)  /* [0] enable [1] run [11:8] rate code   */
 #define AUD_TX_FMT      AUD(0x208)  /* [2] stereo, [7] always set            */
 #define AUD_TX_FIFO     0x4000920cu

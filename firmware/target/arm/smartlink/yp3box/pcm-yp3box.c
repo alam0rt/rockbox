@@ -195,9 +195,9 @@ yp3_audio_block_init(void)
     field_set(&AUD_RX_MUTE(2), 0x10000u, 0);
 
     audio_block_up = true;
-    logf("aud: init ctrl=%08lx rx=%08lx tx=%08lx",
-         (unsigned long)AUD(0x00), (unsigned long)AUD_RX_CTRL,
-         (unsigned long)AUD_TX_CTRL);
+    logf("aud: init 00=%08lx play(0x200)=%08lx cap(0x100)=%08lx",
+         (unsigned long)AUD(0x00), (unsigned long)AUD_TX_CTRL,
+         (unsigned long)AUD_RX_CTRL);
 }
 
 /* --- the analogue output stage --------------------------------------------
@@ -278,47 +278,129 @@ static void yp3_analog_enable(void)
  * vendor's route ioctls maintain; we want the stereo pair on and the other two
  * off, so the outcome is written directly rather than reproducing the state
  * machine. */
+/* Start the PLAYBACK stream, transcribed from the vendor's own playback arm.
+ *
+ * The vendor function is FIRM 0xd7b0e0. It has exactly three call sites and
+ * they do NOT agree on the force flag: audio_open passes 0 (0xd7d760),
+ * audio_route_apply (0xd7c49c) and audio_rx_enable (0xd7b48a) both pass 1,
+ * which forces the rate code to 7 and skips the 0x208 write. What follows is
+ * the force == 0 path - audio_open's, the one a stream actually opens with -
+ * in its order, through the base pointer at 0xd7b3d4 (= 0x40009000):
+ *
+ *   0xd7b0e4  base[0x00] |= 0x80000022
+ *   0xd7b0f4  base[0x00] |= 0x40000000        a SECOND write, not one OR
+ *   0xd7b0fe  base[0xfc] &= ~0x1f
+ *   0xd7b194  base[0x200] &= ~2
+ *   0xd7b1a0  base[0x200] |= 1
+ *   0xd7b1a8  the four channel volumes, field 0x1ff
+ *             (literals 0xd7b3dc..0xd7b3e8 = 0x40009228/258/288/2b8)
+ *   0xd7b24c  base[0x200] = (old & ~0xf00) | (ratecode << 8)
+ *   0xd7b25c  base[0x208] = stereo ? (old | 4) : (old & ~4), then | 0x80
+ *   0xd7b376  per enabled channel: |= 2 (or |= 6), then |= 1
+ *   0xd7ba00  base[0x410] |= 0x40000000       (from 0xd7b99c, the stream start)
+ *
+ * TWO THINGS THAT ARE NOT WHAT THE CAPTURE FILE DOES, and both were wrong here
+ * because the two register files are identical in shape and the capture one
+ * (0x100, driven by FIRM 0xd7b46c) was transcribed by mistake:
+ *
+ *   - playback never sets bit 1 of base[0x200]. The capture path builds
+ *     `old | 2 | ratecode<<8` at 0xd7b528; the playback path builds
+ *     `old | ratecode<<8` and relies on bit 0, set separately at 0xd7b1a0.
+ *   - a playback channel word is 3, not 5. 0xd7b390..0xd7b398 ORs 2 (or 6)
+ *     and then 1; the 5 came from the capture loop at 0xd7b56e.
+ */
 static void yp3_tx_enable(unsigned long rate, bool stereo)
 {
     unsigned n;
+    uint32_t v;
 
+    /* 0xd7b0e4 .. 0xd7b0fe - global, and ahead of everything else. */
     AUD(0x00) |= 0x80000022u;
     AUD(0x00) |= 0x40000000u;
     AUD(0xfc) &= ~0x1fu;
 
-    yp3_analog_enable();
+    /* FIRM 0xd7a3f0 and 0xd7a478, reached from 0xd7b0e0's head gated on
+     * ctx[0xe6] bits 0 and 1 - one output channel each, and never implemented
+     * here. Both halves of AUD(0x08) go in for stereo:
+     *
+     *     0xd7a404:  AUD(0x08) |= 0x2040 | 3            (bits 0,1,6,13)
+     *     0xd7a48c:  AUD(0x08) |= 0x20400000 | 0x30000  (the same, << 16)
+     *
+     * 0xd7aa78 is the matching disable and clears 0x3fc0 and 3, which is what
+     * identifies the two halves as one field per channel. */
+    AUD(0x08) |= 0x2040u | 3u;
+    AUD(0x08) |= 0x20400000u | 0x30000u;
 
-    AUD_TX_CTRL &= ~2u;                 /* stop while reconfiguring */
+    /* 0xd7b194 / 0xd7b1a0 - stop, then enable. Bit 0 is the enable for this
+     * file; bit 1 stays clear. */
+    AUD_TX_CTRL &= ~2u;
     AUD_TX_CTRL |= 1u;
 
-    /* Volume to zero first, then the real value - the vendor's two-step, which
-     * is there to keep the transition out of the speaker.
-     *
-     * THESE DEFAULT TO ZERO IN THE VENDOR. audio_hw_init leaves the four
-     * playback volumes at 0 and only the capture side at 0x1ff, so a block
-     * that is clocked, configured and actively transferring is still silent
-     * until this runs. That is exactly the failure that reads as "the DMA is
-     * not working", and it is why the maximum goes in here unconditionally:
-     * Rockbox attenuates in software (PCM_SINK_SWVOL), so the hardware wants
-     * to sit at unity. */
-    for (n = 0; n < 4; n++)
-        field_set(&AUD_TX_VOL(n), AUD_VOL_MAX, 0);
+    /* 0xd7b1a8 - all four channel volumes, not three. */
     for (n = 0; n < 4; n++)
         field_set(&AUD_TX_VOL(n), AUD_VOL_MAX, AUD_VOL_MAX);
 
-    field_set(&AUD_TX_CTRL, 0xf00u, yp3_rate_code(rate));
+    /* 0xd7b24c - rate code into [11:8], everything else preserved. */
+    AUD_TX_CTRL = (AUD_TX_CTRL & ~0xf00u)
+                | ((uint32_t)yp3_rate_code(rate) << 8);
+
+    /* 0xd7b25c - bit 2 is stereo, bit 7 is unconditional. */
     AUD_TX_FMT = (AUD_TX_FMT & ~4u) | (stereo ? 4u : 0u) | 0x80u;
 
-    AUD(AUD_TX_CH(0)) = (AUD(AUD_TX_CH(0)) & ~8u) | 1u;
-    AUD(AUD_TX_CH(1)) = (AUD(AUD_TX_CH(1)) & ~8u) | 1u;
+    /* FIRM 0xd7ab90, called from 0xd7b356 immediately before the channel loop
+     * and never implemented here at all. It is per-channel routing in
+     * AUD(0x20), one nibble-ish field per channel:
+     *
+     *     channel 0 enabled -> |= 0x0d     else &= ~0x0d
+     *     channel 1 enabled -> |= 0xd00    else &= ~0xd00
+     *     channel 2 enabled -> |= 0xd0000  else &= ~0xd0000
+     *
+     * through the same 0x40009000 base (literal 0xd7abf4). Stereo is channels
+     * 0 and 1, so the first two fields go in and the third comes out. Without
+     * this the channel words below are set on channels that are not routed
+     * anywhere, which is consistent with a transmitter that accepts every
+     * register write and still never asks the DMA for a sample. */
+    /* NOTE: yp3_analog_enable already ORs 0x0d0d into this register, so this is
+     * not new - it is here because the vendor sets it at 0xd7ab90, called from
+     * 0xd7b356 BEFORE the channel loop, and the analogue path runs after. */
+    AUD(0x20) = (AUD(0x20) & ~0xd0d0du) | 0x0du | 0xd00u;
+
+    /* 0xd7b390 - the stereo pair on, the other two off. The `| 6` variant is
+     * selected by a context byte (ctx[0xe5]) this driver has no equivalent of;
+     * the `& ~4 | 2` arm is the one taken when that byte is clear, which is
+     * the freshly-initialised state. */
+    AUD(AUD_TX_CH(0)) = (AUD(AUD_TX_CH(0)) & ~4u) | 3u;
+    AUD(AUD_TX_CH(1)) = (AUD(AUD_TX_CH(1)) & ~4u) | 3u;
     AUD(AUD_TX_CH(2)) &= ~0xbu;
     AUD(AUD_TX_CH(3)) &= ~0xbu;
 
-    AUD_TX_CTRL |= 2u;                  /* run */
+    /* The vendor's order: the analogue stage comes up AFTER this file is
+     * configured and BEFORE the stream is started - 0xd7c4a2 runs 0xd7b46c,
+     * then 0xd7c4a8 runs 0xd7ac8c, then 0xd7c4b6 runs 0xd7b99c. */
+    yp3_analog_enable();
+
+    /* 0xd7ba00, in the stream-start step. ONLY bit 30.
+     *
+     * An earlier version also wrote 0x44 into this register, taken from
+     * 0xd7b55a - which is inside the CAPTURE enable's channel loop, not this
+     * path. 0x410 is zeroed by yp3_audio_block_init along with the rest of the
+     * 0x400..0x600 window, and the vendor's playback arm sets bit 30 and
+     * nothing else, so that is what happens here. */
+    v = AUD(0x410);
+    AUD(0x410) = v | 0x40000000u;
 
     logf("aud: tx ctrl=%08lx fmt=%08lx code=%u vol=%08lx",
          (unsigned long)AUD_TX_CTRL, (unsigned long)AUD_TX_FMT,
          yp3_rate_code(rate), (unsigned long)AUD_TX_VOL(0));
+    /* Read back what actually stuck: this file and the capture file are
+     * identical in shape, so the only proof of which one is live is what the
+     * registers hold after the writes. */
+    logf("aud: ch0=%08lx ch1=%08lx ch2=%08lx r410=%08lx",
+         (unsigned long)AUD(AUD_TX_CH(0)), (unsigned long)AUD(AUD_TX_CH(1)),
+         (unsigned long)AUD(AUD_TX_CH(2)), (unsigned long)AUD(0x410));
+    logf("aud: 00=%08lx r08=%08lx r20=%08lx fc=%08lx",
+         (unsigned long)AUD(0x00), (unsigned long)AUD(0x08),
+         (unsigned long)AUD(0x20), (unsigned long)AUD(0xfc));
 }
 
 static void yp3_tx_disable(void)
@@ -385,6 +467,18 @@ static void yp3_dma_open(void)
  * with bit 29 cleared. The audio stream wrapper the vendor calls this through
  * (SRAM 0x814c08) refuses a length that is not a multiple of 4; with 32-bit
  * widths on both sides that is the floor to keep. */
+/* The audio peripheral request line is 1, and it is not a guess: the vendor's
+ * audio dma_open at FIRM 0xd7d6f0 builds its descriptor with the source and
+ * destination request ids set to 1 and 0 (or 0 and 1) depending on direction -
+ * 0x10 and 0x14 in the descriptor, at 0xd7d6fe and 0xd7d74a. Playback is
+ * memory (id 0) to audio (id 1), which is precisely what PCM_DMA_CTRL's
+ * bits 4:0 and bit 17 already encode.
+ *
+ * An eight-way sweep of that field used to run here on the first buffer. It
+ * reported "NO request line 0-7 moved a byte", and that was true but
+ * meaningless: the transmitter had never been started, so no line could have
+ * asserted. It is gone - a speculative probe in the start path is exactly the
+ * kind of thing that produces a surprise three flashes later. */
 static void yp3_dma_play(const void *addr, size_t size)
 {
     DMA_DST(PCM_DMA_CH) = AUD_TX_FIFO;
@@ -579,7 +673,7 @@ static void sink_play(const void *addr, size_t size)
         logf("pcm aud: 00=%08lx tx=%08lx fmt=%08lx vol=%08lx",
              (unsigned long)AUD(0x00), (unsigned long)AUD_TX_CTRL,
              (unsigned long)AUD_TX_FMT, (unsigned long)AUD_TX_VOL(0));
-        logf("pcm ch: 220=%08lx 250=%08lx iser1=%08lx",
+        logf("pcm ch: ch0=%08lx ch1=%08lx iser1=%08lx",
              (unsigned long)AUD(AUD_TX_CH(0)),
              (unsigned long)AUD(AUD_TX_CH(1)),
              (unsigned long)REG32(0xE000E104));
