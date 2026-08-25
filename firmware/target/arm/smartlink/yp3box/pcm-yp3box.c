@@ -629,7 +629,13 @@ void yp3_dma2_irq(void)
      * produce identical register readbacks and this port has confused them
      * before. logf from interrupt context is not something to leave in the
      * tree; this is bounded and comes out once the path works. */
-    if (pcm_irqs <= 8)
+    /* Not while the self-test is talking. logf from interrupt context
+     * interleaved with the foreground's own logf and corrupted a line in the
+     * v3 run - `st: gpio1 dma irq #2 st=00000003` - and the line it ate was a
+     * pre-walk GPIO dump, which was one of the two things that boot existed to
+     * capture. The ring has no locking; the fix is not to write from both
+     * sides at once. */
+    if (pcm_irqs <= 8 && !st_active)
         logf("dma irq #%lu st=%08lx", (unsigned long)pcm_irqs,
              (unsigned long)status);
 
@@ -961,53 +967,88 @@ static void st_pad_walk(unsigned ch)
     ROM_GPIO_CFG1(b | PAD_MODE15 | 0u);
 }
 
-/* Dumped before and after every walk. The GPIO register layout past +0x10 is
- * [U], and a walk is a KNOWN change to two known pins - so the diff between
- * these two dumps is a decode of the mux registers, obtained for free from a
- * boot that was happening anyway. */
+/* The port-1 register window.
+ *
+ * The v3 run decoded three of these against pins whose function is already
+ * known, and all three agree `[L]`:
+ *
+ *   +0x00..+0x0c   FOUR BITS OF MODE PER PIN, eight pins per word. P1.10's
+ *                  nibble in +0x04 read 1 before its walk and 15 after, and
+ *                  mode 1 is exactly what BOARD-PINS decodes lcd-yp3box.c's
+ *                  panel-reset descriptor 0x000150cb as.
+ *   +0x10          pin data, one bit per pin. It read 0x40020400 with the
+ *                  amplifier open, the backlight on and panel reset high -
+ *                  bits 30, 17 and 10, which is P1.30, P1.17 and P1.10.
+ *   +0x14, +0x18   two bits of PULL per pin, pins 0-15 and 16-31. Each walk
+ *                  cleared 01 to 00 on exactly the two pads it touched, and
+ *                  that is a DEPARTURE - the vendor's set_mode does not touch
+ *                  pull, and this driver's packed descriptor carries [5:4] = 0.
+ *
+ * The alternate-function value is NOT in this window, which is why the v3
+ * dumps showed the alt walk doing nothing visible. ROM 0x7ac maps alt through
+ * a table and hands it to ROM 0x5ae, and the sibling helper at ROM 0x82c
+ * writes its argument to *port_base + 0x218* - so the alt registers sit a long
+ * way above the 0x40 window. Both halves are dumped now. */
 static void st_gpio_dump(const char *tag)
 {
     unsigned i;
 
-    for (i = 0; i < 16; i += 4)
-        logf("st: gpio1 %s [%02x] %08lx %08lx %08lx %08lx", tag, i * 4,
+    for (i = 0; i < 12; i += 4)
+        logf("st: g1 %s [%02x] %08lx %08lx %08lx %08lx", tag, i * 4,
              (unsigned long)REG32(GPIO_PORT(1) + i * 4),
              (unsigned long)REG32(GPIO_PORT(1) + (i + 1) * 4),
              (unsigned long)REG32(GPIO_PORT(1) + (i + 2) * 4),
              (unsigned long)REG32(GPIO_PORT(1) + (i + 3) * 4));
+    logf("st: g1 %s [200] %08lx %08lx %08lx %08lx", tag,
+         (unsigned long)REG32(GPIO_PORT(1) + 0x200),
+         (unsigned long)REG32(GPIO_PORT(1) + 0x204),
+         (unsigned long)REG32(GPIO_PORT(1) + 0x208),
+         (unsigned long)REG32(GPIO_PORT(1) + 0x20c));
+    logf("st: g1 %s [210] %08lx %08lx %08lx %08lx", tag,
+         (unsigned long)REG32(GPIO_PORT(1) + 0x210),
+         (unsigned long)REG32(GPIO_PORT(1) + 0x214),
+         (unsigned long)REG32(GPIO_PORT(1) + 0x218),
+         (unsigned long)REG32(GPIO_PORT(1) + 0x21c));
 }
 
 void yp3_audio_selftest(void)
 {
-    /* Walk order, and the tone that identifies each in the ear. Channel 0 is
-     * last because its pads are the panel reset. */
-    static const unsigned char order[3] = { 2u, 1u, 0u };
-    static const unsigned short tone[3] = { 500u, 1000u, 2000u };
+    /* Descending, because that is the direction the question points. v3
+     * produced audible sound with this field at 31 and it was very faint, and
+     * nothing establishes which end of a 5-bit analogue gain field is loud -
+     * YP3_ANALOG_GAIN has been [U] since this driver was written, and the one
+     * earlier sweep of it ran while the DMA was moving no bytes, so it
+     * measured nothing. If 31 is maximum ATTENUATION rather than maximum gain,
+     * this sweep gets louder as it goes and the answer is the first thing
+     * anyone hears. */
+    static const unsigned char gains[6] = { 31u, 24u, 16u, 8u, 4u, 0u };
     unsigned i, k;
 
-    logf("st: ==== audio self-test v3: the output pads ====");
+    logf("st: ==== audio self-test v4: the gain direction ====");
 
     if (!audio_block_up)
         yp3_audio_block_init();
     yp3_audio_pll(SAMPR_44);
     ROM_CLK_APPLY(AUDIO_MCLK);
-    logf("st: mclk=%lu busy=%d mod25=%d mod21=%d", yp3_audio_mclk,
-         (int)((ACLK(0x14) >> 11) & 1u), ROM_CLK_IS_ON(AUDIO_MODULE),
-         ROM_CLK_IS_ON(DMA_MODULE));
 
-    /* All three analogue channels up: which one reaches an output is the
-     * question, so none of them may be the thing that is missing. */
     st_fill(SAMPR_44, 1000);
     yp3_analog_mask = 7u;
     yp3_tx_enable(SAMPR_44, true);
-    st_set_gain(7u, 31u);
     logf("st: up? 50=%d 54=%d 58=%d",
          !!(AUD(0x50) & (1u << 29)), !!(AUD(0x54) & (1u << 29)),
          !!(AUD(0x58) & (1u << 29)));
 
-    /* The digital path is known good as of build 3bed8944ed - 132 transfers
-     * at the sample rate - so this is a confirmation, not a question. If it
-     * regresses, nothing below means anything and this line says so. */
+    /* All three channels' pads, walked up front. v3 established that sound
+     * comes out with these walked; WHICH channel carries it is a separate
+     * question, and folding it in would put two variables into a test that is
+     * read by ear. Channel 0 is still walked last - its pads are the panel
+     * reset - so the display disturbance v3 showed is expected here too. */
+    st_gpio_dump("pre ");
+    st_pad_walk(2);
+    st_pad_walk(1);
+    st_pad_walk(0);
+    st_gpio_dump("post");
+
     yp3_dma_open();
     st_irqs = 0;
     st_active = true;
@@ -1015,32 +1056,18 @@ void yp3_audio_selftest(void)
     yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);
     for (i = 0; i < 200 && st_irqs == 0; i++)
         st_wait_ms(1);
-    logf("st: digital irqs=%lu after %ums 200=%08lx 208=%08lx",
-         (unsigned long)st_irqs, i, (unsigned long)AUD_TX_CTRL,
-         (unsigned long)AUD_TX_FMT);
+    logf("st: digital irqs=%lu after %ums 200=%08lx", (unsigned long)st_irqs,
+         i, (unsigned long)AUD_TX_CTRL);
 
-    /* Amplifier on for the whole test: which channel feeds it is exactly what
-     * is unknown, so it cannot be switched per channel. */
     yp3_speaker_pa(true);
-
-    for (k = 0; k < 3; k++) {
-        unsigned ch = order[k];
-        uint32_t before = st_irqs;
-
-        logf("st: --- pad walk channel %u (%#x/%#x), %u Hz ---",
-             ch, 0x15000u + ch * 0x1000u, 0x15800u + ch * 0x1000u, tone[k]);
-        st_gpio_dump("pre ");
-        st_pad_walk(ch);
-        st_gpio_dump("post");
-
-        st_fill(SAMPR_44, tone[k]);     /* in place: the DMA reads it live */
-        logf("st: LISTEN 3s channel %u at %u Hz", ch, tone[k]);
-        st_wait_ms(3000);
-        logf("st: channel %u done, irqs +%lu", ch,
-             (unsigned long)(st_irqs - before));
+    for (k = 0; k < 6; k++) {
+        st_set_gain(7u, gains[k]);
+        logf("st: step %u gain=%u 2c=%08lx 30=%08lx", k, gains[k],
+             (unsigned long)AUD(0x2c), (unsigned long)AUD(0x30));
+        st_wait_ms(2000);
     }
-
     yp3_speaker_pa(false);
+
     st_active = false;
     yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));
     DMA_CTRL(PCM_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
