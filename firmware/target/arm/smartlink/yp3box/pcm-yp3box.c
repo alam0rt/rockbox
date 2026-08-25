@@ -437,6 +437,24 @@ static void yp3_tx_enable(unsigned long rate, bool stereo)
     AUD(AUD_TX_CH(2)) &= ~0xbu;
     AUD(AUD_TX_CH(3)) &= ~0xbu;
 
+    /* 0xd7b41c: base[0x200] |= 2, at the exit of the four-iteration channel
+     * loop (0xd7b410 `cmp r2, #4` / 0xd7b414 `bne 0xd7b362`). THIS IS THE RUN
+     * BIT and it is the vendor's, not a guess.
+     *
+     * It was in this driver, was removed on the claim that "there is no such
+     * write on the playback path", and the removal was wrong - the search that
+     * produced that claim followed the channel loop's body and never followed
+     * it to its exit. Hardware then settled it: with bit 1 clear the DMA
+     * channel armed, GO stuck, and not one transfer ever completed; poking
+     * bit 1 alone started it and 132 transfers completed at exactly the 44.1
+     * kHz rate.
+     *
+     * Bit 0, which the vendor writes at 0xd7b1a4, does NOT read back on this
+     * part - `tx: set0 200=00300000` immediately after the write. It is not
+     * the enable it was documented as; bit 1 is the whole story. */
+    AUD_TX_CTRL |= 2u;
+    TXTRACE("run");
+
     /* The vendor's order: the analogue stage comes up AFTER this file is
      * configured and BEFORE the stream is started - 0xd7c4a2 runs 0xd7b46c,
      * then 0xd7c4a8 runs 0xd7ac8c, then 0xd7c4b6 runs 0xd7b99c. */
@@ -905,119 +923,144 @@ static uint32_t st_poke(const char *tag, uint32_t set, uint32_t clr)
     return after;
 }
 
-void yp3_audio_selftest(void)
+/* The analogue output pads, transcribed from the vendor's own walk.
+ *
+ * Each analogue channel owns TWO pads, which is what a differential output
+ * looks like - and the XS4150's inputs are a differential pair on pins 3/4
+ * `[D]`, so that fits:
+ *
+ *     channel 0   0x15000 / 0x15800   P1.10 / P1.11
+ *     channel 1   0x16000 / 0x16800   P1.12 / P1.13
+ *     channel 2   0x17000 / 0x17800   P1.14 / P1.15
+ *
+ * The walk is a four-stage state machine, state in ctx[0xf0], 50 ms apart.
+ * Channel 0's stages are FIRM 0xd7a668, 0xd7a6c4, 0xd7a704, 0xd7a74c and each
+ * one is guarded on the previous state:
+ *
+ *     1  gpio_set_mode(pad, 0x780)   both pads     then gpio_set_alt(pad, 4)
+ *     2  gpio_set_mode(pad, 0x780)   both pads     (mode only, again)
+ *     3  gpio_set_alt(pad, 12)       both pads
+ *     4  gpio_set_alt(pad, 0)        both pads     <- the resting state
+ *
+ * 0x780 is the mode field pre-shifted: [10:7] = 15. So the end state is
+ * mode 15, alt 0, and stages 1..3 are a sequence to get there without a pop.
+ *
+ * ONE DEPARTURE. The vendor reaches mode and alt through two helpers at FIRM
+ * 0xc48244 and 0xc48268, and FIRM is what an XIP build overwrites - those
+ * addresses are Rockbox now. The boot ROM's configurator takes mode and alt in
+ * one packed descriptor, which is what this driver already uses for the
+ * amplifier, so each stage rewrites both fields with mode held at 15. The
+ * sequence of alt values is unchanged and that is the part that matters.
+ *
+ * P1.10 IS ALSO lcd-yp3box.c's LCD_RESET_PIN, the identical 0x15000. Channel 0
+ * is walked LAST here for that reason: if the panel dies, everything else has
+ * already been tested and logged. */
+#define PAD_MODE15  0x780u
+
+static void st_pad_walk(unsigned ch)
+{
+    unsigned a = 0x15000u + ch * 0x1000u;       /* 0x15000/0x16000/0x17000 */
+    unsigned b = a + 0x800u;
+
+    ROM_GPIO_CFG1(a | PAD_MODE15 | 4u);
+    ROM_GPIO_CFG1(b | PAD_MODE15 | 4u);
+    st_wait_ms(50);
+    ROM_GPIO_CFG1(a | PAD_MODE15 | 4u);
+    ROM_GPIO_CFG1(b | PAD_MODE15 | 4u);
+    st_wait_ms(50);
+    ROM_GPIO_CFG1(a | PAD_MODE15 | 12u);
+    ROM_GPIO_CFG1(b | PAD_MODE15 | 12u);
+    st_wait_ms(50);
+    ROM_GPIO_CFG1(a | PAD_MODE15 | 0u);
+    ROM_GPIO_CFG1(b | PAD_MODE15 | 0u);
+}
+
+/* Dumped before and after every walk. The GPIO register layout past +0x10 is
+ * [U], and a walk is a KNOWN change to two known pins - so the diff between
+ * these two dumps is a decode of the mux registers, obtained for free from a
+ * boot that was happening anyway. */
+static void st_gpio_dump(const char *tag)
 {
     unsigned i;
-    uint32_t c0, c1, c2;
 
-    logf("st: ==== audio self-test v2 ====");
-
-    /* S0. Raw, uninterpreted - the GPIO layout past +0x10 is [U], and a dump
-     * can be re-read against a later decode while a decode cannot. */
     for (i = 0; i < 16; i += 4)
-        logf("st: gpio1[%02x] %08lx %08lx %08lx %08lx", i * 4,
+        logf("st: gpio1 %s [%02x] %08lx %08lx %08lx %08lx", tag, i * 4,
              (unsigned long)REG32(GPIO_PORT(1) + i * 4),
              (unsigned long)REG32(GPIO_PORT(1) + (i + 1) * 4),
              (unsigned long)REG32(GPIO_PORT(1) + (i + 2) * 4),
              (unsigned long)REG32(GPIO_PORT(1) + (i + 3) * 4));
+}
+
+void yp3_audio_selftest(void)
+{
+    /* Walk order, and the tone that identifies each in the ear. Channel 0 is
+     * last because its pads are the panel reset. */
+    static const unsigned char order[3] = { 2u, 1u, 0u };
+    static const unsigned short tone[3] = { 500u, 1000u, 2000u };
+    unsigned i, k;
+
+    logf("st: ==== audio self-test v3: the output pads ====");
 
     if (!audio_block_up)
         yp3_audio_block_init();
-
-    /* S1. The master clock, observed rather than computed.
-     *
-     * The v1 run logged mclk=22579000 and that number is arithmetic: it is
-     * what this driver INTENDED, and CLAUDE.md's own warning is that
-     * get_clock_freq derives a rate from the dividers without looking at the
-     * gate, so a plausible reading is not evidence that a clock runs. These
-     * are the PLL's own registers before and after programming, plus the busy
-     * bit that 0x80da4e spins on. If 0x14 bit 11 is still set afterwards the
-     * PLL never settled, and every enable bit below is being written into a
-     * register file with no clock in its domain - which is the leading
-     * explanation for what v1 saw. */
-    logf("st: pll before 10=%08lx 14=%08lx",
-         (unsigned long)ACLK(0x10), (unsigned long)ACLK(0x14));
     yp3_audio_pll(SAMPR_44);
     ROM_CLK_APPLY(AUDIO_MCLK);
-    logf("st: pll after  10=%08lx 14=%08lx busy=%d",
-         (unsigned long)ACLK(0x10), (unsigned long)ACLK(0x14),
-         (int)((ACLK(0x14) >> 11) & 1u));
-    st_wait_ms(10);
-    logf("st: pll +10ms  14=%08lx busy=%d mclk=%lu",
-         (unsigned long)ACLK(0x14), (int)((ACLK(0x14) >> 11) & 1u),
-         yp3_audio_mclk);
-    logf("st: mod25=%d mod21=%d", ROM_CLK_IS_ON(AUDIO_MODULE),
+    logf("st: mclk=%lu busy=%d mod25=%d mod21=%d", yp3_audio_mclk,
+         (int)((ACLK(0x14) >> 11) & 1u), ROM_CLK_IS_ON(AUDIO_MODULE),
          ROM_CLK_IS_ON(DMA_MODULE));
 
-    /* S2. The bring-up, now tracing every write to 0x200 as it happens. */
+    /* All three analogue channels up: which one reaches an output is the
+     * question, so none of them may be the thing that is missing. */
     st_fill(SAMPR_44, 1000);
-    yp3_analog_mask = 3u;
-    yp3_tx_trace = true;
+    yp3_analog_mask = 7u;
     yp3_tx_enable(SAMPR_44, true);
-    yp3_tx_trace = false;
+    st_set_gain(7u, 31u);
     logf("st: up? 50=%d 54=%d 58=%d",
          !!(AUD(0x50) & (1u << 29)), !!(AUD(0x54) & (1u << 29)),
          !!(AUD(0x58) & (1u << 29)));
 
-    /* S3. The enable-bit ladder.
-     *
-     * v1 could not distinguish two faults that look identical at the end of
-     * yp3_tx_enable: a bit that never latches (no clock in that domain) and a
-     * bit that latches and is then cleared by a later write in the sequence.
-     * The trace above separates those. This asks the third question - whether
-     * ORDER is what matters - by setting the bit AFTER everything else is
-     * configured, which is not what the vendor does but costs nothing to try
-     * in the same boot.
-     *
-     * Each rung reports its own readback, so a rung that works names itself. */
-    c0 = st_poke("bit0-late", 1u, 0u);
-    c1 = st_poke("bit1-too", 2u, 0u);
-    c2 = st_poke("both", 3u, 0u);
-    logf("st: ladder %08lx %08lx %08lx", (unsigned long)c0,
-         (unsigned long)c1, (unsigned long)c2);
-
-    /* S4. Arm one transfer and read the CHANNEL back.
-     *
-     * v1 never logged DMA_CTRL after arming, and that is the gap that let two
-     * explanations survive: a transmitter that never runs (so the peripheral
-     * never requests, and the count sits full) versus a channel whose GO bit
-     * does not stick (so the engine never runs at all). Both give
-     * irqs=0, residue=full, status=0. The GO bit readback tells them apart. */
+    /* The digital path is known good as of build 3bed8944ed - 132 transfers
+     * at the sample rate - so this is a confirmation, not a question. If it
+     * regresses, nothing below means anything and this line says so. */
     yp3_dma_open();
     st_irqs = 0;
     st_active = true;
     yp3_dma_play(st_tone, sizeof st_tone);
     yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);
-    logf("st: armed ctrl=%08lx go=%d len=%08lx st=%08lx",
-         (unsigned long)DMA_CTRL(PCM_DMA_CH),
-         (int)((DMA_CTRL(PCM_DMA_CH) >> 30) & 1u),
-         (unsigned long)DMA_LEN(PCM_DMA_CH),
-         (unsigned long)DMA_IRQST(PCM_DMA_CH));
     for (i = 0; i < 200 && st_irqs == 0; i++)
         st_wait_ms(1);
-    logf("st: xfer irqs=%lu after %ums residue=%lu go=%d st=%08lx",
-         (unsigned long)st_irqs, i,
-         (unsigned long)(DMA_LEN(PCM_DMA_CH) & DMA_LEN_MASK),
-         (int)((DMA_CTRL(PCM_DMA_CH) >> 30) & 1u),
-         (unsigned long)DMA_IRQST(PCM_DMA_CH));
-    logf("st: tx now 200=%08lx 208=%08lx fifo-src=%08lx",
-         (unsigned long)AUD_TX_CTRL, (unsigned long)AUD_TX_FMT,
-         (unsigned long)DMA_SRC(PCM_DMA_CH));
+    logf("st: digital irqs=%lu after %ums 200=%08lx 208=%08lx",
+         (unsigned long)st_irqs, i, (unsigned long)AUD_TX_CTRL,
+         (unsigned long)AUD_TX_FMT);
 
-    /* S5. Two seconds at full gain with the amplifier on, in case any of the
-     * rungs above took. No sweep: nothing has made a sound yet, so there is
-     * nothing to calibrate, and a 20-second boot bought no information. */
-    st_set_gain(3u, 31u);
+    /* Amplifier on for the whole test: which channel feeds it is exactly what
+     * is unknown, so it cannot be switched per channel. */
     yp3_speaker_pa(true);
-    logf("st: LISTEN 2s, 1 kHz, gain 31");
-    st_wait_ms(2000);
-    yp3_speaker_pa(false);
 
+    for (k = 0; k < 3; k++) {
+        unsigned ch = order[k];
+        uint32_t before = st_irqs;
+
+        logf("st: --- pad walk channel %u (%#x/%#x), %u Hz ---",
+             ch, 0x15000u + ch * 0x1000u, 0x15800u + ch * 0x1000u, tone[k]);
+        st_gpio_dump("pre ");
+        st_pad_walk(ch);
+        st_gpio_dump("post");
+
+        st_fill(SAMPR_44, tone[k]);     /* in place: the DMA reads it live */
+        logf("st: LISTEN 3s channel %u at %u Hz", ch, tone[k]);
+        st_wait_ms(3000);
+        logf("st: channel %u done, irqs +%lu", ch,
+             (unsigned long)(st_irqs - before));
+    }
+
+    yp3_speaker_pa(false);
     st_active = false;
     yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));
     DMA_CTRL(PCM_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
     yp3_tx_disable();
-    st_set_gain(3u, YP3_ANALOG_GAIN);
+    st_set_gain(7u, YP3_ANALOG_GAIN);
+    yp3_analog_mask = 3u;
 
     logf("st: ==== done irqs=%lu ====", (unsigned long)st_irqs);
 }
