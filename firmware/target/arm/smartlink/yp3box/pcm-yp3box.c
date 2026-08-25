@@ -223,44 +223,91 @@ yp3_audio_block_init(void)
  *    change, and the log line below reports what it actually holds. */
 #define YP3_ANALOG_GAIN  0u             /* AUD(0x30)[20:16] and [28:24], [U] */
 
-static void yp3_analog_enable(void)
-{
-    /* Already up? Bit 29 of each channel's power register reads back as the
-     * state flag - the vendor's own gain ioctls test exactly this. */
-    if ((AUD(0x50) & (1u << 29)) && (AUD(0x54) & (1u << 29)))
-        return;
+/* Which analogue channels to bring up. 3 is the stereo pair, which is what
+ * /dev/audio0 selects; the self-test at the foot of this file varies it,
+ * because there is a real question about whether this product's jack and
+ * amplifier hang off channel 2 rather than 0 and 1 - analogue channel 0's
+ * output pads are P1.10/P1.11, and P1.10 is this panel's reset line
+ * (lcd-yp3box.c LCD_RESET_PIN, the same 0x15000 descriptor). A product cannot
+ * route audio through its own LCD reset, so channel 0 is suspect `[I]`. */
+static unsigned yp3_analog_mask = 3u;
 
-    AUD(0x30) |= 0x01u;                 /* channel 0 present */
-    AUD(0x30) |= 0x10u;                 /* channel 1 present */
-    AUD(0x40) |= 0x200u;
-    AUD(0x4c) |= 0x20000u;
-    AUD(0x4c) |= 0x10000u;
+/* The three channels' registers, indexed by channel:
+ *   present bit  ch0/ch1 in AUD(0x30) bits 0 and 4, ch2 in AUD(0x2c) bit 0
+ *   power reg    AUD(0x50), AUD(0x54), AUD(0x58)
+ *   0x4c bit     0x20000, 0x10000, 0x400000
+ *   settle bit   0x01, 0x02, 0x100
+ *   bias field   0x0d, 0xd00, 0xd0000 in AUD(0x20)   (FIRM 0xd7ab90)
+ *
+ * EVIDENCE NOTE. The channel 0 and 1 sequence below is the one this driver has
+ * always had, transcribed instruction by instruction from 0xd7ac8c. The
+ * channel 2 arms are from the same function's mask & 4 branches as condensed
+ * in docs/AUDIO.md, which is a weaker reading - they have never been written
+ * out against the disassembly line by line. They are here to be TESTED, not
+ * because they are known good. */
+static uint32_t aud_pwr(unsigned ch)
+{
+    return AUDIO_BASE + (ch == 2 ? 0x58u : 0x50u + ch * 4u);
+}
+
+static void yp3_analog_enable(unsigned mask)
+{
+    unsigned ch;
+
+    /* Already up? Bit 29 of each channel's power register reads back as the
+     * state flag - the vendor's own gain ioctls test exactly this. Only the
+     * channels being asked for count, or a mask change would be ignored. */
+    {
+        bool all_up = true;
+        for (ch = 0; ch < 3; ch++)
+            if ((mask & (1u << ch)) && !(REG32(aud_pwr(ch)) & (1u << 29)))
+                all_up = false;
+        if (all_up)
+            return;
+    }
+
+    if (mask & 1u) AUD(0x30) |= 0x01u;  /* channel 0 present */
+    if (mask & 2u) AUD(0x30) |= 0x10u;  /* channel 1 present */
+    if (mask & 4u) AUD(0x2c) |= 0x01u;  /* channel 2 present */
+    if (mask & 3u) AUD(0x40) |= 0x200u;
+    if (mask & 1u) AUD(0x4c) |= 0x20000u;
+    if (mask & 2u) AUD(0x4c) |= 0x10000u;
+    if (mask & 4u) AUD(0x4c) |= 0x400000u;
     AUD(0x40)  = (AUD(0x40) & ~0x30u) | 0x20u;
     AUD(0x4c) |= 0x100000u;
-    AUD(0x40) |= 0x800u;
-    AUD(0x50) |= 0x8000u;               /* pre-charge */
-    AUD(0x54) |= 0x8000u;
+    if (mask & 3u) AUD(0x40) |= 0x800u;
+    for (ch = 0; ch < 3; ch++)          /* pre-charge */
+        if (mask & (1u << ch))
+            REG32(aud_pwr(ch)) |= 0x8000u;
     udelay(10000);
-    AUD(0x50) |= 0x10000000u;           /* enable */
-    AUD(0x54) |= 0x10000000u;
-    AUD(0x50) |= 0x20000000u;           /* up */
-    AUD(0x54) |= 0x20000000u;
+    for (ch = 0; ch < 3; ch++)
+        if (mask & (1u << ch)) {
+            REG32(aud_pwr(ch)) |= 0x10000000u;      /* enable */
+            REG32(aud_pwr(ch)) |= 0x20000000u;      /* up     */
+        }
     AUD(0x4c) |= 0x30u;
-    AUD(0x4c) |= 0x03u;
+    AUD(0x4c) |= (mask & 3u) | ((mask & 4u) ? 0x100u : 0u);
     udelay(10000);
-    AUD(0x50) |= 0xfffu;                /* the vendor's mvn/lsr idiom */
-    AUD(0x54) |= 0xfffu;
+    for (ch = 0; ch < 3; ch++)          /* the vendor's mvn/lsr idiom */
+        if (mask & (1u << ch))
+            REG32(aud_pwr(ch)) |= 0xfffu;
     udelay(10000);
-    AUD(0x4c) &= ~0x03u;
-    field_set(&AUD(0x30), 0x001f0000u, YP3_ANALOG_GAIN);
-    field_set(&AUD(0x30), 0x1f000000u, YP3_ANALOG_GAIN);
+    AUD(0x4c) &= ~((mask & 3u) | ((mask & 4u) ? 0x100u : 0u));
+    if (mask & 1u) field_set(&AUD(0x30), 0x001f0000u, YP3_ANALOG_GAIN);
+    if (mask & 2u) field_set(&AUD(0x30), 0x1f000000u, YP3_ANALOG_GAIN);
+    if (mask & 4u) field_set(&AUD(0x2c), 0x001f0000u, YP3_ANALOG_GAIN);
 
     /* audio_pa_bias, FIRM 0xd7ab90: 0x0d per analogue channel. */
-    AUD(0x20) |= 0x00000d0du;
+    AUD(0x20) |= (mask & 1u ? 0x0du : 0u)
+               | (mask & 2u ? 0xd00u : 0u)
+               | (mask & 4u ? 0xd0000u : 0u);
 
-    logf("aud: analog 30=%08lx 4c=%08lx 50=%08lx 54=%08lx",
-         (unsigned long)AUD(0x30), (unsigned long)AUD(0x4c),
-         (unsigned long)AUD(0x50), (unsigned long)AUD(0x54));
+    logf("aud: analog mask=%u 2c=%08lx 30=%08lx 4c=%08lx", mask,
+         (unsigned long)AUD(0x2c), (unsigned long)AUD(0x30),
+         (unsigned long)AUD(0x4c));
+    logf("aud: analog 50=%08lx 54=%08lx 58=%08lx (bit29 = channel up)",
+         (unsigned long)AUD(0x50), (unsigned long)AUD(0x54),
+         (unsigned long)AUD(0x58));
     logf("aud: trim 64=%08lx 68=%08lx (not written, see comment)",
          (unsigned long)AUD(0x64), (unsigned long)AUD(0x68));
 }
@@ -377,7 +424,7 @@ static void yp3_tx_enable(unsigned long rate, bool stereo)
     /* The vendor's order: the analogue stage comes up AFTER this file is
      * configured and BEFORE the stream is started - 0xd7c4a2 runs 0xd7b46c,
      * then 0xd7c4a8 runs 0xd7ac8c, then 0xd7c4b6 runs 0xd7b99c. */
-    yp3_analog_enable();
+    yp3_analog_enable(yp3_analog_mask);
 
     /* 0xd7ba00, in the stream-start step. ONLY bit 30.
      *
@@ -489,6 +536,25 @@ static void yp3_dma_play(const void *addr, size_t size)
                          | DMA_CTRL_GO;
 }
 
+/* --- self-test state ------------------------------------------------------
+ *
+ * Declared here because the DMA interrupt below has to know about it. The
+ * test itself is at the foot of this file. */
+#ifndef YP3_AUDIO_SELFTEST
+#define YP3_AUDIO_SELFTEST 1
+#endif
+#if YP3_AUDIO_SELFTEST
+/* 20 ms of 44.1 kHz stereo. NOT const, and never const: .rodata is SPI NOR on
+ * this XIP build, and a DMA reading flash while the CPU fetches instructions
+ * from it wedges the bus with no fault and no timeout. This lands in .bss,
+ * which is SRAM, and is filled at run time. */
+#define ST_FRAMES 880
+static int16_t st_tone[ST_FRAMES * 2] __attribute__((aligned(4)));
+static volatile bool st_active;
+static volatile uint32_t st_irqs;
+void yp3_audio_selftest(void);       /* defined at the foot of this file */
+#endif
+
 /* --- interrupt ------------------------------------------------------------
  *
  * The DMA channel's own, IRQ 60 + channel. The audio block raises nothing the
@@ -531,6 +597,18 @@ void yp3_dma2_irq(void)
     if (pcm_irqs <= 8)
         logf("dma irq #%lu st=%08lx", (unsigned long)pcm_irqs,
              (unsigned long)status);
+
+#if YP3_AUDIO_SELFTEST
+    /* The self-test drives the hardware directly and must not reach into the
+     * core's PCM state machine - nothing above pcm_sink has been started at
+     * the point it runs. It re-arms its own buffer and returns. */
+    if (st_active) {
+        st_irqs++;
+        if (status & DMA_IRQST_DONE)
+            yp3_dma_play(st_tone, sizeof st_tone);
+        return;
+    }
+#endif
 
     if (status & DMA_IRQST_DONE) {
         const void *addr;
@@ -593,6 +671,9 @@ static void sink_init(void)
     /* The block is left off until there is something to play: it reprograms a
      * PLL, and a clock change during LCD or SD bring-up is one more variable
      * in the wrong place. sink_set_freq brings it up on demand. */
+#if YP3_AUDIO_SELFTEST
+    yp3_audio_selftest();
+#endif
 }
 
 static void sink_postinit(void)
@@ -707,6 +788,177 @@ static void sink_stop(void)
     yp3_tx_disable();
     tx_running = false;
 }
+
+/* ==========================================================================
+ * The audio self-test
+ * ==========================================================================
+ *
+ * WHY THIS EXISTS. Nothing on this path has ever produced a sample. Reaching
+ * it through Rockbox means going via pcmbuf, buffering and a codec, and
+ * ROADMAP A1 already documents a livelock in that stack - so a silent boot
+ * cannot be attributed to the hardware. This runs from sink_init(), which
+ * pcm_init() calls after lcd_init() and storage_init() and before
+ * audio_init(): the LCD is up, the card is mounted so the black box can flush
+ * the log, and no codec, no PCM ring and no UI are running.
+ *
+ * IT IS STAGED, AND THAT IS THE POINT. CLAUDE.md's rule is never to land four
+ * changes in one flash, because when it fails every one of them failed
+ * together. That rule is about CONFIGURATION changes whose failures alias.
+ * This is the opposite construction: every stage logs its verdict BEFORE the
+ * next one runs, so the last line in the ring names the stage that stopped.
+ * One flash, many hypotheses, no aliasing.
+ *
+ * WHAT EACH STAGE SETTLES:
+ *
+ *   S0  port-1 GPIO window, dumped raw     which pads the LCD already claimed,
+ *                                          from the running system, no meter
+ *   S1  block up, registers read back      zeroes => module 0x25 is wrong,
+ *                                          and it costs nothing else
+ *   S2  PLL committed                      the master clock
+ *   S3  TX file configured, read back      the digital transmitter took it
+ *   S4  bit 29 of 0x50/0x54/0x58           a HARDWARE acknowledgement that the
+ *                                          analogue channel powered up - the
+ *                                          vendor's own gain ioctls test it
+ *   S5  one DMA transfer, bounded wait     "dma irq" present or absent, plus
+ *                                          residue: full count => never
+ *                                          started, partial => started and
+ *                                          stalled. Different faults, and they
+ *                                          read identically in the registers.
+ *   S6  a tone you can hear                three passes over the analogue
+ *                                          channel mask, four gain steps each
+ *
+ * S6 IS READ BY EAR, AND IT IS BUILT TO BE. Each pass uses a different tone
+ * frequency, so which analogue channel produced sound is reported by PITCH and
+ * needs no counting: 1 kHz = channels 0+1, 500 Hz = channel 2 alone, 2 kHz =
+ * all three. Within a pass the gain steps 0, 8, 16, 31 as four one-second
+ * bursts with a gap between them, so "it came in on the third burst" measures
+ * YP3_ANALOG_GAIN, which has been [U] for the life of this port.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO: it never runs the analogue output pad mux.
+ * Analogue channel 0's pads are P1.10/P1.11 and lcd-yp3box.c drives the very
+ * same descriptor (0x15000) as the panel reset, so that walk would reset the
+ * display mid-test and turn a clean result into a confusing one. The pads are
+ * downstream of getting a sample out at all.
+ *
+ * Delete this whole block in the commit that acts on its result. */
+#if YP3_AUDIO_SELFTEST
+
+static void st_wait_ms(unsigned ms)
+{
+    while (ms--)
+        udelay(1000);
+}
+
+/* A square wave, because it is the loudest thing per unit amplitude and the
+ * easiest to be sure you heard. Amplitude is deliberately a quarter of full
+ * scale: the analogue gain is unknown and this may be going into a 3 W
+ * amplifier a few centimetres from someone's ear. */
+static void st_fill(unsigned long rate, unsigned freq)
+{
+    unsigned half = (unsigned)(rate / (freq * 2u));
+    unsigned i;
+
+    if (half == 0)
+        half = 1;
+    for (i = 0; i < ST_FRAMES; i++) {
+        int16_t v = ((i / half) & 1u) ? 8000 : -8000;
+        st_tone[i * 2]     = v;
+        st_tone[i * 2 + 1] = v;
+    }
+}
+
+static void st_set_gain(unsigned mask, unsigned g)
+{
+    if (mask & 1u) field_set(&AUD(0x30), 0x001f0000u, g);
+    if (mask & 2u) field_set(&AUD(0x30), 0x1f000000u, g);
+    if (mask & 4u) field_set(&AUD(0x2c), 0x001f0000u, g);
+}
+
+void yp3_audio_selftest(void)
+{
+    static const unsigned char masks[3] = { 3u, 4u, 7u };
+    static const unsigned short freqs[3] = { 1000u, 500u, 2000u };
+    static const unsigned char gains[4] = { 0u, 8u, 16u, 31u };
+    unsigned pass, i, g;
+
+    logf("st: ==== audio self-test ====");
+
+    /* S0. Raw, uninterpreted. The GPIO register layout beyond +0x10 is [U],
+     * so this dumps the window rather than pretending to decode it - and a
+     * dump can be re-read against a later decode, which a decode cannot. */
+    for (i = 0; i < 16; i += 4)
+        logf("st: gpio1[%02x] %08lx %08lx %08lx %08lx", i * 4,
+             (unsigned long)REG32(GPIO_PORT(1) + i * 4),
+             (unsigned long)REG32(GPIO_PORT(1) + (i + 1) * 4),
+             (unsigned long)REG32(GPIO_PORT(1) + (i + 2) * 4),
+             (unsigned long)REG32(GPIO_PORT(1) + (i + 3) * 4));
+
+    /* S1 and S2. Both log their own readbacks. */
+    if (!audio_block_up)
+        yp3_audio_block_init();
+    yp3_audio_pll(SAMPR_44);
+    ROM_CLK_APPLY(AUDIO_MCLK);
+    logf("st: mclk=%lu mod25=%d mod21=%d", yp3_audio_mclk,
+         ROM_CLK_IS_ON(AUDIO_MODULE), ROM_CLK_IS_ON(DMA_MODULE));
+
+    for (pass = 0; pass < 3; pass++) {
+        unsigned mask = masks[pass];
+
+        logf("st: --- pass %u: analog mask %u, %u Hz ---",
+             pass, mask, freqs[pass]);
+        st_fill(SAMPR_44, freqs[pass]);
+
+        /* S3 and S4. yp3_tx_enable logs the TX file and the analogue stage,
+         * bit 29 included. */
+        yp3_analog_mask = mask;
+        yp3_tx_enable(SAMPR_44, true);
+        logf("st: up? 50=%d 54=%d 58=%d",
+             !!(AUD(0x50) & (1u << 29)), !!(AUD(0x54) & (1u << 29)),
+             !!(AUD(0x58) & (1u << 29)));
+
+        /* S5. One transfer, then a bounded wait. 20 ms of audio should
+         * complete in 20 ms; 200 ms of patience is forty times the margin and
+         * still finite, which is the whole difference between a probe and a
+         * hang. */
+        yp3_dma_open();
+        st_irqs = 0;
+        st_active = true;
+        yp3_dma_play(st_tone, sizeof st_tone);
+        yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);
+        for (i = 0; i < 200 && st_irqs == 0; i++)
+            st_wait_ms(1);
+        logf("st: first xfer irqs=%lu after %ums residue=%lu st=%08lx",
+             (unsigned long)st_irqs, i,
+             (unsigned long)(DMA_LEN(PCM_DMA_CH) & DMA_LEN_MASK),
+             (unsigned long)DMA_IRQST(PCM_DMA_CH));
+
+        /* S6. Four bursts. The gap is silence at gain 0, not a stopped
+         * transfer: stopping and restarting the DMA between bursts would put
+         * a second variable into the one stage that is read by ear. */
+        yp3_speaker_pa(true);
+        for (g = 0; g < 4; g++) {
+            st_set_gain(mask, gains[g]);
+            logf("st: pass %u burst %u gain=%u LISTEN", pass, g, gains[g]);
+            st_wait_ms(1000);
+            st_set_gain(mask, 0);
+            st_wait_ms(250);
+        }
+        yp3_speaker_pa(false);
+
+        logf("st: pass %u done irqs=%lu", pass, (unsigned long)st_irqs);
+
+        st_active = false;
+        yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));
+        DMA_CTRL(PCM_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
+        yp3_tx_disable();
+    }
+
+    /* Leave nothing behind for the normal path: it re-runs the whole bring-up
+     * from sink_set_freq, and it expects the stereo pair. */
+    yp3_analog_mask = 3u;
+    logf("st: ==== self-test complete ====");
+}
+#endif /* YP3_AUDIO_SELFTEST */
 
 /* One rate for now. Both halves of rate selection are now recovered - the PLL
  * family and the TX_CTRL[11:8] code - so 11025, 12000, 16000, 22050, 24000,
