@@ -118,17 +118,20 @@
 
 #define PLUGIN_BUFFER_SIZE  0x2000
 
-/* Codec XIP split. Codec .text and .rodata are linked into per-codec slots in
- * SPI NOR and execute in place, so codecbuf holds only .data and .bss and is
- * sized by the worst codec's WRITABLE footprint rather than its total. The
- * tables above are totals and no longer set CODEC_SIZE; measured writable
- * footprints after the split are:
+/* Codec slots in flash, COPIED TO SRAM AT LOAD. Each codec's whole image is
+ * linked into a per-codec slot in SPI NOR; lc_open() memcpys it into codecbuf
+ * and the codec runs from SRAM.
  *
- *     spc        76,780     <- binding constraint
- *     atrac3_rm  68,096     atrac3_oma 67,584     tta 57,944
- *     wav/wav64  43,076
- *     mpa        38,288     (was 105,784; rq_table alone is 32,828)
- *     vorbis        172     (90,192 of text+rodata, all now in flash)
+ * It used to EXECUTE IN PLACE from the slot, so codecbuf held only .data and
+ * .bss and was sized by the worst writable footprint (spc, 76,780) rather than
+ * the worst total. That was measured and reverted: this part is a Cortex-M4
+ * with no instruction cache, so every codec instruction came over the SPI-NOR
+ * link at 32 MHz while the core ran at 192, and an MP3 decoded 26 ms of audio
+ * every 2.5 seconds - about 1% of real time. docs/AUDIO.md has the log.
+ *
+ * So CODEC_SIZE is back to being sized by the worst TOTAL, and the slots are
+ * now purely a delivery mechanism - no codec files on the card, no codec
+ * buffering into the audio arena, and no XIP penalty on the decoder.
  *
  * See apps/plugins/plugin.lds (SL6801 branch), tools/codec_slots.txt for the
  * slot addresses, and tools/gen_codec_slots.py which feeds the link flags and
@@ -148,12 +151,17 @@
  * together with HAVE_CODEC_XIP. */
 #define HAVE_LC_OPEN_TARGET
 
-/* 0x13000 is 77,824: clears spc, the worst writable footprint, by 1,044
- * bytes. Without the XIP split this has to be 0x1b000 to hold mpa's
- * 105,784-byte total - so turning HAVE_CODEC_XIP off means putting this back.
- * Dropping spc, atrac3 and tta - the call already made for cook, ay and gbs -
- * would let it fall to 0xb000. */
-#define CODEC_SIZE          0x13000
+/* 0x1b000 is 110,592, sized by mpa's 105,840-byte total (text 67,552, data 4,
+ * bss 38,284) with 4.7 KB of headroom - it is the largest codec built here.
+ * vorbis is 90,388, atrac3_rm 100,204, spc 88,284.
+ *
+ * This is 0x8000 more than the execute-in-place layout needed, and those 32 KB
+ * come off the audio arena: 184,640 bytes to 151,872. That is affordable and
+ * the reasoning is already in docs/AUDIO.md - the vendor's own firmware
+ * decodes with an 18 KB working buffer and NO file readahead at all, because
+ * this board streams from SD by design. A 148 KB arena is still far more than
+ * the hardware was built around. */
+#define CODEC_SIZE          0x1b000
 
 /* The tree cache is allocated before playback. The generic 1,000-entry default
  * consumes 52 KiB (40-byte names plus 12-byte entries) from the small core

@@ -224,63 +224,48 @@ SECTIONS
      * tools/codec_slots.txt and is fixed. */
     .codecxip CODEC_XIP_ORIGIN : {
         LONG(0x59503358);               /* 'YP3X' */
-        LONG(_codec_xip_dataload);
-        LONG(_codec_xip_data_start);
-        LONG(_codec_xip_data_end);
+        LONG(_codec_xip_load);
+        LONG(_codec_xip_start);
+        LONG(_codec_xip_end);
     }
+    _codec_xip_load = CODEC_XIP_ORIGIN + 16;
 
-    .header : {
-        KEEP(*(.header))
-    }
-
-    /* The header's load_addr is the codec's RAM base, NOT where the header
-     * itself lives: codec_load_ram() checks `hdr->load_addr != codecbuf` and
-     * rejects the codec if it differs. With the split the header is in flash,
-     * so point these at PLUGIN_RAM's origin, which is codecbuf, and is exactly
-     * where .data lands. The companion check on end_addr still guards a .bss
-     * that would overflow codecbuf. */
-    _plugin_start_addr = ORIGIN(PLUGIN_RAM);
-    plugin_start_addr = ORIGIN(PLUGIN_RAM);
-
-    .text :
+    /* ONE output section, VMA in codecbuf and LMA in the flash slot.
+     *
+     * Codec .text and .rodata used to have their VMA in flash and execute in
+     * place. That saved codecbuf - mpa is 105,784 bytes of which only 38,288
+     * is writable - and it cost about a hundredfold in speed, because this
+     * part is a Cortex-M4 with NO INSTRUCTION CACHE and the SPI-NOR link is a
+     * fraction of the core clock. An MP3 decoded 26 ms of audio every 2.5
+     * seconds; see docs/AUDIO.md. Read-only bytes in codecbuf are not loss,
+     * they are the entire point.
+     *
+     * Everything initialised goes in one section on purpose. The alternative -
+     * separate .header/.text/.rodata/.data with each LMA chained off
+     * LOADADDR(prev) + SIZEOF(prev) - silently breaks the moment any section
+     * needs more than 4-byte alignment, because alignment padding lands in the
+     * VMA and not in SIZEOF. One section has one LMA and cannot drift. */
+    .codecimg : AT(_codec_xip_load)
     {
+        _codec_xip_start = .;
+        _plugin_start_addr = .;
+        plugin_start_addr = .;
+        KEEP(*(.header))
         *(.text*)
 #ifdef CPU_ARM
         *(.glue_7)
         *(.glue_7t)
 #endif
-    }
-
-    .rodata :
-    {
         *(.rodata*)
-    }
-
-    /* Place the unwind tables explicitly. Left as orphans ld puts them at the
-     * current location counter - which is after .rodata, exactly where .data's
-     * load address is - and the link fails with an LMA overlap. In the old
-     * single-region script they were orphans too, but everything was flowing
-     * into PLUGIN_RAM in order so nothing noticed. */
-    .ARM.exidx :
-    {
+        /* Placed explicitly for the reason the old script recorded: left as
+         * orphans ld puts them at the current location counter and the link
+         * fails with an LMA overlap. */
         *(.ARM.exidx*)
-    }
-
-    .ARM.extab :
-    {
         *(.ARM.extab*)
-    }
-
-    . = ALIGN(4);
-    _codec_xip_dataload = .;
-
-    /* VMA in codecbuf, initialiser image in flash directly behind the code. */
-    .data : AT(_codec_xip_dataload)
-    {
-        _codec_xip_data_start = .;
+        . = ALIGN(4);
         *(.data*)
         . = ALIGN(4);
-        _codec_xip_data_end = .;
+        _codec_xip_end = .;
     } > PLUGIN_RAM
 #else
     .header : {

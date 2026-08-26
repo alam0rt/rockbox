@@ -20,11 +20,15 @@
 
 /* lc_open() for a target whose codecs are already in memory.
  *
- * Codec .text and .rodata are linked into per-codec slots in SPI NOR and
- * execute in place from there, so there is nothing to read off the card and
- * codecbuf only has to hold .data and .bss. Loading such a codec is copying
- * .data to its home in codecbuf; codec_start() zeroes .bss itself, as it
- * always has.
+ * Each codec's whole image is linked into a per-codec slot in SPI NOR, so
+ * there is nothing to read off the card - loading one is a single memcpy from
+ * the slot into codecbuf. codec_start() zeroes .bss itself, as it always has.
+ *
+ * IT USED TO EXECUTE IN PLACE from the slot, with only .data and .bss landing
+ * in codecbuf. That halved the buffer requirement and cost about a hundredfold
+ * in speed: this part is a Cortex-M4 with no instruction cache, so every
+ * instruction came over the SPI-NOR link, and an MP3 decoded 26 ms of audio
+ * every 2.5 seconds. docs/AUDIO.md has the measurement.
  *
  * This sits at the lc_open() seam deliberately. apps/codecs.c asks the loader
  * for a binary by path and gets a header back, and that contract is unchanged
@@ -71,9 +75,9 @@
 struct codec_xip_desc
 {
     uint32_t magic;
-    uint32_t dataload;      /* .data initialiser image, in flash */
-    uint32_t data_start;    /* .data destination, in codecbuf */
-    uint32_t data_end;
+    uint32_t load;          /* the whole image, in flash, behind this struct */
+    uint32_t start;         /* its destination: codecbuf                     */
+    uint32_t end;           /* end of the initialised image in codecbuf      */
 };
 
 #define YP3_CODEC_SLOT(name, base, size) { name, (base) },
@@ -139,20 +143,26 @@ static void * lc_open_resident(const char *name, unsigned char *buf,
         /* The descriptor is flash written at install time and the buffer is
          * sized by this build; a mismatch means the two disagree about
          * CODEC_SIZE, which would otherwise be a silent overrun. */
-        if (d->data_end < d->data_start
-            || (unsigned char *)d->data_start != buf
-            || (unsigned char *)d->data_end > buf + buf_size)
+        if (d->end < d->start
+            || (unsigned char *)d->start != buf
+            || (unsigned char *)d->end > buf + buf_size)
         {
-            logf("lc_open: %s data %08lx..%08lx outside %08lx+%lx", name,
-                 (unsigned long)d->data_start, (unsigned long)d->data_end,
+            logf("lc_open: %s image %08lx..%08lx outside %08lx+%lx", name,
+                 (unsigned long)d->start, (unsigned long)d->end,
                  (unsigned long)buf, (unsigned long)buf_size);
             return NULL;
         }
 
-        if (d->data_end > d->data_start)
-            memcpy((void *)d->data_start, (const void *)d->dataload,
-                   d->data_end - d->data_start);
+        /* The whole initialised image - header, text, rodata and data - is
+         * copied into codecbuf and RUNS THERE. It used to execute in place
+         * from the slot, and that cost about a hundredfold: no instruction
+         * cache, and every fetch over the SPI-NOR link. */
+        if (d->end > d->start)
+            memcpy((void *)d->start, (const void *)d->load,
+                   d->end - d->start);
 
+        /* Not optional any more. This just wrote code through the data path
+         * and is about to jump into it. */
         commit_discard_idcache();
 
         /* Log the hit, not just the failures. The line immediately after this
@@ -161,14 +171,13 @@ static void * lc_open_resident(const char *name, unsigned char *buf,
          * come back - which is the difference between a loader fault and a
          * fault inside the codec, and the log ring survives a hang plus reset
          * in the black box. */
-        logf("lc_open: %s resident %08lx, .data %lu, hdr %08lx", name,
-             (unsigned long)codec_slots[i].base,
-             (unsigned long)(d->data_end - d->data_start),
-             (unsigned long)(d + 1));
+        logf("lc_open: %s slot %08lx -> %08lx, %lu bytes", name,
+             (unsigned long)codec_slots[i].base, (unsigned long)d->start,
+             (unsigned long)(d->end - d->start));
 
-        /* The header follows the descriptor; see the .codecxip and .header
-         * output sections in plugin.lds. */
-        return (void *)(d + 1);
+        /* The header is the first thing in the image, so it is now at the RAM
+         * base - which is what codec_load_ram() checks load_addr against. */
+        return (void *)d->start;
     }
 
     return NULL;
