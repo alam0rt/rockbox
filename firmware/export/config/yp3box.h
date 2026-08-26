@@ -170,8 +170,23 @@
  * compressed-input reserve. Existing settings are clamped at tree init. */
 #define MAX_FILES_IN_DIR_LIMIT 200
 
-/* Half a second of decoded-PCM lookahead instead of a whole one. A second is
- * 172 KB at 44.1 kHz stereo and the entire audio arena here is about 160 KB.
+/* A QUARTER of a second of decoded-PCM lookahead. A whole one is 172 KB at
+ * 44.1 kHz stereo and the entire audio arena here is about 151 KB.
+ *
+ * It was a half, and moving codecs out of SPI NOR and into codecbuf took 32 KB
+ * off the arena and left the FILE buffer at 10,916 bytes - not enough to hold
+ * even the first handle. The device buffered zero tracks, so there was no id3
+ * (the UI showed "? bitrate"), the codec never loaded and nothing played
+ * `[L]`. The arithmetic, all of it off the same arena:
+ *
+ *     ring 91,100 + guard 32,768 + reserve 16,384 = 140,252 of 151,168
+ *
+ * A quarter-second ring is about 47,000, which puts the file buffer at ~55 KB
+ * - MORE than the 44,388 it had before codecs moved, so this is not a
+ * compromise to pay for codecbuf, it is a ring that was oversized for this
+ * device all along. docs/AUDIO.md records why: the vendor's own firmware
+ * decodes with an 18 KB working buffer and no file readahead whatsoever,
+ * because this board streams from SD at 2 MB/s by design.
  *
  * This replaced PCM_MIN_BUFFER_DIVISOR, a knob this port invented that existed
  * on no other target, so nothing upstream ever exercised the path and it broke
@@ -179,7 +194,7 @@
  * never reach a watermark still sized against the full-rate ring. The fraction
  * below is stated once and pcmbuf.c derives the watermark from it, so the two
  * cannot drift apart again. */
-#define PCMBUF_LOOKAHEAD_DEN   2
+#define PCMBUF_LOOKAHEAD_DEN   4
 
 #define AUDIO_BUFFER_RESERVE   0x4000
 /* A 128x160 RGB565 default backdrop costs 40 KiB in core buflib. Keep that
