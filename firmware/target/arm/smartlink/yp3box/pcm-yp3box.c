@@ -1043,27 +1043,48 @@ static void st_tx_channels(unsigned mask)
     }
 }
 
+/* THE ANALOGUE OUTPUT PATH GAINS. A second set of gain fields, separate from
+ * the AUD(0x30)/AUD(0x2c) ones, that this driver has never written at all -
+ * and every log this port has produced reads them as zero `[L]`.
+ *
+ * The vendor loads each from its context, in the very functions tx_enable
+ * calls per enabled channel `[C]`:
+ *
+ *   0xd7a418   AUD(0x08)[12:8]  = ctx[0xa0]      channel 0
+ *   0xd7a4a0   AUD(0x08)[28:24] = ctx[0xa4]      channel 1
+ *   0xd7a51e   AUD(0x0c)[14:8]  = ctx[0xa8]      channel 2, and 0xd7a514
+ *              also sets bit 16 there, which ioctl 67's plain |= 0x43 does not
+ *
+ * Our logs read r08=20432043 and 0c=00000043: all three fields zero, bit 16
+ * clear. docs/AUDIO.md already records this exact failure for the DIGITAL
+ * volume - "clocked, configured, actively transferring and still silent" -
+ * and it is the same trap one layer down. */
+static void st_path_gain(unsigned g)
+{
+    field_set(&AUD(0x08), 0x00001f00u, g);          /* channel 0, 5 bits */
+    field_set(&AUD(0x08), 0x1f000000u, g);          /* channel 1, 5 bits */
+    field_set(&AUD(0x0c), 0x00007f00u,              /* channel 2, 7 bits */
+              (g * 4u) > 127u ? 127u : g * 4u);
+}
+
 void yp3_audio_selftest(void)
 {
-    /* v6 landed every write it set out to land - 00=c3000022 with both output
-     * enables set, 0c=00000043, module 2 up, channel 2's pads walked - and
-     * produced nothing. So the analogue stage is not missing an enable, and
-     * the pads are not missing a mux. 1219 DMA completions say the digital
-     * side is fine. Something in between is not connected, and the one thing
-     * in between that has never been varied is which digital transmit channel
-     * is switched on.
+    /* v7 closed the last cheap guess: every digital TX channel combination
+     * was tried, alone and together, and none of them made a sound. What the
+     * tester DID hear was the amplifier's own noise floor rising and falling
+     * with the PA - so the XS4150 and the speaker are alive and P1.30 really
+     * is the enable, and the amp is being fed nothing.
      *
-     * Five rungs, tone running throughout, everything v6 established applied
-     * up front. If none of them sounds, the answer is not in a register this
-     * port can guess at, and the next move is to read the vendor's playback
-     * path end to end - the media manager's own ioctl sequence and the route
-     * ids it writes into ctx[0x32], [0x33], [0x4d] and [0x4e] - rather than
-     * another ladder. That is disassembly time, not a hardware cycle. */
-    static const unsigned char tx[5] = { 0x3u, 0xfu, 0x4u, 0x8u, 0x1u };
+     * This is not another ladder over a guess. Three named gain fields that
+     * the vendor writes on every playback start have been zero in every log
+     * this port has ever produced.
+     *
+     * One pitch per rung, so anything heard names its own rung. */
+    static const unsigned char gain[5] = { 0u, 8u, 16u, 24u, 31u };
     static const unsigned short freq[5] = { 400u, 600u, 900u, 1400u, 2100u };
     unsigned i, k;
 
-    logf("st: ==== v7: which digital TX channel actually goes anywhere ====");
+    logf("st: ==== v8: the analogue path gains were never written ====");
 
     if (!audio_block_up)
         yp3_audio_block_init();
@@ -1074,20 +1095,19 @@ void yp3_audio_selftest(void)
     yp3_analog_mask = 7u;
     yp3_tx_enable(SAMPR_44, true);
     st_set_gain(7u, 31u);
+    st_tx_channels(0xfu);           /* all four: v7 showed none of them alone
+                                     * matters, so it is not the variable */
 
-    /* Everything v6 proved lands, applied once, up front. */
+    /* Everything the earlier runs proved lands, applied once. */
     field_set(&AUD(0x00), 0x01000000u, 1);
     field_set(&AUD(0x00), 0x02000000u, 1);
     AUD(0x0c) |= 0x43u;
+    AUD(0x0c) |= 0x10000u;          /* 0xd7a514 - ioctl 67 does not set this */
     if (!ROM_CLK_IS_ON(2u))
         ROM_CLK_ENABLE(2u);
     ROM_CLK_DIV(0x2cu, 8u);
     ROM_CLK_APPLY(0x2cu);
     st_pad_walk(2);
-    logf("st: base 00=%08lx 0c=%08lx 20=%08lx 2c=%08lx 30=%08lx",
-         (unsigned long)AUD(0x00), (unsigned long)AUD(0x0c),
-         (unsigned long)AUD(0x20), (unsigned long)AUD(0x2c),
-         (unsigned long)AUD(0x30));
 
     yp3_dma_open();
     st_irqs = 0;
@@ -1096,26 +1116,17 @@ void yp3_audio_selftest(void)
     yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);
     for (i = 0; i < 200 && st_irqs == 0; i++)
         st_wait_ms(1);
-    logf("st: digital irqs=%lu", (unsigned long)st_irqs);
+    logf("st: digital irqs=%lu 08=%08lx 0c=%08lx", (unsigned long)st_irqs,
+         (unsigned long)AUD(0x08), (unsigned long)AUD(0x0c));
     yp3_speaker_pa(true);
 
-    /* ONE PITCH PER RUNG, so anything heard names its own rung. A listener
-     * cannot tell rung A from rung C by silence, and "somewhere in the middle"
-     * is not a result - v3 got this right by giving each pass its own
-     * frequency and v7 dropped it. Ascending, an octave and a half apart, with
-     * a real gap between them so two rungs cannot blur into one. */
     for (k = 0; k < 5; k++) {
-        st_tx_channels(tx[k]);
-        st_set_gain(7u, 31u);
+        st_path_gain(gain[k]);
         st_fill(SAMPR_44, freq[k]);
-        logf("st: %c tx-mask=%#x %uHz ch0=%08lx ch1=%08lx ch2=%08lx ch3=%08lx",
-             'A' + k, tx[k], freq[k],
-             (unsigned long)AUD(AUD_TX_CH(0)), (unsigned long)AUD(AUD_TX_CH(1)),
-             (unsigned long)AUD(AUD_TX_CH(2)), (unsigned long)AUD(AUD_TX_CH(3)));
+        logf("st: %c path-gain=%u %uHz 08=%08lx 0c=%08lx", 'A' + k, gain[k],
+             freq[k], (unsigned long)AUD(0x08), (unsigned long)AUD(0x0c));
         st_wait_ms(3000);
-        /* Silence between rungs: gain to the far end and the channels off, so
-         * a rung that works has an audible edge on both sides of it. */
-        st_tx_channels(0u);
+        st_path_gain(0u);
         st_wait_ms(700);
     }
 
