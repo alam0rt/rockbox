@@ -575,8 +575,22 @@ static void yp3_dma_play(const void *addr, size_t size)
  *
  * Declared here because the DMA interrupt below has to know about it. The
  * test itself is at the foot of this file. */
+/* OFF. It answered what it was built for - the digital path is complete, the
+ * transmitter runs, the DMA moves samples at the sample rate - and the thing
+ * it could not answer, why none of that reaches a pin, is recorded in
+ * docs/AUDIO.md with nine hypotheses excluded.
+ *
+ * It is off now because it had started to COST evidence rather than produce
+ * it. yp3_dma2_irq logs only while pcm_irqs <= 8, and a self-test run spends
+ * all eight of those on itself - 1215 transfers before the UI is even up - so
+ * real playback, the path that now matters, logged no interrupts at all. It
+ * also spends 25 seconds of every boot and hands normal playback an audio
+ * block it has already configured and torn down.
+ *
+ * A probe that outlives its question starts eating the instrumentation of
+ * whatever comes next. */
 #ifndef YP3_AUDIO_SELFTEST
-#define YP3_AUDIO_SELFTEST 1
+#define YP3_AUDIO_SELFTEST 0
 #endif
 #if YP3_AUDIO_SELFTEST
 /* 20 ms of 44.1 kHz stereo. NOT const, and never const: .rodata is SPI NOR on
@@ -588,6 +602,9 @@ static int16_t st_tone[ST_FRAMES * 2] __attribute__((aligned(4)));
 static volatile bool st_active;
 static volatile uint32_t st_irqs;
 void yp3_audio_selftest(void);       /* defined at the foot of this file */
+#else
+/* The interrupt's log guard reads this whether or not the test is built. */
+#define st_active false
 #endif
 
 /* --- interrupt ------------------------------------------------------------
