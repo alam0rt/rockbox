@@ -89,13 +89,24 @@ yp3_flash_verify(void)
  * running normally again. The per-rung results go into .bss for
  * yp3_measure_speed to print afterwards.
  *
- * It stays off until someone deliberately turns it on, because the failure
- * mode is a device that will not boot and cannot say why - the single most
- * expensive outcome available. Recovery is ./tools/27_install_rockbox.sh in
- * bootloader mode, which uses the ROM's own flash settings and is unaffected. */
-#define YP3_FLASH_LADDER 0
+ * TURNED ON, because the cost of leaving it off has now been measured. An MP3
+ * decodes 26 ms of audio every 2.5 seconds - about 1% of real time - and this
+ * part is a Cortex-M4 with no instruction cache, so every instruction outside
+ * .icode is fetched over this link. 384/12 = 32 MHz was always a guess, and
+ * the whole machine is paying it: the UI, the SD drain, interrupt latency and
+ * the decoder alike. See docs/AUDIO.md.
+ *
+ * The failure mode is still a device that will not boot and cannot say why, so
+ * it stays a ladder that verifies by content and falls back. Recovery is
+ * ./tools/27_install_rockbox.sh in bootloader mode, which uses the ROM's own
+ * flash settings and is unaffected by anything decided here. */
+#define YP3_FLASH_LADDER 1
 
-#define FLASH_RUNGS 4
+/* 128, 96, 64, 48 and the 32 MHz floor. Rung 2 - 192 MHz - is deliberately
+ * absent: no SPI-NOR runs there, and an impossible clock is the one most
+ * likely to wedge the controller outright rather than return garbage a content
+ * check can catch. */
+#define FLASH_RUNGS 5
 uint32_t yp3_flash_div;                 /* reported by yp3_measure_speed */
 uint32_t yp3_flash_rung_div[FLASH_RUNGS];
 uint32_t yp3_flash_rung_hz[FLASH_RUNGS];
@@ -111,7 +122,7 @@ yp3_flash_clock_ladder(void)
     const volatile uint32_t *p = (const volatile uint32_t *)0x00c00000u;
     unsigned i, j;
 
-    divs[0] = 4u; divs[1] = 6u; divs[2] = 8u; divs[3] = 12u;
+    divs[0] = 3u; divs[1] = 4u; divs[2] = 6u; divs[3] = 8u; divs[4] = 12u;
 
     yp3_flash_set_div(12u);
     for (i = 0; i < FLASH_REF_WORDS; i++)
