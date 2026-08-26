@@ -89,18 +89,32 @@ yp3_flash_verify(void)
  * running normally again. The per-rung results go into .bss for
  * yp3_measure_speed to print afterwards.
  *
- * TURNED ON, because the cost of leaving it off has now been measured. An MP3
- * decodes 26 ms of audio every 2.5 seconds - about 1% of real time - and this
- * part is a Cortex-M4 with no instruction cache, so every instruction outside
- * .icode is fetched over this link. 384/12 = 32 MHz was always a guess, and
- * the whole machine is paying it: the UI, the SD drain, interrupt latency and
- * the decoder alike. See docs/AUDIO.md.
+ * TURNED ON ONCE, AND IT BROKE THE BOOT. `[L]` The device came up dead with an
+ * EMPTY log ring - nothing at all before it stopped - which is precisely the
+ * outcome the paragraph above calls the most expensive available.
  *
- * The failure mode is still a device that will not boot and cannot say why, so
- * it stays a ladder that verifies by content and falls back. Recovery is
- * ./tools/27_install_rockbox.sh in bootloader mode, which uses the ROM's own
- * flash settings and is unaffected by anything decided here. */
-#define YP3_FLASH_LADDER 1
+ * Two things went wrong, and only one of them was the clock:
+ *
+ * 1. The ladder tries its rungs FASTEST FIRST and returns on the first that
+ *    verifies. Adding 3 (128 MHz) to the front therefore made an untried
+ *    extreme the very first thing the device ever does with its own
+ *    instruction bus. A content check catches a divider that returns garbage;
+ *    it cannot catch one that wedges the controller, because yp3_flash_verify
+ *    never returns to report it.
+ * 2. THE LADDER CANNOT SAY WHICH RUNG KILLED IT. Its per-rung results go into
+ *    .bss for yp3_measure_speed to print later, so a wedge loses all of them.
+ *    That is why the ring is empty and why this cost a cycle and told us
+ *    nothing about the flash at all - not even whether 48 MHz works.
+ *
+ * Before this is turned on again it needs to step DOWN from the known-good
+ * divider one rung at a time, keeping the last value that verified, and to
+ * drop a breadcrumb into .persist before each attempt so that a wedge is
+ * attributable. Neither is a large change; both are the difference between a
+ * cycle that measures something and this one.
+ *
+ * Recovery is ./tools/27_install_rockbox.sh in bootloader mode, which uses the
+ * ROM's own flash settings and is unaffected by anything decided here. */
+#define YP3_FLASH_LADDER 0
 
 /* 128, 96, 64, 48 and the 32 MHz floor. Rung 2 - 192 MHz - is deliberately
  * absent: no SPI-NOR runs there, and an impossible clock is the one most
