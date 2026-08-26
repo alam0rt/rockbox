@@ -1060,6 +1060,7 @@ void yp3_audio_selftest(void)
      * ids it writes into ctx[0x32], [0x33], [0x4d] and [0x4e] - rather than
      * another ladder. That is disassembly time, not a hardware cycle. */
     static const unsigned char tx[5] = { 0x3u, 0xfu, 0x4u, 0x8u, 0x1u };
+    static const unsigned short freq[5] = { 400u, 600u, 900u, 1400u, 2100u };
     unsigned i, k;
 
     logf("st: ==== v7: which digital TX channel actually goes anywhere ====");
@@ -1098,13 +1099,24 @@ void yp3_audio_selftest(void)
     logf("st: digital irqs=%lu", (unsigned long)st_irqs);
     yp3_speaker_pa(true);
 
+    /* ONE PITCH PER RUNG, so anything heard names its own rung. A listener
+     * cannot tell rung A from rung C by silence, and "somewhere in the middle"
+     * is not a result - v3 got this right by giving each pass its own
+     * frequency and v7 dropped it. Ascending, an octave and a half apart, with
+     * a real gap between them so two rungs cannot blur into one. */
     for (k = 0; k < 5; k++) {
         st_tx_channels(tx[k]);
-        logf("st: %c tx-mask=%#x  ch0=%08lx ch1=%08lx ch2=%08lx ch3=%08lx",
-             'A' + k, tx[k],
+        st_set_gain(7u, 31u);
+        st_fill(SAMPR_44, freq[k]);
+        logf("st: %c tx-mask=%#x %uHz ch0=%08lx ch1=%08lx ch2=%08lx ch3=%08lx",
+             'A' + k, tx[k], freq[k],
              (unsigned long)AUD(AUD_TX_CH(0)), (unsigned long)AUD(AUD_TX_CH(1)),
              (unsigned long)AUD(AUD_TX_CH(2)), (unsigned long)AUD(AUD_TX_CH(3)));
         st_wait_ms(3000);
+        /* Silence between rungs: gain to the far end and the channels off, so
+         * a rung that works has an audible edge on both sides of it. */
+        st_tx_channels(0u);
+        st_wait_ms(700);
     }
 
     yp3_speaker_pa(false);
