@@ -38,6 +38,11 @@
 #include "pcm.h"
 #include "pcm-internal.h"
 #include "pcm_sink.h"
+/* YP3_AUDIO_SELFTEST is written into this generated header by
+ * tools/40_build.sh from YP3_SELFTEST=1. Without the include the #ifndef below
+ * quietly defined it to 0, so the switch built a normal image and the boot it
+ * was asked for proved nothing. */
+#include "yp3-buildstamp.h"
 #include "sl6801-regs.h"
 #include "pcm_mixer.h"
 #include "kernel.h"

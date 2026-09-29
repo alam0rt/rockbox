@@ -10,6 +10,125 @@
     .type reset_handler, %function
 start:
 reset_handler:
+    /* --- get out of handler mode FIRST ---------------------------------
+     *
+     * The ROM's USB bootloader dispatches its RUNRAM command from inside the
+     * USB interrupt handler: 0x627a loads the address and 0x61d4 does a bare
+     * `bx`. Nothing unwinds the exception, so an image started with
+     * smtlink `exec` runs in HANDLER MODE for ever, IPSR stuck at the USB
+     * interrupt number.
+     *
+     * Measured, not deduced. An exec-booted image panicked with
+     *
+     *     Incorrect CPU mode in mrsw_write_acquire (0x39!=0x00)
+     *
+     * 0x39 is exception 57, IRQ 41, which the boot log independently names as
+     * USB (`usb: ... irq41=00005695`). Rockbox asserts thread context on every
+     * filesystem lock, so it boots and then dies the moment it touches a file.
+     * It also means the USB ISR never returns, so the device stays enumerated
+     * at the same devnum and looks to the host like it never branched at all.
+     *
+     * The ROM's own validated boot enters from main, in thread mode, and is
+     * unaffected - which is why that path has always worked and this one never
+     * has, despite 23_boot_rockbox.sh assuming it did.
+     *
+     * So synthesise an exception return. EXC_RETURN 0xFFFFFFF9 is "return to
+     * Thread mode, use MSP", and the hardware pops R0-R3, R12, LR, PC, xPSR
+     * from SP. Only PC and xPSR need to mean anything: the rest are dead
+     * before crt0 sets up its own world. xPSR must have the T bit, and the
+     * stacked PC has bit 0 clear because the hardware takes Thumb from xPSR.
+     */
+    mrs     r0, ipsr
+    cmp     r0, #0
+    beq     10f                     /* already thread mode: the ROM boot path */
+
+    ldr     r0, =stackend
+    sub     r0, r0, #32             /* room for the 8-word exception frame */
+    mov     sp, r0
+    ldr     r1, =10f
+    bic     r1, r1, #1
+    str     r1, [r0, #24]           /* stacked PC   */
+    mov     r1, #1
+    lsl     r1, r1, #24             /* xPSR.T       */
+    str     r1, [r0, #28]
+    mov     r1, #0
+    sub     r1, r1, #7              /* 0xfffffff9   */
+    bx      r1
+10:
+
+    /* --- the rig hook, before ANYTHING else touches the machine ---------
+     *
+     * Runs while the boot ROM's world is still completely intact: early_init
+     * has run, VTOR still points at the ROM's own vector table at 0x800000,
+     * interrupts are enabled, and the USB module clock is on (ROM 0x4c952).
+     * That is precisely the state ROM main is in at 0x4c978 when it calls the
+     * download service for a held VOL key - which is why re-entering that
+     * service from here is expected to work, and why this must come before
+     * the flash window, the stack munge and the .data copy.
+     *
+     * yp3_bootctl lives at the head of .persist: never cleared by crt0, never
+     * written by the .data copy, and above the 0x800000-0x806000 window the
+     * boot ROM re-initialises, so it survives a reset. Offsets are fixed by
+     * app.lds:
+     *
+     *   +0x00 magic   +0x04 request   +0x08 warm_flag  +0x0c warm_vec
+     *   +0x10 resets  +0x14 boots     +0x18 rom_wdog   +0x1c spare
+     */
+    ldr     r0, =yp3_bootctl
+    ldr     r1, [r0, #0]
+    ldr     r2, =0x42430001             /* "BC" + version */
+    cmp     r1, r2
+    beq     11f
+    /* Cold start: .persist holds whatever the last power-off left, so it has
+       to be initialised before any field is believed. */
+    movs    r1, #0
+    str     r1, [r0, #4]
+    str     r1, [r0, #8]
+    str     r1, [r0, #12]
+    str     r1, [r0, #16]
+    str     r1, [r0, #20]
+    str     r1, [r0, #24]
+    str     r1, [r0, #28]
+    str     r2, [r0, #0]
+11:
+    /* boots++. A software reset that comes back here with this incremented
+       and the magic intact is the whole proof that .persist survives one -
+       app.lds has always CLAIMED it does, and nothing had measured it. */
+    ldr     r1, [r0, #20]
+    adds    r1, #1
+    str     r1, [r0, #20]
+
+    /* The reset-path probe. ROM 0x68 reads 0x4000000c and, when it is not
+       zero, does `bx *(0x30000600)` instead of running main - so a software
+       reset that leaves that flag set never reaches this instruction at all.
+       Arriving here IS the measurement; the value is recorded for the log.
+       0x30000600 is only dereferenced when the flag is set, because nothing
+       in the dumps says that register reads safely otherwise. */
+    ldr     r1, =0x4000000c
+    ldr     r1, [r1]
+    str     r1, [r0, #8]
+    movs    r2, #0
+    cbz     r1, 12f
+    ldr     r2, =0x30000600
+    ldr     r2, [r2]
+12: str     r2, [r0, #12]
+
+    /* A pending "go to the bootloader" request: hand the machine straight
+       back to the ROM's USB download service, which is what the host talks
+       to as 301a:2800. The request is cleared FIRST, so a service that does
+       not come up costs one reset and not an unbreakable loop. The infinite
+       call mirrors ROM 0x4c992, the bad-image path, exactly. */
+    ldr     r1, [r0, #4]
+    ldr     r2, =0x600710AD
+    cmp     r1, r2
+    bne     14f
+    movs    r1, #0
+    str     r1, [r0, #4]
+    ldr     r4, =0x0004c8a1             /* ROM download service, Thumb */
+13: blx     r4
+    b       13b
+14:
+
     /* OPEN THE FLASH WINDOW FIRST.
      *
      * The XIP aperture decodes 0xc00000-0xe00000 (2MB) but the controller only

@@ -340,20 +340,32 @@ void system_init(void)
     yp3_measure_speed();
 
     /* The boot ROM leaves a watchdog running and Rockbox does not refresh it.
-     * Disable it before any driver starts. */
+     * Disable it before any driver starts.
+     *
+     * Capture the reload first. It is the only watchdog period on this part
+     * that is KNOWN to expire - it is what used to reset Rockbox in a loop -
+     * and yp3_reboot() reuses it rather than inventing a number for units
+     * nothing has measured. Keep the last nonzero value: a warm boot that
+     * somehow skipped the ROM's arming should not erase it. */
+    if (WDOG_LOAD)
+        yp3_bootctl.rom_wdog_load = WDOG_LOAD;
     WDOG_CTRL = 0;
 
     /* Mask any pending device interrupts before drivers run. */
     yp3_mask_all_irqs();
     /* Clocks are already configured by the boot ROM / bootloader:
      * cpu pll 384 MHz, core pll 192 MHz, ahb 32 MHz (measured). */
+
+    /* Last: it logs, and it may arm a watchdog, so everything else has to be
+     * in a state that can survive one. */
+    yp3_rig_init();
 }
 
 void system_reboot(void)
 {
-    /* AIRCR SYSRESETREQ */
-    REG32(0xE000ED0C) = (0x5FAu << 16) | (1u << 2);
-    while (1) ;
+    /* SYSRESETREQ alone was all this used to do, and whether this part acts on
+     * it has never been measured. yp3_reboot arms the watchdog as well. */
+    yp3_reboot();
 }
 
 /* panicf() ends here. It has already painted the panel; write the black box

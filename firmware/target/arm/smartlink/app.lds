@@ -106,6 +106,12 @@ SECTIONS
     .persist (NOLOAD) : ALIGN(8)
     {
         _persistbegin = .;
+        /* FIRST, and fixed at 32 bytes: crt0 reads and writes this before
+           .data is copied or .bss is cleared, so it addresses the fields by
+           constant offset. Anything inserted ahead of it silently moves every
+           offset the assembly uses. See rig-yp3box.c for the layout. */
+        yp3_bootctl = .;
+        . += 32;                        /* struct yp3_bootctl */
         yp3_blackbox = .;
         . += 192;                       /* struct yp3_blackbox */
         *logf.o(.bss* COMMON);

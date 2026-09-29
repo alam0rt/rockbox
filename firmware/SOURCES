@@ -1980,6 +1980,7 @@ target/arm/smartlink/yp3box/system-yp3box.c
 target/arm/smartlink/yp3box/sd-yp3box.c
 target/arm/smartlink/yp3box/stubs-yp3box.c
 target/arm/smartlink/yp3box/timer-yp3box.c
+target/arm/smartlink/yp3box/rig-yp3box.c
 target/arm/smartlink/yp3box/vectors-sl6801.S
 target/arm/smartlink/yp3box/cpucache-sl6801.c
 target/arm/smartlink/yp3box/lcd-yp3box.c

@@ -201,6 +201,13 @@ int button_read_device(void)
     if (play_held)
         btn |= BUTTON_PLAY;                      /* centre, id 0x21 "enter" */
 
+    /* The rig's scripted presses, so an unattended cycle can walk the UI to a
+     * track and start it. Injected here rather than into the button queue so a
+     * synthetic press is indistinguishable from a real one all the way up:
+     * repeat, long-press and action.c all see it. Compiles to nothing without
+     * YP3_RIG_KEYS. See rig-yp3box.c. */
+    btn |= yp3_rig_buttons();
+
     return btn;
 }
 

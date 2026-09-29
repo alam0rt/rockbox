@@ -26,6 +26,9 @@ void tick_start(unsigned int interval_in_ms)
 
 void systick_handler(void)
 {
+    /* Before the tick tasks, not after: the dead-man and the rig countdown are
+     * the things that have to keep running when a tick task is what wedged. */
+    yp3_rig_tick();
     call_tick_tasks();
 }
 
