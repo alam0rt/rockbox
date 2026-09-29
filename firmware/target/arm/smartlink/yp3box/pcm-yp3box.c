@@ -43,6 +43,10 @@
  * quietly defined it to 0, so the switch built a normal image and the boot it
  * was asked for proved nothing. */
 #include "yp3-buildstamp.h"
+
+#ifndef YP3_AUD_R410
+#define YP3_AUD_R410 1      /* the vendor's stream start sets bit 30 */
+#endif
 #include "sl6801-regs.h"
 #include "pcm_mixer.h"
 #include "kernel.h"
@@ -244,12 +248,17 @@ static unsigned yp3_analog_mask = 3u;
  *   settle bit   0x01, 0x02, 0x100
  *   bias field   0x0d, 0xd00, 0xd0000 in AUD(0x20)   (FIRM 0xd7ab90)
  *
- * EVIDENCE NOTE. The channel 0 and 1 sequence below is the one this driver has
- * always had, transcribed instruction by instruction from 0xd7ac8c. The
- * channel 2 arms are from the same function's mask & 4 branches as condensed
- * in docs/AUDIO.md, which is a weaker reading - they have never been written
- * out against the disassembly line by line. They are here to be TESTED, not
- * because they are known good. */
+ * Channel 2 has now been written out against 0xd7ac8c line by line, and the
+ * condensed reading this driver used to follow had dropped two of its writes:
+ *
+ *   0xd7addc  AUD(0x40) |= 0x1000     after 0x58's enable/up, before settle
+ *   0xd7adf2  AUD(0x4c) |= 0x400      before the 0x100 settle bit
+ *
+ * 0x400 is channel 2's counterpart of 0x10/0x20: the disable at 0xd7affc
+ * clears all three together with `bic #0x430`. Channel 2 is also the one the
+ * vendor's own analogue power-on (ioctl 67, 0xd7cd80) walks the pads of - so
+ * every build of this driver has half-enabled the one channel the product
+ * demonstrably uses. */
 static uint32_t aud_pwr(unsigned ch)
 {
     return AUDIO_BASE + (ch == 2 ? 0x58u : 0x50u + ch * 4u);
@@ -290,6 +299,10 @@ static void yp3_analog_enable(unsigned mask)
             REG32(aud_pwr(ch)) |= 0x10000000u;      /* enable */
             REG32(aud_pwr(ch)) |= 0x20000000u;      /* up     */
         }
+    if (mask & 4u) {
+        AUD(0x40) |= 0x1000u;                       /* 0xd7addc */
+        AUD(0x4c) |= 0x400u;                        /* 0xd7adf2 */
+    }
     AUD(0x4c) |= 0x30u;
     AUD(0x4c) |= (mask & 3u) | ((mask & 4u) ? 0x100u : 0u);
     udelay(10000);
@@ -307,9 +320,9 @@ static void yp3_analog_enable(unsigned mask)
                | (mask & 2u ? 0xd00u : 0u)
                | (mask & 4u ? 0xd0000u : 0u);
 
-    logf("aud: analog mask=%u 2c=%08lx 30=%08lx 4c=%08lx", mask,
+    logf("aud: analog mask=%u 2c=%08lx 30=%08lx 40=%08lx 4c=%08lx", mask,
          (unsigned long)AUD(0x2c), (unsigned long)AUD(0x30),
-         (unsigned long)AUD(0x4c));
+         (unsigned long)AUD(0x40), (unsigned long)AUD(0x4c));
     logf("aud: analog 50=%08lx 54=%08lx 58=%08lx (bit29 = channel up)",
          (unsigned long)AUD(0x50), (unsigned long)AUD(0x54),
          (unsigned long)AUD(0x58));
@@ -473,7 +486,13 @@ static void yp3_tx_enable(unsigned long rate, bool stereo)
      * 0x400..0x600 window, and the vendor's playback arm sets bit 30 and
      * nothing else, so that is what happens here. */
     v = AUD(0x410);
+#if YP3_AUD_R410
     AUD(0x410) = v | 0x40000000u;
+#else
+    /* Experiment: the window's coefficient RAM is all zeroes, so enabling it
+     * may multiply every sample by nothing. */
+    (void)v;
+#endif
     TXTRACE("r410");
 
     logf("aud: tx ctrl=%08lx fmt=%08lx code=%u vol=%08lx",
