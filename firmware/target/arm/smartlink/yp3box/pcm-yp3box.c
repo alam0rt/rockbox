@@ -203,6 +203,40 @@ yp3_audio_block_init(void)
     field_set(&AUD_RX_MUTE(1), 0x10000u, 0);
     field_set(&AUD_RX_MUTE(2), 0x10000u, 0);
 
+    /* THE VENDOR'S INIT TAIL - what /dev/audio0's open does after
+     * audio_hw_init, recovered by following the caller rather than the
+     * callee (FIRM 0xd67484..0xd67552). Its settings go through the stream
+     * device's set() (0xd7e67e), which forwards straight to audio_ioctl, in
+     * this order:
+     *
+     *   ioctl 90 = 3                channel mask (we already do)
+     *   3,4 = 0; 51,52,53 = 1;      analogue gains and the context flags
+     *   48,49,50 = 0,20,84; 58,59   that gate the per-channel path gains
+     *   27 = 0                      capture volume
+     *   ioctl 2   = 1   0xd7c7e8    FIELD_SET(AUD(0x00), 0x0c000000, 1)
+     *   ioctl 96  = 1   0xd7d252    AUD(0x00) bit 24
+     *   ioctl 128 = 1   0xd7d218    AUD(0x00) bit 5
+     *   ioctl 121 = 1, mdelay(1), ioctl 121 = 0, mdelay(200)
+     *                   0xd7d450    PULSE AUD(0x00) bit 28
+     *
+     * Bit 26 and the bit-28 pulse had never been done by this driver - a
+     * strobe then a 200 ms settle is the shape of a codec reset or reference
+     * charge-up. Everything above the pulse runs at boot in the vendor,
+     * before any stream is opened. */
+    {
+        uint32_t before = AUD(0x00);
+
+        field_set(&AUD(0x00), 0x0c000000u, 1);          /* ioctl 2   */
+        AUD(0x00) |= 1u << 24;                          /* ioctl 96  */
+        AUD(0x00) |= 1u << 5;                           /* ioctl 128 */
+        AUD(0x00) |= 1u << 28;                          /* ioctl 121 = 1 */
+        udelay(1000);
+        AUD(0x00) &= ~(1u << 28);                       /* ioctl 121 = 0 */
+        udelay(200000);
+        logf("aud: vendor init tail 00: %08lx -> %08lx",
+             (unsigned long)before, (unsigned long)AUD(0x00));
+    }
+
     audio_block_up = true;
     logf("aud: init 00=%08lx play(0x200)=%08lx cap(0x100)=%08lx",
          (unsigned long)AUD(0x00), (unsigned long)AUD_TX_CTRL,
