@@ -39,6 +39,8 @@ reset_handler:
      * stacked PC has bit 0 clear because the hardware takes Thumb from xPSR.
      */
     mrs     r0, ipsr
+    mov     r5, r0                  /* kept for bootctl: the frame pop below
+                                       restores r0-r3/r12/lr/pc/xpsr only */
     cmp     r0, #0
     beq     10f                     /* already thread mode: the ROM boot path */
 
@@ -113,6 +115,12 @@ reset_handler:
     ldr     r2, [r2]
 12: str     r2, [r0, #12]
 
+    /* The IPSR we were entered with: 0 for the ROM's own validated boot,
+       the USB exception number (0x39) for smtlink exec. Recorded, because
+       the thread-mode drop above is otherwise only inferred from the absence
+       of a panic. */
+    str     r5, [r0, #28]
+
     /* A pending "go to the bootloader" request: hand the machine straight
        back to the ROM's USB download service, which is what the host talks
        to as 301a:2800. The request is cleared FIRST, so a service that does
@@ -124,6 +132,13 @@ reset_handler:
     bne     14f
     movs    r1, #0
     str     r1, [r0, #4]
+    /* ...unless the host started us with exec. Then the ROM download service
+       is already where we came from, and the host asked for THIS image. In rig
+       mode the ROM never runs crt0 after a reset, so the request a rig reboot
+       leaves behind survives to the next exec - and obeying it there diverts
+       an image the host explicitly started back into a service this hook has
+       never managed to bring up on USB. */
+    cbnz    r5, 14f
     ldr     r4, =0x0004c8a1             /* ROM download service, Thumb */
 13: blx     r4
     b       13b

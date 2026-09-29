@@ -26,7 +26,7 @@ struct yp3_bootctl {
     uint32_t resets;
     uint32_t boots;
     uint32_t rom_wdog_load;
-    uint32_t spare;
+    uint32_t entry_ipsr;   /* 0 = ROM boot, 0x39 = smtlink exec (USB ISR) */
 };
 extern struct yp3_bootctl yp3_bootctl;   /* placed by app.lds, head of .persist */
 

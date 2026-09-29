@@ -153,9 +153,12 @@ void yp3_reboot(void)
  * crt0 acts on the request before it touches anything else.
  *
  * Note this is belt-and-braces with rig mode (tools/53_rig_mode_on.sh): with
- * the HLKJ magic zeroed the ROM lands in the download service on ANY reset and
- * the request is simply ignored. It is what lets a device with a valid boot
- * header still be driven unattended. */
+ * the HLKJ magic zeroed the ROM lands in the download service on ANY reset
+ * without running crt0 - so the request is NOT consumed, it stays in .persist
+ * and the next exec'd image finds it. crt0 ignores it when entered from an
+ * exception (entry_ipsr != 0), because exec means the host chose this image.
+ * The request is what lets a device with a valid boot header still be driven
+ * unattended. */
 void yp3_reboot_to_bootloader(void)
 {
     yp3_bootctl.request = BOOTCTL_REQ_BOOTLDR;

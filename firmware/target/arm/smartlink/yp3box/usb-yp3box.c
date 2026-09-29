@@ -30,6 +30,11 @@
 #include "sdmmc.h"
 #include <string.h>
 #include "sl6801-regs.h"
+#include "yp3-buildstamp.h"
+
+#ifndef YP3_RIG_SECONDS
+#define YP3_RIG_SECONDS 0
+#endif
 #ifdef ROCKBOX_HAS_LOGF
 #define LOGF_ENABLE
 #endif
@@ -626,6 +631,13 @@ int usb_detect(void)
      * between; usb.c debounces over 200 ms anyway. */
     static long next_poll;
     static int detected = USB_EXTRACTED;
+
+    /* A rig build always has the cable in - it is how the host flashes and
+     * reads the ring, all through the boot ROM, never through Rockbox. Left
+     * alone, VBUS sends every rig boot straight into mass-storage mode and
+     * the UI and playback the rig exists to exercise never run. */
+    if (YP3_RIG_SECONDS)
+        return USB_EXTRACTED;
 
     if (TIME_AFTER(current_tick, next_poll)) {
         next_poll = current_tick + HZ / 10;

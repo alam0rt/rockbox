@@ -44,6 +44,10 @@
 #include "version.h"
 #include "yp3-buildstamp.h"
 
+#ifndef YP3_RIG_SECONDS
+#define YP3_RIG_SECONDS 0
+#endif
+
 /* "YP3B", plus a layout revision in the last nibble. BUMP THIS whenever the
  * header or the .persist layout changes: the logf ring sits directly behind
  * this struct, so growing the struct moves the ring, and a stale magic would
@@ -428,8 +432,14 @@ bool blackbox_dump(void)
     bb->reason = BB_NONE;
     bb->msg[0] = '\0';
 #ifdef ROCKBOX_HAS_LOGF
-    logfindex = 0;
-    logfwrap = false;
+    /* Not in a rig build. The dump runs a few seconds into the CURRENT boot,
+     * so clearing here also throws away that boot's own early records - and
+     * the rig reads its evidence out of SRAM, never off the card. Left alone
+     * the ring simply wraps, and the newest records are the ones kept. */
+    if (!YP3_RIG_SECONDS) {
+        logfindex = 0;
+        logfwrap = false;
+    }
 #endif
     return true;
 }
