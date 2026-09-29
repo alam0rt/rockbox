@@ -495,6 +495,33 @@ static void yp3_tx_enable(unsigned long rate, bool stereo)
 #endif
     TXTRACE("r410");
 
+    /* THE PLAYBACK MUTES. Bit 16 of AUD_TX_MUTE(n) (0x224 + n*0x30) is the
+     * per-channel mute: vendor ioctls 31..34 are FIELD_SET(0x40009224 +
+     * n*0x30, 0x10000, arg) at FIRM 0xd7c8fa..0xd7c92c. Those four addresses
+     * appear in FIRM ONLY as those handlers' literals (0xd7caec..0xd7caf8):
+     * audio_hw_init clears the CAPTURE mutes (0x134/0x154/0x174) and never
+     * these. So whatever unmutes playback is the player calling the ioctl -
+     * a step no single-function transcription can see. This driver defined
+     * AUD_TX_MUTE and never read or wrote it. Dump the whole TX file first,
+     * so the cold value is recorded whatever happens next. */
+    {
+        static bool dumped;
+        unsigned o, n;
+
+        if (!dumped) {
+            dumped = true;
+            for (o = 0x200; o < 0x2c0; o += 0x10)
+                logf("aud: tx %03x: %08lx %08lx %08lx %08lx", o,
+                     (unsigned long)AUD(o), (unsigned long)AUD(o + 4),
+                     (unsigned long)AUD(o + 8), (unsigned long)AUD(o + 12));
+        }
+        for (n = 0; n < 4; n++)
+            field_set(&AUD_TX_MUTE(n), 0x10000u, 0);
+        logf("aud: tx mute after clear: %08lx %08lx %08lx %08lx",
+             (unsigned long)AUD_TX_MUTE(0), (unsigned long)AUD_TX_MUTE(1),
+             (unsigned long)AUD_TX_MUTE(2), (unsigned long)AUD_TX_MUTE(3));
+    }
+
     logf("aud: tx ctrl=%08lx fmt=%08lx code=%u vol=%08lx",
          (unsigned long)AUD_TX_CTRL, (unsigned long)AUD_TX_FMT,
          yp3_rate_code(rate), (unsigned long)AUD_TX_VOL(0));
