@@ -83,6 +83,9 @@ SECTIONS
     .bss (NOLOAD) :
     {
         _bssbegin = .;
+        /* IBSS_ATTR (USE_IRAM, see config/yp3box.h). All of SRAM is IRAM
+           here, so it simply joins .bss and is cleared with it. */
+        *(.ibss);
         /* logf.o is excluded: its ring, index and wrap flag go into .persist
            below so they survive a reset. crt0 clears _bssbegin.._bssend. */
         *(EXCLUDE_FILE (*logf.o) .bss*);
@@ -114,6 +117,8 @@ SECTIONS
         . += 32;                        /* struct yp3_bootctl */
         yp3_blackbox = .;
         . += 192;                       /* struct yp3_blackbox */
+        yp3_flashlog = .;
+        . += 16;                        /* quad switch stages, see system-yp3box.c */
         *logf.o(.bss* COMMON);
         _persistend = .;
     } > SRAM

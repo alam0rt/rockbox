@@ -2,6 +2,9 @@
 #include "blackbox.h"
 #include "system-target.h"
 #include "sl6801-regs.h"
+/* YP3_FLASH_QUAD comes from here; without it the #ifndef default wins and
+ * the build flag reaches nothing. */
+#include "yp3-buildstamp.h"
 #ifdef ROCKBOX_HAS_LOGF
 #define LOGF_ENABLE
 #endif
@@ -46,6 +49,78 @@ static void __attribute__((section(".icode"), noinline)) yp3_flash_timing(void)
  * SRAM, so reading it never touches the link under test. */
 #define FLASH_REF_WORDS 128
 static uint32_t yp3_flash_ref[FLASH_REF_WORDS];
+
+/* --- quad I/O reads --------------------------------------------------------
+ *
+ * The boot ROM leaves the XIP window reading with opcode 0x03 on ONE data
+ * line: controller +0x20 = 0x02a09503, the mode-0 word from ROM 0x832c. The
+ * vendor bootloader switches to quad at 0x820808 (loaded from flash 0x60 at
+ * 0x81fbc0), and FIRM repeats it at 0xc0ee38:
+ *
+ *   GPIO0 +0x00 = (old & 0xff000000) | 0x00222222   flash pins 0..5, mode 2
+ *   read JEDEC id, accept 0x146085 / 0x156085 / 0x1540c8
+ *   read status register 2; if QE (bit 1) is clear, WRITE it (non-volatile)
+ *   ctx[0x20] = 2, ctx[0x0c] = 0x00a6bdeb           ROM flash ctx at 0x800938
+ *   +0x20 = 0x02a6bdeb                              quad I/O read, opcode 0xEB
+ *
+ * Measured from the host on this device (payloads/quadprobe.c, 2026-09-29):
+ * id 0x156085 (Puya P25Q16), SR2 = 0x02 so QE is ALREADY set - the stock
+ * bootloader left it that way - and quad reads are byte-identical to 1-bit
+ * over 64 KB, 2.06x faster on raw sequential fetches. So this does not issue
+ * the id/status commands and never writes the chip: it verifies by content
+ * instead, and backs out on any mismatch.
+ *
+ * .icode, because it changes how every flash fetch is made. yp3_flashlog is
+ * in .persist and gets a stage word BEFORE each step, so a boot that dies
+ * here still says where. */
+#ifndef YP3_FLASH_QUAD
+#define YP3_FLASH_QUAD 1
+#endif
+#define GPIO0_MODE      REG32(0x40081000u)
+#define XIPC(o)         REG32(0x30000000u + (o))
+#define FLASH_CTX(o)    REG32(0x00800938u + (o))
+#define XIP_CMD_1BIT    0x02a09503u
+#define XIP_CMD_QUAD    0x02a6bdebu
+
+extern volatile uint32_t yp3_flashlog[4];   /* app.lds, in .persist */
+
+#if YP3_FLASH_QUAD
+static int __attribute__((section(".icode"), noinline)) yp3_flash_quad(void)
+{
+    const volatile uint32_t *p = (const volatile uint32_t *)0x00c10000u;
+    uint32_t g = GPIO0_MODE, c = XIPC(0x20), primask;
+    unsigned i;
+    int ok = 1;
+
+    __asm__ volatile ("mrs %0, primask\n cpsid i" : "=r"(primask) :: "memory");
+    yp3_flashlog[0] = 0x51ad0001u;              /* 1: capturing reference */
+    yp3_flashlog[1] = g;
+    yp3_flashlog[3] = c;
+    for (i = 0; i < FLASH_REF_WORDS; i++)
+        yp3_flash_ref[i] = p[i];
+
+    yp3_flashlog[0] = 0x51ad0002u;              /* 2: switched, verifying */
+    GPIO0_MODE = (g & 0xff000000u) | 0x00222222u;
+    XIPC(0x20) = XIP_CMD_QUAD;
+    __asm__ volatile ("dsb\n isb" ::: "memory");
+    for (i = 0; i < FLASH_REF_WORDS; i++)
+        if (p[i] != yp3_flash_ref[i])
+            ok = 0;
+
+    if (ok) {
+        FLASH_CTX(0x20) = 2;
+        FLASH_CTX(0x0c) = 0x00a6bdebu;
+    } else {
+        XIPC(0x20) = c;
+        GPIO0_MODE = g;
+        __asm__ volatile ("dsb\n isb" ::: "memory");
+    }
+    yp3_flashlog[2] = ok;
+    yp3_flashlog[0] = 0x51ad0003u;              /* 3: done */
+    __asm__ volatile ("msr primask, %0" :: "r"(primask) : "memory");
+    return ok;
+}
+#endif
 static void __attribute__((section(".icode"), noinline))
 yp3_flash_set_div(unsigned div)
 {
@@ -222,6 +297,9 @@ static void __attribute__((section(".icode"), noinline)) yp3_clock_init(void)
 #endif
     for (d = 0; d < 100000u; d++) ;
 #endif
+#if YP3_FLASH_QUAD
+    yp3_flash_quad();
+#endif
 
     /* The clock tree is now configured for the 192 MHz core clock used by
      * udelay(). */
@@ -274,19 +352,42 @@ yp3_spin_sram(uint32_t n)
     SPIN_BODY(n);
 }
 
+/* Returns 0xffffffff if SysTick wrapped, rather than a small wrong number.
+ * The first version of this reported flash=47248 for a loop that really took
+ * ~16.8M cycles: 24 bits wrap at 16.7M, and "0.39x - flash faster than SRAM"
+ * was the remainder. COUNTFLAG (CSR bit 16) is set on any reload and cleared
+ * by reading CSR, so it is read once before starting and once at the end. */
 static uint32_t yp3_time_spin(void (*fn)(uint32_t), uint32_t n)
 {
-    uint32_t a, b;
+    uint32_t a, b, csr;
 
     SYSTICK_CSR = 0;
     SYSTICK_RVR = 0x00ffffffu;
     SYSTICK_CVR = 0;
     SYSTICK_CSR = 5u;                   /* core clock, no interrupt, enable */
+    (void)SYSTICK_CSR;                  /* clear COUNTFLAG */
     a = SYSTICK_CVR;
     fn(n);
     b = SYSTICK_CVR;
+    csr = SYSTICK_CSR;
     SYSTICK_CSR = 0;
+    if (csr & (1u << 16))
+        return 0xffffffffu;
     return (a - b) & 0x00ffffffu;       /* SysTick counts DOWN */
+}
+
+/* 64 KB of sequential DATA reads through the XIP window, from .icode so the
+ * loop's own fetches are not in the measurement. The host probe measured the
+ * same thing under the boot ROM: 1-bit 373 cycles/word, quad 181. */
+static uint32_t yp3_read_sum;
+static void __attribute__((section(".icode"), noinline))
+yp3_read_flash(uint32_t base)
+{
+    uint32_t s = 0, a;
+
+    for (a = base; a < base + 0x10000u; a += 4)
+        s += REG32(a);
+    yp3_read_sum = s;
 }
 
 static void yp3_measure_speed(void)
@@ -301,18 +402,31 @@ static void yp3_measure_speed(void)
              (unsigned long)ROM_CLK_FREQ(ids[i]));
     logf("flash: divider %lu held (12 = the 32 MHz floor)",
          (unsigned long)yp3_flash_div);
+    logf("flash: read cmd %08lx (%s) gpio0 %08lx, quad stage %08lx ok=%lu",
+         (unsigned long)XIPC(0x20),
+         XIPC(0x20) == XIP_CMD_QUAD ? "quad" :
+         XIPC(0x20) == XIP_CMD_1BIT ? "1-bit" : "?",
+         (unsigned long)GPIO0_MODE, (unsigned long)yp3_flashlog[0],
+         (unsigned long)yp3_flashlog[2]);
     for (i = 0; i < yp3_flash_rungs; i++)
         logf("flash: div=%lu -> %lu Hz %s",
              (unsigned long)yp3_flash_rung_div[i],
              (unsigned long)yp3_flash_rung_hz[i],
              yp3_flash_rung_ok[i] ? "OK" : "bad");
 
-    /* 20000 iterations is long enough to swamp the call overhead and short
-     * enough not to overflow SysTick's 24 bits even at a heavy XIP penalty. */
-    sram_cyc  = yp3_time_spin(yp3_spin_sram, 20000u);
-    flash_cyc = yp3_time_spin(yp3_spin_flash, 20000u);
-    logf("speed: sram=%lu cyc flash=%lu cyc for 20000 iters",
+    logf("flash: ctl %08lx +04 %08lx +08 %08lx +24 %08lx sys+04 %08lx +08 %08lx",
+         (unsigned long)XIPC(0x00), (unsigned long)XIPC(0x04),
+         (unsigned long)XIPC(0x08), (unsigned long)XIPC(0x24),
+         (unsigned long)REG32(0x40000004u), (unsigned long)REG32(0x40000008u));
+
+    /* 2000 iterations: at the ~840 cycles/iteration XIP actually costs, 20000
+     * wrapped SysTick. yp3_time_spin now says so instead of lying. */
+    sram_cyc  = yp3_time_spin(yp3_spin_sram, 2000u);
+    flash_cyc = yp3_time_spin(yp3_spin_flash, 2000u);
+    logf("speed: sram=%lu cyc flash=%lu cyc for 2000 iters",
          (unsigned long)sram_cyc, (unsigned long)flash_cyc);
+    logf("speed: 64KB data read from flash = %lu cyc (-1 = wrapped)",
+         (unsigned long)yp3_time_spin(yp3_read_flash, 0x00c40000u));
     if (sram_cyc)
         logf("speed: XIP penalty = %lu.%02lux",
              (unsigned long)(flash_cyc / sram_cyc),

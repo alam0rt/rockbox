@@ -81,6 +81,23 @@
 #define HAVE_SW_VOLUME_CONTROL
 #define HAVE_SW_TONE_CONTROLS
 
+/* ICODE_ATTR into SRAM, for the core only.
+ *
+ * config.h picks USE_IRAM per CPU and this one is not on its list, so every
+ * function Rockbox marks as hot - the DSP, the resampler, pcmbuf, the mixer,
+ * the LCD blitters - stayed in SPI NOR. Measured on this part (2026-09-29,
+ * system-yp3box.c yp3_measure_speed): each instruction fetch from flash is its
+ * own SPI transaction, 262x the SRAM cost at 1-bit and 132x in quad, and a
+ * sampling profile put 0.1% of the CPU in the codec. config.h only ever ADDS
+ * USE_IRAM, and it includes this file first, so defining it here enables the
+ * attributes without touching shared code.
+ *
+ * Core only, as for IMX233 and JZ47xx: codecs already execute from codecbuf,
+ * which is SRAM, and no plugins are built. */
+#if !defined(PLUGIN) && !defined(CODEC) && !defined(BOOTLOADER)
+#define USE_IRAM
+#endif
+
 /* Codecs are loaded into codecbuf, so CODEC_SIZE has to be at least as large as
  * the biggest codec we intend to play. Measured on an ARM build (text+data+bss,
  * which is what gets loaded):
