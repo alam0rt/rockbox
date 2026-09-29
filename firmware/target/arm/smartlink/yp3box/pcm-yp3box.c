@@ -696,8 +696,20 @@ void yp3_dma2_irq(void)
         const void *addr;
         size_t size;
 
-        if (pcm_play_dma_complete_callback(PCM_DMAST_OK, &addr, &size))
+        if (pcm_play_dma_complete_callback(PCM_DMAST_OK, &addr, &size)) {
             yp3_dma_play(addr, size);
+            /* The half of the protocol this driver was missing for weeks.
+             * With PCM_SINK_SWVOL, complete_callback only hands back the
+             * CURRENT double-buffer half; the NEXT half is filled - and the
+             * mixer asked for more samples - in the STARTED status callback,
+             * which every other sink driver calls right after starting the
+             * transfer (pcm-jz4760.c, pcm-x1000.c, pcm-coldfire.c). Without
+             * it the DMA replayed one 1 KB buffer forever: 6393 completions,
+             * pcmbuf's read index still 0, and the codec parked in
+             * codec_pcmbuf_insert_callback waiting for space that never
+             * came - which is what "the codec runs at 1% speed" really was. */
+            pcm_play_dma_status_callback(PCM_DMAST_STARTED);
+        }
     }
 }
 
@@ -803,13 +815,43 @@ static void sink_unlock(void)
     yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);
 }
 
+/* Playback dynamics, once a second for the first 40 s after the first
+ * sink_play. The end-of-run snapshot after the STARTED fix said the sink now
+ * advances but the DMA stopped after 531 transfers with one restart - an
+ * underrun, or a stop that never recovers - and one snapshot cannot tell those
+ * apart. Tick context, like the black box's t= beacon. The pcmbuf/mixer
+ * accessors live in apps/ and are declared here only for this diagnostic. */
+extern size_t pcmbuf_free(void);
+extern int pcmbuf_used_descs(void);
+static int pcm_beacon_left;
+
+static void pcm_beacon(void)
+{
+    static long next;
+
+    if (pcm_beacon_left <= 0 || TIME_BEFORE(current_tick, next))
+        return;
+    next = current_tick + HZ;
+    pcm_beacon_left--;
+    logf("pcmb: irqs=%lu plays=%lu playing=%d mix=%d free=%lu descs=%d",
+         (unsigned long)pcm_irqs, (unsigned long)pcm_plays,
+         (int)pcm_is_playing(), (int)mixer_channel_status(PCM_MIXER_CHAN_PLAYBACK),
+         (unsigned long)pcmbuf_free(), pcmbuf_used_descs());
+}
+
 static void sink_play(const void *addr, size_t size)
 {
+    if (pcm_plays == 0) {
+        pcm_beacon_left = 40;
+        tick_add_task(pcm_beacon);
+    }
+
     if (!tx_running)
         sink_set_freq(0);
 
     yp3_dma_play(addr, size);
     yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);     /* vendor priority is 2 */
+    pcm_play_dma_status_callback(PCM_DMAST_STARTED);    /* see yp3_dma2_irq */
 
     /* Amplifier last, once samples are already flowing, so it is not powered
      * up into a silent line. */
@@ -867,8 +909,16 @@ static void sink_stop(void)
      * bit 30 is the start. */
     yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));
     DMA_CTRL(PCM_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
-    yp3_tx_disable();
-    tx_running = false;
+
+    /* The transmitter stays up. Measured 2026-09-29 with a 1 Hz beacon: the
+     * first start worked, and every start after a stop armed the DMA and never
+     * got another completion. yp3_tx_disable clears 0xb from the channel
+     * words and the re-enable only ORs 3 back, so bit 3 - present from cold
+     * reset, and set on the one start that has ever worked - never returned
+     * (ch0=0000000b first time, 00000003 after), and 0x208's status bits said
+     * the transmitter was no longer requesting (20040584 -> 00040084). The
+     * restart is now exactly the re-arm yp3_dma2_irq does thousands of times
+     * a run. Tearing the block down properly waits on knowing what bit 3 is. */
 }
 
 /* ==========================================================================

@@ -27,6 +27,19 @@ OUTPUT_ARCH(arm)
 #define FLASH_XIP   0x00c0e000
 #define FLASH_END   0x00dfc000
 
+/* Hot code copied into SRAM by crt0 with .data, chosen by the YP3_PROFILE
+ * sampler rather than by guessing (2026-09-29). With playback working, 49% of
+ * ALL CPU was resample_hermite and 9% dsp_sample_input, both executing from
+ * SPI NOR at ~132x the SRAM cost, and 15% the scheduler. These nine objects
+ * are ~10 KB of code. Archive members are named exactly: "*thread.o" would
+ * also catch codec_thread.o and audio_thread.o. */
+#define SRAM_HOT \
+    *libfirmware.a:thread.o *libfirmware.a:pcm_mixer.o \
+    *libfirmware.a:pcm_sw_volume.o *pcmbuf.o \
+    *librbcodec.a:resample.o *librbcodec.a:dsp_core.o \
+    *librbcodec.a:dsp_sample_input.o *librbcodec.a:dsp_sample_output.o \
+    *librbcodec.a:dsp_misc.o
+
 MEMORY
 {
     FLASH (rx)  : ORIGIN = FLASH_XIP, LENGTH = FLASH_END - FLASH_XIP
@@ -44,8 +57,8 @@ SECTIONS
         . = ALIGN(4);
         *(.init.text*);
         *(.init*);
-        *(.text*);
-        *(.rodata*);
+        *(EXCLUDE_FILE(SRAM_HOT) .text*);
+        *(EXCLUDE_FILE(SRAM_HOT) .rodata*);
         . = ALIGN(4);
     } > FLASH
 
@@ -58,6 +71,17 @@ SECTIONS
         . = ALIGN(4);
         _datastart = .;
         *(.icode);
+        /* SRAM_HOT, one statement per file: ld takes one section list per
+           file pattern. Keep in step with the macro above. */
+        *libfirmware.a:thread.o(.text* .rodata*);
+        *libfirmware.a:pcm_mixer.o(.text* .rodata*);
+        *libfirmware.a:pcm_sw_volume.o(.text* .rodata*);
+        *pcmbuf.o(.text* .rodata*);
+        *librbcodec.a:resample.o(.text* .rodata*);
+        *librbcodec.a:dsp_core.o(.text* .rodata*);
+        *librbcodec.a:dsp_sample_input.o(.text* .rodata*);
+        *librbcodec.a:dsp_sample_output.o(.text* .rodata*);
+        *librbcodec.a:dsp_misc.o(.text* .rodata*);
         *(.irodata);
         *(.idata);
         . = ALIGN(4);

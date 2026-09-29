@@ -6,6 +6,12 @@
 #include "system.h"
 #include "sl6801-regs.h"
 #include "lcd-target.h"
+#include "kernel.h"
+#include "yp3-buildstamp.h"
+#ifdef ROCKBOX_HAS_LOGF
+#define LOGF_ENABLE
+#endif
+#include "logf.h"
 
 /* Bounded waits prevent a dead LCDC from hanging the whole boot. */
 /* LCDC operations run from SRAM because XIP fetches can stall during setup. */
@@ -264,19 +270,244 @@ static void lcd_set_window(int x, int y, int w, int h)
     wd8(x0 >> 8); wd8(x0 & 0xff); wd8(x1 >> 8); wd8(x1 & 0xff);
     lcd_write_cmd(0x2b);
     wd8(y0 >> 8); wd8(y0 & 0xff); wd8(y1 >> 8); wd8(y1 & 0xff);
-    lcd_write_cmd(0x2c);
 }
 
-void LCDICODE lcd_update_rect(int x, int y, int width, int height)
+/* --- pixels by DMA -----------------------------------------------------------
+ *
+ * The PIO path below sends ONE PIXEL per LCDC transaction and busy-waits each
+ * one: 20,480 kick/wait pairs a frame. The sampling profiler (YP3_PROFILE,
+ * 2026-09-29) put ~40% of all CPU time in lcdc_wait_idle/lcdc_kick and 0.1% in
+ * the codec, which is why playback starves.
+ *
+ * The vendor sets the window by PIO and streams the pixels by DMA - its
+ * transfer routine is SRAM 0x815aba(dev, cmd, cmdlen, buf, nbytes):
+ *
+ *   base[0x24] = cmd;  base[0x28] = nbytes - 1      nbytes <= 4096
+ *   wait !(status & 0x60000000)
+ *   base[0x10] = (base[0x10] & ~0x30) | 8           FIFO fed by DMA
+ *   dma_start(tx, src = buf, dst = base + 0x34, nbytes)
+ *   base[0x20] = (base[0x20] & ~0x30e) | ((cmdlen - 1) << 8) | 1
+ *
+ * The channel is the vendor's LCD TX channel as captured live in
+ * probe/dma_work.bin and decoded in docs/DMA.md: channel 0, control
+ * 0x001a0289 (16-bit memory source, 32-bit destination, request line 9),
+ * length config 0x13000000, config 0x00080002.
+ *
+ * This path was abandoned on 2026-08-21 ("the DMA channel does not transfer"),
+ * before the DMA engine was decoded for audio and before the panel itself
+ * worked. It has not been tried on a working display before this.
+ *
+ * Pixels are byte-swapped into SRAM bounce buffers, exactly as the PIO path
+ * swaps each pixel: DMA sources must be SRAM anyway (CLAUDE.md), and the swap
+ * of chunk k+1 overlaps the transfer of chunk k.
+ *
+ * While a chunk is in flight the CPU YIELDS, which is the point: the codec
+ * runs while the panel is fed. Only from thread context with interrupts on and
+ * the kernel ticking; anywhere else it spins, bounded, as the PIO path does.
+ * A chunk that has not finished in 100 ms is logged, the channel stopped, and
+ * the rest of the boot falls back to PIO - a bad DMA path costs a log line,
+ * not a dead display.
+ *
+ * MEASURED 2026-09-29, and it is OFF by default: the panel kept showing the
+ * last PIO frame. The first-chunk dump says the channel accepts GO and clears
+ * it, but its length register never leaves 0x1000, and the LCDC raises DONE
+ * within ~2000 loop iterations of the kick - far too soon for 4 KB on an
+ * 8-bit bus. That is the 2026-08-21 result again: the LCDC finishes an empty
+ * transaction because it never raises request line 9. The channel descriptor
+ * matches the vendor's (FIRM 0xd7e044) field for field and the LCDC's
+ * +0x10/+0x40/+0x44 match stock, so the missing enable is somewhere in the
+ * vendor's LCD open path, not in anything this file already writes. */
+#ifndef YP3_LCD_DMA
+#define YP3_LCD_DMA 0
+#endif
+#define LCD_DMA_CH          0
+#define LCD_DMA_CTRL        0x001a0289u
+#define LCD_DMA_LENCFG      0x13000000u
+#define LCD_DMA_CFG         0x00080002u
+#define LCDC_FIFO           (LCDC_BASE + 0x34)
+#define LCD_CHUNK_PIX       2048                /* 4096 bytes, the vendor cap */
+
+#if YP3_LCD_DMA
+static uint16_t lcd_bounce[2][LCD_CHUNK_PIX] __attribute__((aligned(4)));
+#else
+static uint16_t lcd_bounce[2][1];   /* 8 KB of SRAM is not spent on a path that is off */
+#endif
+static bool lcd_dma_ok = YP3_LCD_DMA;
+static bool lcd_dma_ready;
+static unsigned long lcd_dma_frames, lcd_pio_frames;
+static long lcd_dma_t0, lcd_pio_t0;
+
+static void lcd_dma_open(void)
+{
+    DMA_CTRL(LCD_DMA_CH) &= ~DMA_CTRL_GO;
+    DMA_CTRL(LCD_DMA_CH)  = LCD_DMA_CTRL;
+    DMA_LEN(LCD_DMA_CH)   = LCD_DMA_LENCFG;
+    DMA_IRQST(LCD_DMA_CH) = DMA_IRQST(LCD_DMA_CH);
+    DMA_CFG(LCD_DMA_CH)   = (DMA_CFG(LCD_DMA_CH) & 0x3fffu) | LCD_DMA_CFG;
+    lcd_dma_ready = true;
+}
+
+/* Thread context, interrupts on, kernel ticking: the only place yield() is
+ * safe. lcd_update is also reached from panicf and early boot. */
+static bool lcd_may_yield(void)
+{
+    uint32_t ipsr, primask;
+
+    __asm__ volatile ("mrs %0, ipsr" : "=r"(ipsr));
+    __asm__ volatile ("mrs %0, primask" : "=r"(primask));
+    return ipsr == 0 && primask == 0 && current_tick > HZ;
+}
+
+/* Swap n pixels of the rect starting at pixel index `first` into dst. */
+static void LCDICODE lcd_fill_bounce(uint16_t *dst, int x, int y, int w,
+                                     int first, int n)
+{
+    int r = first / w, c = first % w;
+    const fb_data *p = FBADDR(x + c, y + r);
+
+    while (n--) {
+        unsigned v = *p++;
+        *dst++ = (uint16_t)(((v & 0xff) << 8) | (v >> 8));
+        if (++c == w) {
+            c = 0;
+            r++;
+            p = FBADDR(x, y + r);
+        }
+    }
+}
+
+static bool lcd_dma_wait(bool yield_ok)
+{
+    long deadline = current_tick + HZ / 10;
+    uint32_t spins = 0;
+
+    while (!(LCDC_STATUS & LCDC_ST_DONE)) {
+        if (yield_ok) {
+            if (TIME_AFTER(current_tick, deadline))
+                return false;
+            yield();
+        } else if (++spins > 4u * LCDC_SPIN) {
+            return false;
+        }
+    }
+    LCDC_STATUS = LCDC_ST_DONE;
+    DMA_IRQST(LCD_DMA_CH) = DMA_IRQST(LCD_DMA_CH);
+    return true;
+}
+
+/* One-shot record of the first chunk: does the channel MOVE bytes? On
+ * 2026-08-21 the length register never decremented and DONE was the LCDC
+ * finishing an empty transaction; today the panel again shows a stale image
+ * while every chunk reports DONE. dma_get_remaining (SRAM 0x814d1c) is
+ * ch[0x0c] & 0x3ffff, so a moving channel counts down. */
+static bool lcd_dma_dumped;
+static uint32_t lcd_dd[12];
+
+static bool lcd_update_rect_dma(int x, int y, int w, int h)
+{
+    int total = w * h, sent = 0, k = 0;
+    bool yield_ok = lcd_may_yield();
+
+    if (!lcd_dma_ready)
+        lcd_dma_open();
+
+    lcd_set_window(x, y, w, h);
+    lcd_fill_bounce(lcd_bounce[0], x, y, w, 0,
+                    total < LCD_CHUNK_PIX ? total : LCD_CHUNK_PIX);
+
+    while (sent < total) {
+        int n = total - sent;
+        unsigned nbytes;
+
+        if (n > LCD_CHUNK_PIX)
+            n = LCD_CHUNK_PIX;
+        nbytes = (unsigned)n * 2u;
+
+        LCDC_CMD = sent ? 0x3c : 0x2c;          /* RAMWR, then continue */
+        LCDC_DATALEN = nbytes - 1u;
+        lcdc_wait_idle();
+        LCDC_CFG10 = (LCDC_CFG10 & ~0x30u) | 8u;
+
+        DMA_DST(LCD_DMA_CH) = LCDC_FIFO;
+        DMA_SRC(LCD_DMA_CH) = (uint32_t)lcd_bounce[k];
+        DMA_LEN(LCD_DMA_CH) = (DMA_LEN(LCD_DMA_CH) & ~DMA_LEN_MASK) | nbytes;
+        DMA_CTRL(LCD_DMA_CH) = (DMA_CTRL(LCD_DMA_CH) & ~DMA_CTRL_CONT)
+                             | DMA_CTRL_GO;
+        if (!lcd_dma_dumped) {
+            lcd_dd[0] = DMA_LEN(LCD_DMA_CH);
+            lcd_dd[1] = DMA_CTRL(LCD_DMA_CH);
+            lcd_dd[2] = DMA_IRQST(LCD_DMA_CH);
+            lcd_dd[3] = LCDC_STATUS;
+            lcd_dd[4] = LCDC_CFG10;
+        }
+        LCDC_CTRL = (LCDC_CTRL & ~0x30cu & ~0x2u) | 1u;     /* cmdlen 1 */
+        if (!lcd_dma_dumped) {
+            volatile uint32_t d;
+            for (d = 0; d < 2000u; d++) ;
+            lcd_dd[5] = DMA_LEN(LCD_DMA_CH);        /* shortly after the kick */
+            lcd_dd[6] = LCDC_DATALEN;
+            lcd_dd[7] = LCDC_STATUS;
+        }
+
+        /* Prepare the next chunk while this one is on the wire. */
+        if (sent + n < total) {
+            int m = total - sent - n;
+            lcd_fill_bounce(lcd_bounce[k ^ 1], x, y, w, sent + n,
+                            m < LCD_CHUNK_PIX ? m : LCD_CHUNK_PIX);
+        }
+
+        if (!lcd_dma_wait(yield_ok)) {
+            DMA_CTRL(LCD_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
+            logf("lcd: DMA chunk timed out at %d/%d px, st=%08lx dma ctrl=%08lx "
+                 "len=%08lx irq=%08lx - PIO from now on", sent, total,
+                 (unsigned long)LCDC_STATUS, (unsigned long)DMA_CTRL(LCD_DMA_CH),
+                 (unsigned long)DMA_LEN(LCD_DMA_CH),
+                 (unsigned long)DMA_IRQST(LCD_DMA_CH));
+            lcd_dma_ok = false;
+            return false;
+        }
+        if (!lcd_dma_dumped) {
+            lcd_dd[8]  = DMA_LEN(LCD_DMA_CH);
+            lcd_dd[9]  = DMA_CTRL(LCD_DMA_CH);
+            lcd_dd[10] = LCDC_CTRL;
+            lcd_dd[11] = LCDC_DATALEN;
+            lcd_dma_dumped = true;
+            logf("lcd dma: armed len=%08lx ctrl=%08lx irq=%08lx lst=%08lx cfg10=%08lx",
+                 (unsigned long)lcd_dd[0], (unsigned long)lcd_dd[1],
+                 (unsigned long)lcd_dd[2], (unsigned long)lcd_dd[3],
+                 (unsigned long)lcd_dd[4]);
+            logf("lcd dma: kicked len=%08lx dlen=%08lx lst=%08lx",
+                 (unsigned long)lcd_dd[5], (unsigned long)lcd_dd[6],
+                 (unsigned long)lcd_dd[7]);
+            logf("lcd dma: done len=%08lx ctrl=%08lx lctrl=%08lx dlen=%08lx",
+                 (unsigned long)lcd_dd[8], (unsigned long)lcd_dd[9],
+                 (unsigned long)lcd_dd[10], (unsigned long)lcd_dd[11]);
+        }
+        sent += n;
+        k ^= 1;
+    }
+    return true;
+}
+
+/* PIO redraws YIELD every 8 rows. A full frame takes ~69 ms of busy-waited
+ * per-pixel transfers, and the codec thread shares priority 16 with main:
+ * the 2026-09-29 beacon showed one MP3 frame decoded per ~1.5 s while main
+ * held the CPU through redraws. Yielding mid-frame lets another priority-16
+ * thread run while the panel window is half written - and the scroll and
+ * backlight threads are priority 16 and draw - so redraws are serialised:
+ * a second one waits (yielding) for the first to finish. */
+static volatile bool lcd_xfer_busy;
+
+static void LCDICODE lcd_update_rect_pio(int x, int y, int width, int height,
+                                         bool yield_ok)
 {
     int r, c;
 
-    if (x + width > LCD_WIDTH) width = LCD_WIDTH - x;
-    if (y + height > LCD_HEIGHT) height = LCD_HEIGHT - y;
-    if (width <= 0 || height <= 0) return;
-
     lcd_set_window(x, y, width, height);
+    lcd_write_cmd(0x2c);
     for (r = 0; r < height; r++) {
+        if (yield_ok && r && !(r & 7))
+            yield();
         const fb_data *p = FBADDR(x, y + r);
         for (c = 0; c < width; c++) {
             unsigned v = *p++;
@@ -287,6 +518,42 @@ void LCDICODE lcd_update_rect(int x, int y, int width, int height)
             lcd_write_data_n(((v & 0xff) << 8) | (v >> 8), 2);
         }
     }
+}
+
+void lcd_update_rect(int x, int y, int width, int height)
+{
+    bool full;
+
+    if (x + width > LCD_WIDTH) width = LCD_WIDTH - x;
+    if (y + height > LCD_HEIGHT) height = LCD_HEIGHT - y;
+    if (width <= 0 || height <= 0) return;
+
+    /* Full-frame timings, one number per path: the first 16 of each. */
+    full = (width == LCD_WIDTH && height == LCD_HEIGHT);
+
+    if (lcd_dma_ok && lcd_update_rect_dma(x, y, width, height)) {
+        if (full && lcd_dma_frames < 16 && lcd_dma_frames++ == 0)
+            lcd_dma_t0 = current_tick;
+        else if (full && lcd_dma_frames == 16)
+            logf("lcd: DMA, 15 full frames in %ld ticks",
+                 current_tick - lcd_dma_t0), lcd_dma_frames++;
+        return;
+    }
+    {
+        bool yield_ok = lcd_may_yield();
+
+        if (yield_ok)
+            while (lcd_xfer_busy)
+                yield();
+        lcd_xfer_busy = true;
+        lcd_update_rect_pio(x, y, width, height, yield_ok);
+        lcd_xfer_busy = false;
+    }
+    if (full && lcd_pio_frames < 16 && lcd_pio_frames++ == 0)
+        lcd_pio_t0 = current_tick;
+    else if (full && lcd_pio_frames == 16)
+        logf("lcd: PIO, 15 full frames in %ld ticks",
+             current_tick - lcd_pio_t0), lcd_pio_frames++;
 }
 
 void lcd_update(void)

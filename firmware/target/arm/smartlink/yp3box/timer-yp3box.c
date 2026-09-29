@@ -55,12 +55,17 @@ void yp3_systick_body(void)
 #define PROF_CODEC_SHIFT 8              /* 256-byte buckets */
 #define PROF_CODEC_SPAN  0x00020000u    /* 128 KB of codecbuf is plenty */
 #define PROF_ICODE_BASE 0x00806000u
-#define PROF_ICODE_SPAN 0x00004000u
+#define PROF_ICODE_SPAN 0x00008000u
 #define PROF_ICODE_SHIFT 5              /* 32-byte buckets */
 
 extern unsigned char codecbuf[];
 uint32_t yp3_prof_region[8];
 uint16_t yp3_prof_icode[PROF_ICODE_SPAN >> PROF_ICODE_SHIFT];
+/* Which thread was running, by slot (thread_self() & 0xff). With the LCD
+ * busy-wait gone the codec STILL got 0.1% and the scheduler 23%, so the
+ * question is no longer "where is the PC" but "whose turn is it". The host
+ * names the slots from __threads[] and the ELF. */
+uint16_t yp3_prof_thread[32];
 uint32_t yp3_prof_total;
 uint16_t yp3_prof_flash[(PROF_FLASH_END - PROF_FLASH_BASE) >> PROF_FLASH_SHIFT];
 uint16_t yp3_prof_codec[PROF_CODEC_SPAN >> PROF_CODEC_SHIFT];
@@ -70,6 +75,9 @@ void __attribute__((section(".icode"), used)) yp3_prof_sample(uint32_t pc)
     uint32_t cb = (uint32_t)codecbuf, i;
 
     yp3_prof_total++;
+    i = thread_self() & 0xffu;
+    if (i < 32 && yp3_prof_thread[i] != 0xffffu)
+        yp3_prof_thread[i]++;
     if (pc >= PROF_FLASH_BASE && pc < PROF_FLASH_END) {
         yp3_prof_region[0]++;
         i = (pc - PROF_FLASH_BASE) >> PROF_FLASH_SHIFT;
