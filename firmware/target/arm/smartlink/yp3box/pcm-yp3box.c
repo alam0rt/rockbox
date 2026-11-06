@@ -687,6 +687,54 @@ static int16_t st_tone[ST_FRAMES * 2] __attribute__((aligned(4)));
 static volatile bool st_active;
 static volatile uint32_t st_irqs;
 void yp3_audio_selftest(void);       /* defined at the foot of this file */
+
+/* A register snapshot taken while the self-test tone is playing, in .persist
+ * so the rig reads it out after the reboot along with the log ring
+ * (tools/regsnap.py). The windows are the ones tools/56_capture_stock.sh reads
+ * from the vendor firmware while IT plays, so the two diff word for word -
+ * the vendor's live state is the one piece of evidence about this block that
+ * is not a transcription. Self-test builds only: 3 KB of SRAM. */
+#define SNAP_MAGIC  0x50414e53u     /* "SNAP" */
+struct yp3_regsnap {
+    uint32_t magic, seq, tick, tag;
+    uint32_t aud[0x600 / 4];        /* 0x40009000 */
+    uint32_t dma[0x40 / 4];         /* 0x40001000 + 0x40 * PCM_DMA_CH */
+    uint32_t gpio[0x200 / 4];       /* 0x40081000 */
+    uint32_t clk80[0x200 / 4];      /* 0x40080000 */
+    uint32_t clk85[0x200 / 4];      /* 0x40085000 */
+};
+struct yp3_regsnap yp3_regsnap __attribute__((section(".yp3snap")));
+
+static void snap_window(uint32_t *dst, uint32_t base, unsigned bytes)
+{
+    unsigned i;
+
+    for (i = 0; i < bytes / 4; i++) {
+        uint32_t a = base + i * 4;
+        /* Never read a FIFO: a read pops it. */
+        dst[i] = (a == 0x4000910cu || a == 0x4000920cu) ? 0xf1f0f1f0u
+                                                         : REG32(a);
+    }
+}
+
+static void yp3_regsnap_take(uint32_t tag)
+{
+    struct yp3_regsnap *r = &yp3_regsnap;
+
+    if (r->magic != SNAP_MAGIC)
+        r->seq = 0;
+    r->magic = 0;                   /* invalid while half-written */
+    snap_window(r->aud, 0x40009000u, sizeof r->aud);
+    snap_window(r->dma, 0x40001000u + 0x40u * PCM_DMA_CH, sizeof r->dma);
+    snap_window(r->gpio, 0x40081000u, sizeof r->gpio);
+    snap_window(r->clk80, 0x40080000u, sizeof r->clk80);
+    snap_window(r->clk85, 0x40085000u, sizeof r->clk85);
+    r->tick = current_tick;
+    r->tag = tag;
+    r->seq++;
+    r->magic = SNAP_MAGIC;
+    logf("snap: %c taken, seq %lu", (int)tag, (unsigned long)r->seq);
+}
 #else
 /* The interrupt's log guard reads this whether or not the test is built. */
 #define st_active false
@@ -1350,6 +1398,8 @@ void yp3_audio_selftest(void)
     for (k = 0; k < 5; k++) {
         st_path_gain(gain[k]);
         st_fill(SAMPR_44, freq[k]);
+        if (k == 4)
+            yp3_regsnap_take('E');  /* loudest rung, tone running */
         logf("st: %c path-gain=%u %uHz 08=%08lx 0c=%08lx", 'A' + k, gain[k],
              freq[k], (unsigned long)AUD(0x08), (unsigned long)AUD(0x0c));
         st_wait_ms(3000);

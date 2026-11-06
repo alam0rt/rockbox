@@ -144,6 +144,11 @@ SECTIONS
         yp3_flashlog = .;
         . += 16;                        /* quad switch stages, see system-yp3box.c */
         *logf.o(.bss* COMMON);
+        /* pcm-yp3box.c's register snapshot - self-test builds only, so this
+           is empty otherwise. After the ring: nothing addresses it by a
+           fixed offset. */
+        . = ALIGN(4);
+        KEEP(*(.yp3snap));
         _persistend = .;
     } > SRAM
 

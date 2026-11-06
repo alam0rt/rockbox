@@ -572,8 +572,35 @@ void usb_enable(bool on)
         usb_log_state("post-clk");
         usb_probe_regs();
 
+        /* Quiesce the ROM's own USB interrupts before re-attaching.
+         *
+         * A rig boot is entered by `exec`, which the ROM dispatches from
+         * INSIDE its USB interrupt (0x627a -> 0x61d4), so the ROM's stack is
+         * mid-command and the controller may hold latched events. Attach
+         * (0x58f2) enables IRQ 41 and 42 (0x5532..0x5550); the first run of
+         * this path never returned from it while the tick kept running,
+         * which is the shape of an interrupt that fires and never clears.
+         * So mask both lines, drop anything pending in the NVIC, and read the
+         * MUSB interrupt latches, which clear on read: INTRTX +0x02,
+         * INTRRX +0x04 (16-bit), INTRUSB +0x0a (8-bit). A normal boot has
+         * nothing latched here, so this is a no-op for it. */
+        {
+            uint16_t itx, irx;
+            uint8_t iusb;
+
+            REG32(0xE000E184) = (1u << (41 - 32)) | (1u << (42 - 32)); /* ICER1 */
+            REG32(0xE000E284) = (1u << (41 - 32)) | (1u << (42 - 32)); /* ICPR1 */
+            itx = REG16(0x40040002);
+            irx = REG16(0x40040004);
+            iusb = USBC(0x0a);
+            logf("usb: latched tx=%04x rx=%04x usb=%02x, irq41/42 masked",
+                 itx, irx, iusb);
+            (void)itx; (void)irx; (void)iusb;   /* reads ARE the clear */
+        }
+
         usb_exposed = true;
         ROM_USB_SET_USERFN(&usb_msc_ops);
+        logf("usb: attach...");
         ROM_USB_ATTACH();
         usb_log_state("post-attach");
         /* Only now is there anything for the host to talk to: attach has
