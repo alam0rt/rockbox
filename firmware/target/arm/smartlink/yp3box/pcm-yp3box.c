@@ -273,8 +273,8 @@ yp3_audio_block_init(void)
  *
  *   AUD(0x64) = 0x0b   = ((otp[3] << 3) & 0x78) + (otp[2] >> 29)   0xcf8900
  *   AUD(0x68) = 0x4a   = otp[3] bits 4..10                          0xcf891a
- *   AUD(0x5c) = 0xb4a  = the two packed; written by the generic register
- *                        ioctl at 0xd7cfd8, not by analogue init
+ *   AUD(0x5c) = 0xb4a  = (0x64 << 8) | 0x68, READ-ONLY: a build that wrote
+ *                        only 0x64/0x68 read 0x5c back as 0xb4a `[L]`
  *
  * otp_trim reads word n through 0xc481b0 after enabling module 0x58 and
  * clock 0x1b over base 0x40099000 (0xcf88ac). Under Rockbox all three read
@@ -283,13 +283,14 @@ yp3_audio_block_init(void)
  *
  *   YP3_AUDIO_TRIM 0  leave them alone (as before)
  *                  1  0x64/0x68 at the vendor's point in analogue init
- *                  2  also 0x5c - grounded only in the capture, not code */
+ *
+ * Measured 2026-11-07 with the self-test and the laptop mic: trims written
+ * and read back, 0 of 5 tones heard. Not the missing piece. */
 #ifndef YP3_AUDIO_TRIM
 #define YP3_AUDIO_TRIM 0
 #endif
 #define YP3_TRIM_CH0  0x0bu
 #define YP3_TRIM_CH1  0x4au
-#define YP3_TRIM_5C   0xb4au
 
 /* Which analogue channels to bring up. 3 is the stereo pair, which is what
  * /dev/audio0 selects; the self-test at the foot of this file varies it,
@@ -359,9 +360,6 @@ static void yp3_analog_enable(unsigned mask)
      * own stock firmware - see YP3_TRIM_CH0 above. */
     if (mask & 1u) AUD(0x64) = YP3_TRIM_CH0;
     if (mask & 2u) AUD(0x68) = YP3_TRIM_CH1;
-#endif
-#if YP3_AUDIO_TRIM >= 2
-    AUD(0x5c) = YP3_TRIM_5C;
 #endif
     udelay(10000);
     for (ch = 0; ch < 3; ch++)
