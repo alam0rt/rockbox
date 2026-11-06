@@ -35,6 +35,12 @@
 #ifndef YP3_RIG_SECONDS
 #define YP3_RIG_SECONDS 0
 #endif
+/* YP3_RIG_USB=1 lets a rig build see VBUS after all, so a self-rebooting
+ * cycle can exercise Rockbox's own mass storage - and read the card's
+ * blackbox files through it - instead of hiding the cable. */
+#ifndef YP3_RIG_USB
+#define YP3_RIG_USB 0
+#endif
 #ifdef ROCKBOX_HAS_LOGF
 #define LOGF_ENABLE
 #endif
@@ -174,7 +180,10 @@ static int usb_msc_ready(void)
  * 0x27, WRITE PROTECTED. */
 static int usb_msc_write_protected(void)
 {
-    return 0;
+    /* A rig-USB build is the first time this path runs at all, and the write
+     * half is the riskier one (docs/USB.md, "What is still unverified"), so
+     * it exposes the card read-only. */
+    return YP3_RIG_USB ? 1 : 0;
 }
 
 /* +0x00, +0x10, +0x14, +0x18, +0x1c: the ROM calls +0x10 and +0x14 only from
@@ -339,6 +348,11 @@ static int usb_msc_hook(unsigned opcode)
         return 0;                       /* the ROM's own handlers are fine */
 
     if (!usb_exposed)
+        return 0;
+
+    /* The hook sees WRITE(10) before the ROM checks +0x0c, so honour write
+     * protection here: hand it back and the ROM fails it as sense 0x27. */
+    if (opcode == 0x2a && usb_msc_write_protected())
         return 0;
 
     msc_hooks++;
@@ -636,7 +650,7 @@ int usb_detect(void)
      * reads the ring, all through the boot ROM, never through Rockbox. Left
      * alone, VBUS sends every rig boot straight into mass-storage mode and
      * the UI and playback the rig exists to exercise never run. */
-    if (YP3_RIG_SECONDS)
+    if (YP3_RIG_SECONDS && !YP3_RIG_USB)
         return USB_EXTRACTED;
 
     if (TIME_AFTER(current_tick, next_poll)) {

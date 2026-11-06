@@ -817,12 +817,87 @@ static void yp3_speaker_pa(bool on)
     logf("spk: PA %s", on ? "open" : "close");
 }
 
+/* --- the analogue supply: PMU LDO3 ------------------------------------------
+ *
+ * audio_hw_init (FIRM 0xd7d598) opens by asking the PMU for two LDO voltages,
+ * 0xcf7712(3) and 0xcf7712(2), and prints "avcc_low_voltage_mode" when LDO3 is
+ * the lower - so LDO3 is the analogue supply. The PMU LDO HAL is FIRM 0xcf7514:
+ *
+ *     enable  LDO n   PMU 0x2c |=  1 << (n-1)        0xcf7528
+ *     disable LDO n   PMU 0x2c &= ~(1 << (n-1))      0xcf7544
+ *     LDO3 voltage    PMU 0x03 = (old & 0x5d) | code 0xcf75a8, code for
+ *                     2700/2800/2900/3000/3200/3300 mV = 02/20/22/80/82/a0
+ *     LDO1 0x0d (1500 + 100*n), LDO2 0x0e[2:0] (2700 + 100*n), LDO4 0x0f
+ *     (950 + 50*n); "LDO 0" is 0x06 bit 0, voltage 0x07 (600 + 20*n)
+ *
+ * The only code that powers LDO3 is FIRM's pmu_init (0xcf7db4), called from
+ * 0xd6780a with r0 = 0x0ce40ce4 (literal 0xd67838): its halfword at sp+0x22 is
+ * 3300, so it sets LDO3 to 3.3 V (0xcf7f00) and then enables it (0xcf7f0a).
+ * The bootloader and the SRAM image never write 0x2c or 0x03, and this port
+ * skips FIRM - but the rail is on anyway: the ROM leaves 2c=0f [L]. What it
+ * does not set is the voltage (03=14, code 0x00, not in the vendor's table).
+ *
+ * Runs at boot, which is where the vendor does it, and logs the whole LDO
+ * block before and after so the log answers the question either way. */
+#ifndef YP3_AUDIO_LDO3
+#define YP3_AUDIO_LDO3 1
+#endif
+
+#define PMU_LDO_ENABLE      0x2c
+#define PMU_LDO3_VOLT       0x03
+#define PMU_LDO3_VMASK      0xa2u   /* the bits 0xcf75bc does not keep */
+#define PMU_LDO3_3300MV     0xa0u
+#define PMU_LDO3_EN         (1u << 2)
+
+static void yp3_ldo_census(const char *tag)
+{
+    static const uint8_t regs[] = { 0x03, 0x06, 0x07, 0x0d, 0x0e, 0x0f, 0x2c };
+    uint8_t v[sizeof regs];
+    unsigned i;
+
+    for (i = 0; i < sizeof regs; i++)
+        if (!yp3_pmu_read(regs[i], &v[i]))
+            v[i] = 0xee;    /* not a value 0x2c can hold with bits 4..7 clear */
+    logf("ldo %s: 03=%02x 06=%02x 07=%02x 0d=%02x 0e=%02x 0f=%02x 2c=%02x",
+         tag, v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+}
+
+static void yp3_audio_supply(void)
+{
+    uint8_t en, volt;
+
+    yp3_ldo_census("boot");
+#if YP3_AUDIO_LDO3
+    if (!yp3_pmu_read(PMU_LDO_ENABLE, &en) || !yp3_pmu_read(PMU_LDO3_VOLT, &volt)) {
+        logf("ldo: pmu read failed, LDO3 left alone");
+        return;
+    }
+    /* Measured 2026-11-07: the ROM leaves all four LDOs ON (2c=0f) but LDO3
+     * at voltage code 0x00 (03=14), which is not one of the six codes
+     * 0xcf75a8 knows - the vendor always runs it at 3.3 V. So the rail was
+     * never off; set the vendor's voltage anyway, which is the state every
+     * stock boot runs the codec in, and only it. */
+    if ((volt & PMU_LDO3_VMASK) == PMU_LDO3_3300MV && (en & PMU_LDO3_EN)) {
+        logf("ldo: LDO3 already on at 3.3 V");
+        return;
+    }
+    /* The vendor's order: voltage first, then the enable. */
+    (void)yp3_pmu_write(PMU_LDO3_VOLT,
+                        (uint8_t)((volt & ~PMU_LDO3_VMASK) | PMU_LDO3_3300MV));
+    if (!(en & PMU_LDO3_EN))
+        (void)yp3_pmu_write(PMU_LDO_ENABLE, (uint8_t)(en | PMU_LDO3_EN));
+    yp3_ldo_census("ldo3");
+#endif
+}
+
 /* --- the sink ------------------------------------------------------------- */
 
 static bool tx_running;
 
 static void sink_init(void)
 {
+    yp3_audio_supply();
+
     /* The block is left off until there is something to play: it reprograms a
      * PLL, and a clock change during LCD or SD bring-up is one more variable
      * in the wrong place. sink_set_freq brings it up on demand. */
