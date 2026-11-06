@@ -266,6 +266,31 @@ yp3_audio_block_init(void)
  *    change, and the log line below reports what it actually holds. */
 #define YP3_ANALOG_GAIN  0u             /* AUD(0x30)[20:16] and [28:24], [U] */
 
+/* Departure 1, revisited 2026-11-07: we still cannot read the OTP, but we
+ * now know what it holds on THIS unit. tools/56_capture_stock.sh read the
+ * audio block straight after the stock firmware had played
+ * (captures/stock-20261107-101240), and the trims survive its stop:
+ *
+ *   AUD(0x64) = 0x0b   = ((otp[3] << 3) & 0x78) + (otp[2] >> 29)   0xcf8900
+ *   AUD(0x68) = 0x4a   = otp[3] bits 4..10                          0xcf891a
+ *   AUD(0x5c) = 0xb4a  = the two packed; written by the generic register
+ *                        ioctl at 0xd7cfd8, not by analogue init
+ *
+ * otp_trim reads word n through 0xc481b0 after enabling module 0x58 and
+ * clock 0x1b over base 0x40099000 (0xcf88ac). Under Rockbox all three read
+ * zero. These constants are per chip `[L]` for this unit and WRONG for any
+ * other, which is why the switch defaults off.
+ *
+ *   YP3_AUDIO_TRIM 0  leave them alone (as before)
+ *                  1  0x64/0x68 at the vendor's point in analogue init
+ *                  2  also 0x5c - grounded only in the capture, not code */
+#ifndef YP3_AUDIO_TRIM
+#define YP3_AUDIO_TRIM 0
+#endif
+#define YP3_TRIM_CH0  0x0bu
+#define YP3_TRIM_CH1  0x4au
+#define YP3_TRIM_5C   0xb4au
+
 /* Which analogue channels to bring up. 3 is the stereo pair, which is what
  * /dev/audio0 selects; the self-test at the foot of this file varies it,
  * because there is a real question about whether this product's jack and
@@ -327,6 +352,17 @@ static void yp3_analog_enable(unsigned mask)
     for (ch = 0; ch < 3; ch++)          /* pre-charge */
         if (mask & (1u << ch))
             REG32(aud_pwr(ch)) |= 0x8000u;
+#if YP3_AUDIO_TRIM >= 1
+    /* The vendor writes the trims HERE, between pre-charge and enable:
+     * 0xd7ae82 AUD(0x64) = otp_trim(0) for channel 0, 0xd7ad66 AUD(0x68) =
+     * otp_trim(1) for channel 1. The values are this unit's, read from its
+     * own stock firmware - see YP3_TRIM_CH0 above. */
+    if (mask & 1u) AUD(0x64) = YP3_TRIM_CH0;
+    if (mask & 2u) AUD(0x68) = YP3_TRIM_CH1;
+#endif
+#if YP3_AUDIO_TRIM >= 2
+    AUD(0x5c) = YP3_TRIM_5C;
+#endif
     udelay(10000);
     for (ch = 0; ch < 3; ch++)
         if (mask & (1u << ch)) {
@@ -360,8 +396,9 @@ static void yp3_analog_enable(unsigned mask)
     logf("aud: analog 50=%08lx 54=%08lx 58=%08lx (bit29 = channel up)",
          (unsigned long)AUD(0x50), (unsigned long)AUD(0x54),
          (unsigned long)AUD(0x58));
-    logf("aud: trim 64=%08lx 68=%08lx (not written, see comment)",
-         (unsigned long)AUD(0x64), (unsigned long)AUD(0x68));
+    logf("aud: trim 64=%08lx 68=%08lx 5c=%08lx (YP3_AUDIO_TRIM=%d)",
+         (unsigned long)AUD(0x64), (unsigned long)AUD(0x68),
+         (unsigned long)AUD(0x5c), YP3_AUDIO_TRIM);
 }
 
 /* --- the playback half ----------------------------------------------------
