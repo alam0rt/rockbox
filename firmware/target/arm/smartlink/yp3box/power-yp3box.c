@@ -62,11 +62,51 @@
  *
  * The mailbox is synchronous, but a broken PMU must not wedge the Rockbox
  * power thread or the shutdown path forever. */
+/* BASEPRI, not PRIMASK. Masking at priority 3 and below still keeps the tick
+ * (SysTick, now 0xf0) and every thread off the mailbox, which is all the lock
+ * is for, but lets the audio DMA completion (NVIC priority 2) through. With
+ * PRIMASK the tick's PMU reads held off the DMA re-arm and the transmitter ran
+ * dry for ~2.6 ms of every 20 - 150 transfers a second instead of 172, a
+ * 15% stretch and a 49.5 Hz comb on every tone. Nothing at priority 0..2
+ * touches the PMU. */
+#define PMU_LOCK_PRIO   0x30u
+
+static inline uint32_t pmu_lock(void)
+{
+    uint32_t old, v = PMU_LOCK_PRIO;
+    __asm__ volatile ("mrs %0, basepri" : "=r"(old));
+    __asm__ volatile ("msr basepri_max, %0" :: "r"(v) : "memory");
+    return old;
+}
+
+static inline void pmu_unlock(uint32_t old)
+{
+    __asm__ volatile ("msr basepri, %0" :: "r"(old) : "memory");
+}
+
+/* How long a transaction really takes, in core cycles off SysTick, and how
+ * many there are. Read and cleared by the PCM beacon. */
+uint32_t yp3_pmu_cost_max, yp3_pmu_ops;
+#define SYST_RVR_   (*(volatile uint32_t *)0xE000E014)
+#define SYST_CVR_   (*(volatile uint32_t *)0xE000E018)
+
+static inline uint32_t pmu_t0(void) { return SYST_CVR_; }
+
+static inline void pmu_t1(uint32_t t0)
+{
+    uint32_t t1 = SYST_CVR_;
+    uint32_t d = t0 >= t1 ? t0 - t1 : t0 + (SYST_RVR_ + 1u) - t1;
+    yp3_pmu_ops++;
+    if (d > yp3_pmu_cost_max)
+        yp3_pmu_cost_max = d;
+}
+
 bool __attribute__((section(".icode"), noinline))
 yp3_pmu_read(unsigned reg, uint8_t *value)
 {
     unsigned i;
-    int oldlevel = disable_irq_save();
+    uint32_t oldlevel = pmu_lock();
+    uint32_t t0 = pmu_t0();
     bool ok;
 
     PMU_REG(PMU_MB_CMD) = PMU_OP_READ | (reg << 8);
@@ -79,7 +119,8 @@ yp3_pmu_read(unsigned reg, uint8_t *value)
     if (ok)
         *value = (uint8_t)PMU_REG(PMU_MB_RDATA);
 
-    restore_irq(oldlevel);
+    pmu_t1(t0);
+    pmu_unlock(oldlevel);
     return ok;
 }
 
@@ -87,7 +128,8 @@ bool __attribute__((section(".icode"), noinline))
 yp3_pmu_write(unsigned reg, uint8_t value)
 {
     unsigned i;
-    int oldlevel = disable_irq_save();
+    uint32_t oldlevel = pmu_lock();
+    uint32_t t0 = pmu_t0();
     bool ok;
 
     PMU_REG(PMU_MB_WDATA) = value;
@@ -98,7 +140,8 @@ yp3_pmu_write(unsigned reg, uint8_t value)
 
     ok = !(PMU_REG(PMU_MB_CMD) & PMU_GO)
       && !(PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK);
-    restore_irq(oldlevel);
+    pmu_t1(t0);
+    pmu_unlock(oldlevel);
     return ok;
 }
 

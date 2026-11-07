@@ -197,7 +197,18 @@ int button_read_device(void)
     if (left_held)
         btn |= BUTTON_PREV;                      /* back / left, id 0x42 */
 
-    play_read_pmu();
+    /* Every fourth tick only. Each read is a PMU mailbox transaction, and
+     * measured on hardware one takes up to 3.4 ms - 100 a second was a third
+     * of the CPU spent spinning inside the tick (pmu=116/3386us, tk=6.7 ms of
+     * every 10). The PMU latches press and release as edges, and a press and
+     * release seen in the same read are already split across two calls
+     * below, so a slower poll loses no taps; it only adds up to 40 ms of
+     * latency to the centre key. */
+    static unsigned pmu_div;
+    if (++pmu_div >= 4) {
+        pmu_div = 0;
+        play_read_pmu();
+    }
     if (play_held)
         btn |= BUTTON_PLAY;                      /* centre, id 0x21 "enter" */
 

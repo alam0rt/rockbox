@@ -14,6 +14,8 @@
 #define SYST_RVR   (*(volatile uint32_t *)0xE000E014)
 #define SYST_CVR   (*(volatile uint32_t *)0xE000E018)
 
+#define SYST_SHPR3_SYSTICK (*(volatile uint8_t *)0xE000ED23)  /* SHPR3[31:24] */
+
 #define SYST_CSR_ENABLE     (1u << 0)
 #define SYST_CSR_TICKINT    (1u << 1)
 #define SYST_CSR_CLKSOURCE  (1u << 2)   /* processor clock */
@@ -25,9 +27,31 @@ void tick_start(unsigned int interval_in_ms)
     SYST_CSR = 0;                       /* stop while reprogramming */
     SYST_RVR = reload & 0x00ffffffu;    /* 24-bit reload */
     SYST_CVR = 0;
+
+    /* The tick at the LOWEST priority, below the audio DMA (NVIC priority 2).
+     * SysTick resets to 0, the highest, so every device interrupt waited for
+     * the whole tick handler - and call_tick_tasks and nearly every tick task
+     * execute from XIP flash at ~130x the cost of SRAM. The audio DMA re-arm
+     * is a completion interrupt, so for that window the transmitter ran dry:
+     * on the first real MP3 the channel completed 147 transfers a second
+     * where 44.1 kHz needs 172, every tone came out as a pair of lines 49.5 Hz
+     * apart around a missing carrier, and the track ran 16% long - all three
+     * fit "three 1024-byte transfers, then a ~2.6 ms stall, every 20 ms".
+     * Rockbox's usual model is the same: audio DMA on FIQ, the tick on IRQ.
+     * Nothing in a tick task may assume it cannot be preempted by the PCM
+     * interrupt; the PCM side already locks itself with sink_lock. */
+    SYST_SHPR3_SYSTICK = 0xf0;
+
     SYST_CSR = SYST_CSR_CLKSOURCE | SYST_CSR_TICKINT | SYST_CSR_ENABLE;
 }
 
+/* Worst tick-handler duration since the last read, in SysTick counts (core
+ * cycles). The count reloads at the tick, so RVR - CVR on the way out is the
+ * time spent in the handler - unless preemption stretched it past a whole
+ * period, which would read as a small number. With the tick now at the lowest
+ * priority this includes any interrupt that preempted it. Read and cleared by
+ * the PCM beacon, so it also covers the beacon's own logf. */
+uint32_t yp3_tick_cost_max;
 
 void yp3_systick_body(void)
 {
@@ -35,6 +59,10 @@ void yp3_systick_body(void)
      * the things that have to keep running when a tick task is what wedged. */
     yp3_rig_tick();
     call_tick_tasks();
+
+    uint32_t used = SYST_RVR - SYST_CVR;
+    if (used > yp3_tick_cost_max)
+        yp3_tick_cost_max = used;
 }
 
 #if YP3_PROFILE

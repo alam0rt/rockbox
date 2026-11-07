@@ -1166,8 +1166,16 @@ static void pcm_beacon(void)
         return;
     next = current_tick + HZ;
     pcm_beacon_left--;
-    logf("pcmb: irqs=%lu plays=%lu playing=%d mix=%d free=%lu descs=%d",
-         (unsigned long)pcm_irqs, (unsigned long)pcm_plays,
+    extern uint32_t yp3_tick_cost_max;          /* timer-yp3box.c */
+    extern uint32_t yp3_pmu_cost_max, yp3_pmu_ops;  /* power-yp3box.c */
+    unsigned long tk = yp3_tick_cost_max / (CPU_FREQ / 1000000u);
+    unsigned long pm = yp3_pmu_cost_max / (CPU_FREQ / 1000000u);
+    unsigned long po = yp3_pmu_ops;
+    yp3_tick_cost_max = 0;
+    yp3_pmu_cost_max = 0;
+    yp3_pmu_ops = 0;
+    logf("pcmb: irqs=%lu tk=%luus pmu=%lu/%luus plays=%lu playing=%d mix=%d free=%lu descs=%d",
+         (unsigned long)pcm_irqs, tk, po, pm, (unsigned long)pcm_plays,
          (int)pcm_is_playing(), (int)mixer_channel_status(PCM_MIXER_CHAN_PLAYBACK),
          (unsigned long)pcmbuf_free(), pcmbuf_used_descs());
 }
