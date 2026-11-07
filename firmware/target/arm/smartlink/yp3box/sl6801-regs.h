@@ -51,7 +51,14 @@
 #define AUDIO_MCLK      0x00u       /* the PLL output; set_pll then apply(0) */
 #define ASRC_MODULE     0x20u       /* held only while zeroing 0x40009400    */
 #define ASRC_CLK        0x2du
-/* The playback (TX) group. +0x20c is the FIFO the DMA engine writes into.
+/* *** THE MAP BELOW IS WRONG, AND THE ARGUMENT FOR IT IS WRONG *** [L]
+ * 2026-11-08: the DMA engine's +0x04 is the SOURCE (measured, mem-to-mem),
+ * so the "playback wrapper" 0x814bd4 READS 0x4000920c into memory, and the
+ * vendor plays through 0x814bec into 0x4000910c - the +0x100 file - which is
+ * what stock's live channel held while playing and what finally made sound.
+ * The original text follows, kept so its error is visible.
+ *
+ * The playback (TX) group. +0x20c is the FIFO the DMA engine writes into.
  *
  * THIS MAP IS CORRECT AND WAS ONCE "FIXED" INTO BEING WRONG. The evidence, so
  * nobody re-derives it a third time:
@@ -78,7 +85,12 @@
  * them apart. Check the FIFO address before believing anything else. */
 #define AUD_TX_CTRL     AUD(0x200)  /* [0] enable [1] run [11:8] rate code   */
 #define AUD_TX_FMT      AUD(0x208)  /* [2] stereo, [7] always set            */
-#define AUD_TX_FIFO     0x4000920cu
+#define AUD_TX_FIFO     0x4000920cu /* NOT the playback FIFO, see below    */
+/* THE PLAYBACK FIFO [L]: stock's DMA destination while playing music
+ * (captures/stock-20261107-101240), and the one that made sound here on
+ * 2026-11-08. The "TX"/"RX" names on the two files above are the old,
+ * inverted reading and are left only until the driver is reworked. */
+#define AUD_PLAY_FIFO   0x4000910cu
 #define AUD_TX_CH(n)    (0x220u + (n) * 0x30u)      /* n = 0..3              */
 #define AUD_TX_MUTE(n)  AUD(AUD_TX_CH(n) + 4)       /* bit 16                */
 #define AUD_TX_VOL(n)   AUD(AUD_TX_CH(n) + 8)       /* [8:0], 0 = silent     */
@@ -99,8 +111,13 @@
 #define DMA_CHANNELS    8
 #define DMA_CH_BASE(ch) (DMA_BASE + (ch) * 0x40)
 #define DMA_CTRL(ch)    REG32(DMA_CH_BASE(ch) + 0x00)
-#define DMA_DST(ch)     REG32(DMA_CH_BASE(ch) + 0x04)
-#define DMA_SRC(ch)     REG32(DMA_CH_BASE(ch) + 0x08)
+/* +0x04 IS THE SOURCE and +0x08 the destination - MEASURED, 2026-11-08: a
+ * memory-to-memory transfer (YP3_DMA_FLIP) overwrote the buffer at +0x08 with
+ * the one at +0x04, 64 of 64 words. Every build before that had these two
+ * names the other way round, and so did docs/DMA.md; its control-word decode
+ * is self-consistent either way, which is why nothing caught it. */
+#define DMA_SRC(ch)     REG32(DMA_CH_BASE(ch) + 0x04)
+#define DMA_DST(ch)     REG32(DMA_CH_BASE(ch) + 0x08)
 #define DMA_LEN(ch)     REG32(DMA_CH_BASE(ch) + 0x0c)
 #define DMA_CFG(ch)     REG32(DMA_CH_BASE(ch) + 0x20)
 #define DMA_IRQST(ch)   REG32(DMA_CH_BASE(ch) + 0x24)

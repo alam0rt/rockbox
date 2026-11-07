@@ -631,7 +631,14 @@ static void yp3_tx_disable(void)
 /* bits 21:20 = 2 (32-bit source)   bit 19 source burst
  * bit 17 source is memory          bits 9:8 = 2 (32-bit destination)
  * bit 7 destination burst          bits 4:0 = 1 (audio request line) */
-#define PCM_DMA_CTRL    0x002a0281u
+/* REWRITTEN 2026-11-08 [L]. Stock's own channel word while playing, read
+ * live from captures/stock-20261107-101240: bits [9:0] describe the +0x04
+ * side, the SOURCE - bit 5 memory, bit 7 burst, [9:8] = 2 32-bit; bits
+ * [21:12] describe the +0x08 side, the DESTINATION - [16:12] = 1, the audio
+ * request line, bit 19 burst, [21:20] = 2. The old 0x002a0281 was its exact
+ * mirror and moved samples OUT of the +0x200 (capture) FIFO into the buffer:
+ * YP3_DMA_FLIP measured the tone buffer overwritten, 1760 of 1760 words. */
+#define PCM_DMA_CTRL    0x002812a0u
 /* bits 31:28 source burst length - 1, bits 27:24 destination burst length - 1 */
 #define PCM_DMA_LENCFG  0xff000000u
 /* bits 31:14 from descriptor +0x08, which is 32 in every vendor caller;
@@ -683,8 +690,8 @@ static void yp3_dma_open(void)
  * kind of thing that produces a surprise three flashes later. */
 static void yp3_dma_play(const void *addr, size_t size)
 {
-    DMA_DST(PCM_DMA_CH) = AUD_TX_FIFO;
-    DMA_SRC(PCM_DMA_CH) = (uint32_t)addr;
+    DMA_SRC(PCM_DMA_CH) = (uint32_t)addr;              /* +0x04 */
+    DMA_DST(PCM_DMA_CH) = AUD_PLAY_FIFO;                /* +0x08 */
     DMA_LEN(PCM_DMA_CH) = (DMA_LEN(PCM_DMA_CH) & ~DMA_LEN_MASK)
                         | (size & DMA_LEN_MASK);
     DMA_CTRL(PCM_DMA_CH) = (DMA_CTRL(PCM_DMA_CH) & ~DMA_CTRL_CONT)
@@ -725,6 +732,13 @@ static volatile uint32_t st_irqs;
  * closes exactly at the loop point (441 frames = 10 ms = whole cycles of
  * every multiple of 100 Hz; 880 frames is 19.95 ms and closes none). */
 static size_t st_len = ST_FRAMES * 4;
+#ifndef YP3_DMA_FLIP
+#define YP3_DMA_FLIP 0
+#endif
+#if YP3_DMA_FLIP
+static volatile bool st_flip;           /* the IRQ re-arms in stock's form */
+static void st_dma_play_flip(const void *addr, size_t size);
+#endif
 void yp3_audio_selftest(void);       /* defined at the foot of this file */
 
 /* A register snapshot taken while the self-test tone is playing, in .persist
@@ -834,8 +848,14 @@ void yp3_dma2_irq(void)
      * the point it runs. It re-arms its own buffer and returns. */
     if (st_active) {
         st_irqs++;
-        if (status & DMA_IRQST_DONE)
-            yp3_dma_play(st_tone, st_len);
+        if (status & DMA_IRQST_DONE) {
+#if YP3_DMA_FLIP
+            if (st_flip)
+                st_dma_play_flip(st_tone, st_len);
+            else
+#endif
+                yp3_dma_play(st_tone, st_len);
+        }
         return;
     }
 #endif
@@ -979,6 +999,94 @@ static void yp3_audio_supply(void)
 
 /* --- the sink ------------------------------------------------------------- */
 
+/* --- the play start: stock's own, recorded ---------------------------------
+ *
+ * THIS IS WHAT MAKES SOUND [L]. 2026-11-08, YP3_DMA_FLIP: this sequence plus
+ * the DMA channel in stock's form (see yp3_dma_play) played five of five
+ * tones, heard by the user and by tools/listen.py at +33..+51 dB. Playback is
+ * the +0x100 file; every build before it ran the +0x200 file, which is the
+ * CAPTURE side, and pointed the DMA the wrong way round as well.
+ *
+ * The vendor's own play-time register writes, RECORDED from the stock
+ * firmware on this unit (2026-11-07, tools/61_stockpatch_session.sh: the DWT
+ * write recorder patched into stock FIRM, tones audible while it ran).
+ * captures/stocktrace-20261107/run2-capped/stock-trace.json, traps 4717..4797 = pressing
+ * play; values are what each word read back after the write. Not a
+ * transcription - a recording. Applied in stock's order.
+ *
+ * Where stock and this driver differ (the last Rockbox trace,
+ * captures/wtrace-rockbox-selftest-20261107.json):
+ *   - module 0x20 (ASRC window): stock enables it only to zero the ASRC RAM
+ *     (traps 186..317) and turns it OFF; this driver leaves it on. ROM 0x2571
+ *     is the disable stock uses on 0x27/0x29 and usb-yp3box.c already uses.
+ *   - the +0x100 file: stock sets run (bit 1) and channel words 3 at play,
+ *     and CLEARS bit 31 of +0x138/+0x158 (this driver leaves 8000a1ff).
+ *   - analogue: channels 0 and 1 only (+0x40 = a20, +0x4c ends 130030); this
+ *     driver also half-raises channel 2 (0x1a20 / 0x530430).
+ *   - trims 0x0b / 0x4a are written mid-sequence.
+ *   - port 1 pad words +0x48/+0x54/+0x58: stock's pins 14/15 and 20/21 config.
+ *     Pin 10 (LCD reset) is not in any differing field.
+ * GPIO bit 29 of +0x68/+0x70 is the PA (P1.30) - both firmwares set it. */
+#define ROM_CLK_DISABLE_ ((void (*)(unsigned))0x2571u)
+struct st_rp { uint32_t addr, val; uint16_t ms; };
+#ifndef YP3_STOCK_REPLAY
+#define YP3_STOCK_REPLAY 0
+#endif
+static void yp3_wait_ms(unsigned ms)
+{
+    while (ms--)
+        udelay(1000);
+}
+
+static const struct st_rp st_replay[] = {
+    /* t4730..4737: digital, the +0x100 file */
+    { 0x40009000, 0x85000022, 1 }, { 0x40009100, 0x00055700, 1 },
+    { 0x40009100, 0x00055802, 1 }, { 0x40009108, 0x00040300, 1 },
+    { 0x40009108, 0x00040384, 1 }, { 0x40009130, 0x00000003, 1 },
+    { 0x40009138, 0x0000a000, 1 }, { 0x40009150, 0x00000003, 1 },
+    { 0x40009158, 0x0000a000, 1 }, { 0x40009170, 0x00000000, 1 },
+    /* t4741..4758: analogue bring-up, channels 0 and 1 */
+    { 0x40009030, 0x00000001, 1 }, { 0x40009030, 0x00000011, 1 },
+    { 0x40009040, 0x00000210, 1 }, { 0x4000904c, 0x00020000, 1 },
+    { 0x4000904c, 0x00030000, 1 }, { 0x40009040, 0x00000220, 1 },
+    { 0x4000904c, 0x00130000, 1 }, { 0x40009040, 0x00000a20, 1 },
+    { 0x40009050, 0x00028000, 1 }, { 0x40009054, 0x00028000, 5 },
+    { 0x40009064, 0x0000000b, 1 }, { 0x40009068, 0x0000004a, 10 },
+    /* t4769..4787: power-up, settle, gain */
+    { 0x40009050, 0x10028000, 1 }, { 0x40009054, 0x10028000, 1 },
+    { 0x40009050, 0x30028000, 1 }, { 0x40009054, 0x30028000, 1 },
+    { 0x4000904c, 0x00130030, 1 }, { 0x4000904c, 0x00130033, 1 },
+    { 0x40009050, 0x30028fff, 1 }, { 0x40009054, 0x30028fff, 20 },
+    { 0x4000904c, 0x00130030, 1 },
+    /* t4790..4794 and boot: port 1 pad configuration */
+    { 0x40081048, 0xff99fc5f, 1 }, { 0x40081054, 0x55455000, 1 },
+    { 0x40081058, 0x05555041, 1 },
+};
+
+static void yp3_stock_play(void)
+{
+    unsigned i;
+
+    ROM_CLK_DISABLE_(ASRC_MODULE);              /* stock trap 316 */
+    logf("rp: asrc module 0x20 off, on=%d", ROM_CLK_IS_ON(ASRC_MODULE));
+    for (i = 0; i < ARRAYLEN(st_replay); i++) {
+        REG32(st_replay[i].addr) = st_replay[i].val;
+        yp3_wait_ms(st_replay[i].ms);
+        if (REG32(st_replay[i].addr) != st_replay[i].val)
+            logf("rp: %08lx wrote %08lx read %08lx",
+                 (unsigned long)st_replay[i].addr,
+                 (unsigned long)st_replay[i].val,
+                 (unsigned long)REG32(st_replay[i].addr));
+    }
+    logf("rp: done 000=%08lx 100=%08lx 138=%08lx 040=%08lx 04c=%08lx 050=%08lx",
+         (unsigned long)AUD(0x00), (unsigned long)AUD(0x100),
+         (unsigned long)AUD(0x138), (unsigned long)AUD(0x40),
+         (unsigned long)AUD(0x4c), (unsigned long)AUD(0x50));
+    logf("rp: 200=%08lx 208=%08lx clk64=%08lx gpio68=%08lx",
+         (unsigned long)AUD(0x200), (unsigned long)AUD(0x208),
+         (unsigned long)REG32(0x40080064), (unsigned long)REG32(0x40081068));
+}
+
 static bool tx_running;
 
 static void sink_init(void)
@@ -1025,6 +1133,8 @@ static void sink_set_freq(uint16_t freq)
 
     yp3_tx_enable(rate, true);
     yp3_dma_open();
+    yp3_stock_play();       /* the +0x100 file and the analogue stage, as
+                             * stock does it: what actually makes sound */
     tx_running = true;
 }
 
@@ -1229,83 +1339,6 @@ static void st_set_gain(unsigned mask, unsigned g)
     if (mask & 4u) field_set(&AUD(0x2c), 0x001f0000u, g);
 }
 
-/* --- stock replay -----------------------------------------------------------
- *
- * The vendor's own play-time register writes, RECORDED from the stock
- * firmware on this unit (2026-11-07, tools/61_stockpatch_session.sh: the DWT
- * write recorder patched into stock FIRM, tones audible while it ran).
- * captures/stocktrace-20261107/run2-capped/stock-trace.json, traps 4717..4797 = pressing
- * play; values are what each word read back after the write. Not a
- * transcription - a recording. Applied in stock's order.
- *
- * Where stock and this driver differ (the last Rockbox trace,
- * captures/wtrace-rockbox-selftest-20261107.json):
- *   - module 0x20 (ASRC window): stock enables it only to zero the ASRC RAM
- *     (traps 186..317) and turns it OFF; this driver leaves it on. ROM 0x2571
- *     is the disable stock uses on 0x27/0x29 and usb-yp3box.c already uses.
- *   - the +0x100 file: stock sets run (bit 1) and channel words 3 at play,
- *     and CLEARS bit 31 of +0x138/+0x158 (this driver leaves 8000a1ff).
- *   - analogue: channels 0 and 1 only (+0x40 = a20, +0x4c ends 130030); this
- *     driver also half-raises channel 2 (0x1a20 / 0x530430).
- *   - trims 0x0b / 0x4a are written mid-sequence.
- *   - port 1 pad words +0x48/+0x54/+0x58: stock's pins 14/15 and 20/21 config.
- *     Pin 10 (LCD reset) is not in any differing field.
- * GPIO bit 29 of +0x68/+0x70 is the PA (P1.30) - both firmwares set it. */
-#ifndef YP3_STOCK_REPLAY
-#define YP3_STOCK_REPLAY 0
-#endif
-#if YP3_STOCK_REPLAY
-#define ROM_CLK_DISABLE_ ((void (*)(unsigned))0x2571u)
-struct st_rp { uint32_t addr, val; uint16_t ms; };
-static const struct st_rp st_replay[] = {
-    /* t4730..4737: digital, the +0x100 file */
-    { 0x40009000, 0x85000022, 1 }, { 0x40009100, 0x00055700, 1 },
-    { 0x40009100, 0x00055802, 1 }, { 0x40009108, 0x00040300, 1 },
-    { 0x40009108, 0x00040384, 1 }, { 0x40009130, 0x00000003, 1 },
-    { 0x40009138, 0x0000a000, 1 }, { 0x40009150, 0x00000003, 1 },
-    { 0x40009158, 0x0000a000, 1 }, { 0x40009170, 0x00000000, 1 },
-    /* t4741..4758: analogue bring-up, channels 0 and 1 */
-    { 0x40009030, 0x00000001, 1 }, { 0x40009030, 0x00000011, 1 },
-    { 0x40009040, 0x00000210, 1 }, { 0x4000904c, 0x00020000, 1 },
-    { 0x4000904c, 0x00030000, 1 }, { 0x40009040, 0x00000220, 1 },
-    { 0x4000904c, 0x00130000, 1 }, { 0x40009040, 0x00000a20, 1 },
-    { 0x40009050, 0x00028000, 1 }, { 0x40009054, 0x00028000, 5 },
-    { 0x40009064, 0x0000000b, 1 }, { 0x40009068, 0x0000004a, 10 },
-    /* t4769..4787: power-up, settle, gain */
-    { 0x40009050, 0x10028000, 1 }, { 0x40009054, 0x10028000, 1 },
-    { 0x40009050, 0x30028000, 1 }, { 0x40009054, 0x30028000, 1 },
-    { 0x4000904c, 0x00130030, 1 }, { 0x4000904c, 0x00130033, 1 },
-    { 0x40009050, 0x30028fff, 1 }, { 0x40009054, 0x30028fff, 20 },
-    { 0x4000904c, 0x00130030, 1 },
-    /* t4790..4794 and boot: port 1 pad configuration */
-    { 0x40081048, 0xff99fc5f, 1 }, { 0x40081054, 0x55455000, 1 },
-    { 0x40081058, 0x05555041, 1 },
-};
-
-static void st_stock_replay(void)
-{
-    unsigned i;
-
-    ROM_CLK_DISABLE_(ASRC_MODULE);              /* stock trap 316 */
-    logf("rp: asrc module 0x20 off, on=%d", ROM_CLK_IS_ON(ASRC_MODULE));
-    for (i = 0; i < ARRAYLEN(st_replay); i++) {
-        REG32(st_replay[i].addr) = st_replay[i].val;
-        st_wait_ms(st_replay[i].ms);
-        if (REG32(st_replay[i].addr) != st_replay[i].val)
-            logf("rp: %08lx wrote %08lx read %08lx",
-                 (unsigned long)st_replay[i].addr,
-                 (unsigned long)st_replay[i].val,
-                 (unsigned long)REG32(st_replay[i].addr));
-    }
-    logf("rp: done 000=%08lx 100=%08lx 138=%08lx 040=%08lx 04c=%08lx 050=%08lx",
-         (unsigned long)AUD(0x00), (unsigned long)AUD(0x100),
-         (unsigned long)AUD(0x138), (unsigned long)AUD(0x40),
-         (unsigned long)AUD(0x4c), (unsigned long)AUD(0x50));
-    logf("rp: 200=%08lx 208=%08lx clk64=%08lx gpio68=%08lx",
-         (unsigned long)AUD(0x200), (unsigned long)AUD(0x208),
-         (unsigned long)REG32(0x40080064), (unsigned long)REG32(0x40081068));
-}
-#endif
 
 /* The analogue output pads, transcribed from the vendor's own walk.
  *
@@ -1741,6 +1774,149 @@ static void st_pad_inject(void)
 }
 #endif /* YP3_PAD_INJECT */
 
+/* --- which way does the DMA engine go? --------------------------------------
+ *
+ * The live stock capture (captures/stock-20261107-101240, stock PLAYING music
+ * until card-reader mode stopped it) holds the audio channel as
+ *
+ *     CH+00 002812a0   memory on the +0x04 side, request 1 on the +0x08 side
+ *     CH+04 0084fab0   an SRAM buffer
+ *     CH+08 4000910c   the +0x100 file's FIFO        and +0x100 = 00055802 (run)
+ *
+ * which is the vendor wrapper at SRAM 0x814bec. This driver has been running
+ * the exact mirror image - 0x002a0281, +04 = 0x4000920c, +08 = the buffer,
+ * the +0x200 file - which is the wrapper at 0x814bd4. One of the two moves
+ * memory into the audio block, and stock is the one that made sound. The stock
+ * trace agrees: in a whole recorded play session stock changed no +0x2xx word.
+ *
+ * This settles it three ways in one boot:
+ *   1  memory to memory: A at +0x04, B at +0x08, which one gets overwritten
+ *   2  the port's own form, run for ~100 ms: does the tone buffer change
+ *      (then the port has been RECORDING into it, not playing it)
+ *   3  stock's form after stock's recorded +0x100 play sequence, playing the
+ *      five pitches tools/listen.py checks by default */
+#if YP3_DMA_FLIP
+#define STOCK_PLAY_FIFO 0x4000910cu     /* stock's CH+08 while playing */
+#define STOCK_PLAY_CTRL 0x002812a0u     /* stock's CH+00, GO clear */
+#define DD_WORDS 64
+static uint32_t dd_a[DD_WORDS] __attribute__((aligned(16)));
+static uint32_t dd_b[DD_WORDS] __attribute__((aligned(16)));
+
+static void st_dma_play_flip(const void *addr, size_t size)
+{
+    DMA_SRC(PCM_DMA_CH) = (uint32_t)addr;       /* +0x04, as stock had it */
+    DMA_DST(PCM_DMA_CH) = STOCK_PLAY_FIFO;      /* +0x08 */
+    DMA_LEN(PCM_DMA_CH) = (DMA_LEN(PCM_DMA_CH) & ~DMA_LEN_MASK)
+                        | (size & DMA_LEN_MASK);
+    DMA_CTRL(PCM_DMA_CH) = (DMA_CTRL(PCM_DMA_CH) & ~DMA_CTRL_CONT)
+                         | DMA_CTRL_GO;
+}
+
+static void dd_stop(void)
+{
+    unsigned i;
+
+    DMA_CTRL(PCM_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
+    for (i = 0; i < 1000 && (DMA_CTRL(PCM_DMA_CH) & DMA_CTRL_GO); i++)
+        udelay(10);
+    DMA_IRQST(PCM_DMA_CH) = DMA_IRQST(PCM_DMA_CH);
+}
+
+static unsigned dd_changed(const uint32_t *p, uint32_t tag)
+{
+    unsigned i, n = 0;
+
+    for (i = 0; i < DD_WORDS; i++)
+        n += p[i] != (tag | i);
+    return n;
+}
+
+static void st_dma_flip_test(void)
+{
+    static const unsigned short freq[5] = { 400u, 600u, 900u, 1400u, 2100u };
+    unsigned i, n;
+    uint32_t len;
+
+    yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));
+    st_active = false;
+    dd_stop();
+
+    /* 1: memory to memory, both sides incrementing 32-bit, no request line */
+    for (i = 0; i < DD_WORDS; i++) {
+        dd_a[i] = 0xa5000000u | i;
+        dd_b[i] = 0x5a000000u | i;
+    }
+    DMA_CTRL(PCM_DMA_CH) = (2u << 20) | (1u << 17) | (2u << 8) | (1u << 5);
+    DMA_LEN(PCM_DMA_CH) = sizeof dd_a;
+    DMA_SRC(PCM_DMA_CH) = (uint32_t)dd_a;       /* +0x04 */
+    DMA_DST(PCM_DMA_CH) = (uint32_t)dd_b;       /* +0x08 */
+    DMA_CTRL(PCM_DMA_CH) |= DMA_CTRL_GO;
+    for (i = 0; i < 1000 && !(DMA_IRQST(PCM_DMA_CH) & DMA_IRQST_DONE); i++)
+        udelay(10);
+    logf("dd: m2m irqst=%lx len=%08lx ctrl=%08lx a[1]=%08lx b[1]=%08lx",
+         (unsigned long)DMA_IRQST(PCM_DMA_CH), (unsigned long)DMA_LEN(PCM_DMA_CH),
+         (unsigned long)DMA_CTRL(PCM_DMA_CH), (unsigned long)dd_a[1],
+         (unsigned long)dd_b[1]);
+    logf("dd: m2m +04 buffer changed %u/%u, +08 buffer changed %u/%u -> %s",
+         dd_changed(dd_a, 0xa5000000u), DD_WORDS,
+         dd_changed(dd_b, 0x5a000000u), DD_WORDS,
+         dd_changed(dd_b, 0x5a000000u) ? "+04 IS THE SOURCE"
+         : dd_changed(dd_a, 0xa5000000u) ? "+04 is the destination" : "nothing moved");
+    dd_stop();
+
+    /* 2: the port's form, ~100 ms, on a buffer with a known pattern */
+    yp3_dma_open();
+    for (i = 0; i < ST_FRAMES * 2; i++)
+        st_tone[i] = (int16_t)(0x1230 + (i & 7));
+    st_irqs = 0;
+    st_len = ST_FRAMES * 4;
+    st_active = true;
+    yp3_dma_play(st_tone, sizeof st_tone);
+    yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);
+    st_wait_ms(100);
+    yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));
+    st_active = false;
+    dd_stop();
+    for (i = 0, n = 0; i < ST_FRAMES * 2; i++)
+        n += st_tone[i] != (int16_t)(0x1230 + (i & 7));
+    logf("dd: port form %lu irqs, tone buffer changed %u/%u words, [0]=%04x [100]=%04x",
+         (unsigned long)st_irqs, n, ST_FRAMES * 2,
+         (unsigned)(uint16_t)st_tone[0], (unsigned)(uint16_t)st_tone[100]);
+
+    /* 3: stock's +0x100 play sequence, then stock's channel form */
+    yp3_stock_play();
+    st_fill(SAMPR_44, freq[0]);
+    DMA_CTRL(PCM_DMA_CH) = STOCK_PLAY_CTRL;
+    DMA_IRQST(PCM_DMA_CH) = DMA_IRQST(PCM_DMA_CH);
+    st_irqs = 0;
+    st_flip = true;
+    st_active = true;
+    st_dma_play_flip(st_tone, sizeof st_tone);
+    yp3_irq_enable(DMA_IRQ(PCM_DMA_CH), 2);
+    st_wait_ms(20);
+    len = DMA_LEN(PCM_DMA_CH);
+    logf("dd: stock form go ctrl=%08lx +04=%08lx +08=%08lx len=%08lx irqs=%lu 100=%08lx",
+         (unsigned long)DMA_CTRL(PCM_DMA_CH), (unsigned long)DMA_SRC(PCM_DMA_CH),
+         (unsigned long)DMA_DST(PCM_DMA_CH), (unsigned long)len,
+         (unsigned long)st_irqs, (unsigned long)AUD(0x100));
+    for (i = 0; i < 5; i++) {
+        st_fill(SAMPR_44, freq[i]);
+        logf("dd: stock form %uHz irqs=%lu len=%08lx", freq[i],
+             (unsigned long)st_irqs, (unsigned long)DMA_LEN(PCM_DMA_CH));
+        st_wait_ms(2100);               /* ~3 s: udelay runs ~1.44x long */
+        for (n = 0; n < ST_FRAMES * 2; n++)
+            st_tone[n] = 0;
+        st_wait_ms(500);
+    }
+    logf("dd: stock form done irqs=%lu 100=%08lx 108=%08lx", (unsigned long)st_irqs,
+         (unsigned long)AUD(0x100), (unsigned long)AUD(0x108));
+    yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));
+    st_active = false;
+    st_flip = false;
+    dd_stop();
+}
+#endif /* YP3_DMA_FLIP */
+
 static void st_path_gain(unsigned g)
 {
     field_set(&AUD(0x08), 0x00001f00u, g);          /* channel 0, 5 bits */
@@ -1808,7 +1984,7 @@ void yp3_audio_selftest(void)
     /* Stock's recorded sequence, then a long steady tone for the listener.
      * The rungs below rewrite gains and would undo it, so they are skipped. */
     st_fill(SAMPR_44, 1000);
-    st_stock_replay();
+    yp3_stock_play();
     yp3_regsnap_take('R');
     logf("st: replay tone 1000Hz, holding 15s");
     st_wait_ms(15000);
@@ -1817,6 +1993,10 @@ void yp3_audio_selftest(void)
 #endif
 #if YP3_PAD_SWEEP
     st_pad_sweep();
+    goto st_teardown;
+#endif
+#if YP3_DMA_FLIP
+    st_dma_flip_test();
     goto st_teardown;
 #endif
 #if YP3_PAD_INJECT
@@ -1839,7 +2019,7 @@ void yp3_audio_selftest(void)
         st_wait_ms(700);
     }
 
-#if YP3_STOCK_REPLAY || YP3_PAD_SWEEP || YP3_PAD_INJECT
+#if YP3_STOCK_REPLAY || YP3_PAD_SWEEP || YP3_PAD_INJECT || YP3_DMA_FLIP
 st_teardown:
 #endif
     yp3_speaker_pa(false);
