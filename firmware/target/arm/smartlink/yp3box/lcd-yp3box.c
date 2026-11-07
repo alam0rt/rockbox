@@ -323,7 +323,7 @@ static void lcd_set_window(int x, int y, int w, int h)
  * swapped while chunk k is on the wire. The CPU yields while a chunk is in
  * flight, which is the point. */
 #ifndef YP3_LCD_DMA
-#define YP3_LCD_DMA 0
+#define YP3_LCD_DMA 1       /* on hardware 2026-11-08; 0 = per-pixel PIO */
 #endif
 #define LCD_DMA_CH          0
 #define LCD_DMA_CTRL        0x002891a0u     /* descriptor FIRM 0xd7e0ac */
@@ -340,8 +340,44 @@ static uint16_t lcd_bounce[2][2] __attribute__((aligned(4)));   /* path off */
 #endif
 static bool lcd_dma_ok = YP3_LCD_DMA;
 static bool lcd_dma_ready;
-static unsigned long lcd_dma_frames, lcd_pio_frames;
-static long lcd_dma_t0, lcd_pio_t0;
+/* Full-frame wall time, start of lcd_update_rect to its end, per path: what
+ * the panel costs the thread that draws. Includes time yielded to other
+ * threads, so it is latency, not CPU - the profiler says where the CPU goes.
+ * SysTick within the tick plus whole ticks; 32-bit wrap is harmless for
+ * differences under ~22 s. */
+#define LCD_SYST_RVR   (*(volatile uint32_t *)0xE000E014)
+#define LCD_SYST_CVR   (*(volatile uint32_t *)0xE000E018)
+#define LCD_FRAMES_LOGGED 32
+
+static uint32_t lcd_now_cyc(void)
+{
+    long t;
+    uint32_t c, rvr = LCD_SYST_RVR;
+
+    do {
+        t = current_tick;
+        c = LCD_SYST_CVR;
+    } while (t != current_tick);
+    return (uint32_t)t * (rvr + 1u) + (rvr - c);
+}
+
+struct lcd_ftime { unsigned n; uint32_t sum, max; };
+static struct lcd_ftime lcd_ft_dma, lcd_ft_pio;
+
+static void lcd_frame_time(struct lcd_ftime *f, const char *path, uint32_t t0)
+{
+    uint32_t us = (lcd_now_cyc() - t0) / (CPU_FREQ / 1000000u);
+
+    if (f->n >= LCD_FRAMES_LOGGED)
+        return;
+    f->sum += us;
+    if (us > f->max)
+        f->max = us;
+    if (++f->n == LCD_FRAMES_LOGGED)
+        logf("lcd: %s, %u full frames: avg %lu us, max %lu us", path,
+             LCD_FRAMES_LOGGED, (unsigned long)(f->sum / LCD_FRAMES_LOGGED),
+             (unsigned long)f->max);
+}
 
 static void lcd_dma_open(void)
 {
@@ -537,8 +573,9 @@ void lcd_update_rect(int x, int y, int width, int height)
     if (y + height > LCD_HEIGHT) height = LCD_HEIGHT - y;
     if (width <= 0 || height <= 0) return;
 
-    /* Full-frame timings, one number per path: the first 16 of each. */
+    /* Full-frame timings, one number per path: the first 32 of each. */
     full = (width == LCD_WIDTH && height == LCD_HEIGHT);
+    uint32_t t0 = lcd_now_cyc();
 
     {
         bool yield_ok = lcd_may_yield();
@@ -555,20 +592,10 @@ void lcd_update_rect(int x, int y, int width, int height)
             lcd_update_rect_pio(x, y, width, height, yield_ok);
         lcd_xfer_busy = false;
 
-        if (done) {
-            if (full && lcd_dma_frames < 16 && lcd_dma_frames++ == 0)
-                lcd_dma_t0 = current_tick;
-            else if (full && lcd_dma_frames == 16)
-                logf("lcd: DMA, 15 full frames in %ld ticks",
-                     current_tick - lcd_dma_t0), lcd_dma_frames++;
-            return;
-        }
+        if (full)
+            lcd_frame_time(done ? &lcd_ft_dma : &lcd_ft_pio,
+                           done ? "DMA" : "PIO", t0);
     }
-    if (full && lcd_pio_frames < 16 && lcd_pio_frames++ == 0)
-        lcd_pio_t0 = current_tick;
-    else if (full && lcd_pio_frames == 16)
-        logf("lcd: PIO, 15 full frames in %ld ticks",
-             current_tick - lcd_pio_t0), lcd_pio_frames++;
 }
 
 void lcd_update(void)
