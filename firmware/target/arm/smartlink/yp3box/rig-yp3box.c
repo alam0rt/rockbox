@@ -57,6 +57,16 @@
 #define YP3_RIG_KEYS_INIT { { 0, 0, 0 } }   /* no script */
 #define YP3_RIG_NKEYS 0
 #endif
+#ifndef YP3_WTRACE
+#define YP3_WTRACE 0            /* 1 = record peripheral writes, see below */
+#endif
+
+#if YP3_WTRACE
+/* The DWT write recorder. Its own file so the same source can be compiled
+ * into a patch for the vendor firmware; included rather than listed in
+ * firmware/SOURCES so the port stays inside the target directory. */
+#include "wtrace-yp3box.c"
+#endif
 
 /* A held POWEROFF_BUTTON becomes sys_poweroff() once button.c has counted
  * REPEAT_START ticks plus POWEROFF_COUNT repeats. A rig that powers the device
@@ -243,6 +253,15 @@ void yp3_rig_init(void)
          (unsigned long)yp3_bootctl.warm_flag,
          (unsigned long)yp3_bootctl.warm_vec);
     logf("rig: rom wdog load=%08lx", (unsigned long)yp3_bootctl.rom_wdog_load);
+
+#if YP3_WTRACE
+    {
+        uint32_t n = wtrace_start();
+        logf("wtrace: armed, %lu comparators, mask rb %08lx, dhcsr %08lx, %lu volatile words",
+             (unsigned long)n, (unsigned long)yp3_wtrace.mask_rb,
+             (unsigned long)yp3_wtrace.dhcsr, (unsigned long)yp3_wtrace.volatile_n);
+    }
+#endif
 
     if (YP3_DEADMAN_LOAD) {
         yp3_watchdog_arm(YP3_DEADMAN_LOAD);
