@@ -272,65 +272,71 @@ static void lcd_set_window(int x, int y, int w, int h)
     wd8(y0 >> 8); wd8(y0 & 0xff); wd8(y1 >> 8); wd8(y1 & 0xff);
 }
 
-/* --- pixels by DMA -----------------------------------------------------------
+/* --- pixels by DMA ---------------------------------------------------------
  *
- * The PIO path below sends ONE PIXEL per LCDC transaction and busy-waits each
- * one: 20,480 kick/wait pairs a frame. The sampling profiler (YP3_PROFILE,
- * 2026-09-29) put ~40% of all CPU time in lcdc_wait_idle/lcdc_kick and 0.1% in
- * the codec, which is why playback starves.
+ * A transcription of the vendor's LCD WRITE path. The previous version of
+ * this was a faithful copy of the vendor's READ path, which is why it never
+ * moved a byte (2026-08-21, again 2026-09-29: length register stuck, DONE
+ * almost at once). The vendor has one DMA path per direction:
  *
- * The vendor sets the window by PIO and streams the pixels by DMA - its
- * transfer routine is SRAM 0x815aba(dev, cmd, cmdlen, buf, nbytes):
+ *                     read, FIRM 0xc422ea         write, FIRM 0xc4235e
+ *   descriptor        0xd7e044 (handle slot +0)   0xd7e0ac (handle slot +12)
+ *   channel control   0x001a0289                  0x002891a0
+ *   channel +0x0c     0x13000000                  0x31000000
+ *   dma_start         +04 = LCDC+0x34, +08 = buf  +04 = buf, +08 = LCDC+0x30
+ *   LCDC +0x10        &~0x30,     |= 1<<3         &~0x300000, |= 1<<19
+ *   LCDC +0x20        |1, cmdlen in [9:8]         |2 (write) ... see below
  *
- *   base[0x24] = cmd;  base[0x28] = nbytes - 1      nbytes <= 4096
- *   wait !(status & 0x60000000)
- *   base[0x10] = (base[0x10] & ~0x30) | 8           FIFO fed by DMA
- *   dma_start(tx, src = buf, dst = base + 0x34, nbytes)
- *   base[0x20] = (base[0x20] & ~0x30e) | ((cmdlen - 1) << 8) | 1
+ * Every one of those was the read column. The control words come out of
+ * dma_open (0xd7d7f0): descriptor bytes +14/+15/+16 build the +0x08
+ * (destination) side's width [21:20], burst bit 19 and request [16:12],
+ * bytes +18/+19/+20 the +0x04 (source) side's [9:8], bit 7 and [4:0], and a
+ * request of 0 means memory (bit 17 / bit 5). 0xd7e0ac has destination =
+ * request 9, 32 bit, and source = memory, 16 bit: 0x002891a0. dma_start
+ * (0xc414c4) puts r2 at +0x04 and r1 at +0x08 - the order audio proved by
+ * content on 2026-11-08 - and the length in +0x0c[17:0], in bytes, the same
+ * count LCDC +0x28 gets.
  *
- * The channel is the vendor's LCD TX channel as captured live in
- * probe/dma_work.bin and decoded in docs/DMA.md: channel 0, control
- * 0x001a0289 (16-bit memory source, 32-bit destination, request line 9),
- * length config 0x13000000, config 0x00080002.
+ * All three vendor callers (0xc3f460, 0xc3f8bc, 0xc3f94c) send DATA ONLY -
+ * command count 0, so LCDC +0x20 gets |0xb (no command, write, start), the
+ * same word the PIO data write uses. RAMWR goes out first as an ordinary
+ * command. Chunks are at most 4096 bytes (0xc4235e refuses more) and a
+ * multiple of 4 (0xc3f8fe `bic #3`); an odd pixel count sends its first
+ * pixel by PIO (0xc3f858..0xc3f884 does that with the first two bytes).
  *
- * This path was abandoned on 2026-08-21 ("the DMA channel does not transfer"),
- * before the DMA engine was decoded for audio and before the panel itself
- * worked. It has not been tried on a working display before this.
+ * Not trusted on the LCDC's DONE alone: the LCDC raises DONE once it has
+ * clocked DATALEN bytes, whether or not the DMA fed it any, which is exactly
+ * what the read-path version did. After each chunk the CHANNEL's own
+ * transfer-complete bit (+0x24 bit 1) must be set too. The length field is no
+ * witness: it keeps the programmed count after a completed transfer (the
+ * memory-to-memory test logged `irqst=3 len=00000100` having copied all 64
+ * words). A chunk without channel completion, or that does not finish in
+ * 100 ms, turns this path off for the boot and the caller redraws by PIO - a
+ * bad DMA path costs a log line, not a dead display.
  *
- * Pixels are byte-swapped into SRAM bounce buffers, exactly as the PIO path
- * swaps each pixel: DMA sources must be SRAM anyway (CLAUDE.md), and the swap
- * of chunk k+1 overlaps the transfer of chunk k.
+ * One departure: +0x10 bit 19 is restored after the frame. The vendor leaves
+ * it set; this file's PIO paths have never run with it set, and keeping them
+ * on the configuration they were proved on is the cheaper risk.
  *
- * While a chunk is in flight the CPU YIELDS, which is the point: the codec
- * runs while the panel is fed. Only from thread context with interrupts on and
- * the kernel ticking; anywhere else it spins, bounded, as the PIO path does.
- * A chunk that has not finished in 100 ms is logged, the channel stopped, and
- * the rest of the boot falls back to PIO - a bad DMA path costs a log line,
- * not a dead display.
- *
- * MEASURED 2026-09-29, and it is OFF by default: the panel kept showing the
- * last PIO frame. The first-chunk dump says the channel accepts GO and clears
- * it, but its length register never leaves 0x1000, and the LCDC raises DONE
- * within ~2000 loop iterations of the kick - far too soon for 4 KB on an
- * 8-bit bus. That is the 2026-08-21 result again: the LCDC finishes an empty
- * transaction because it never raises request line 9. The channel descriptor
- * matches the vendor's (FIRM 0xd7e044) field for field and the LCDC's
- * +0x10/+0x40/+0x44 match stock, so the missing enable is somewhere in the
- * vendor's LCD open path, not in anything this file already writes. */
+ * Pixels are byte-swapped into SRAM bounce buffers exactly as the PIO path
+ * swaps each one (DMA sources must be SRAM anyway, CLAUDE.md), chunk k+1
+ * swapped while chunk k is on the wire. The CPU yields while a chunk is in
+ * flight, which is the point. */
 #ifndef YP3_LCD_DMA
 #define YP3_LCD_DMA 0
 #endif
 #define LCD_DMA_CH          0
-#define LCD_DMA_CTRL        0x001a0289u
-#define LCD_DMA_LENCFG      0x13000000u
-#define LCD_DMA_CFG         0x00080002u
-#define LCDC_FIFO           (LCDC_BASE + 0x34)
+#define LCD_DMA_CTRL        0x002891a0u     /* descriptor FIRM 0xd7e0ac */
+#define LCD_DMA_LENCFG      0x31000000u
+#define LCD_DMA_CFG         0x00080002u     /* +0x20: (32 << 14) | 2, +0 == 0 */
+#define LCDC_WFIFO          (LCDC_BASE + 0x30)
+#define LCDC_CFG10_TXDMA    (1u << 19)
 #define LCD_CHUNK_PIX       2048                /* 4096 bytes, the vendor cap */
 
 #if YP3_LCD_DMA
 static uint16_t lcd_bounce[2][LCD_CHUNK_PIX] __attribute__((aligned(4)));
 #else
-static uint16_t lcd_bounce[2][1];   /* 8 KB of SRAM is not spent on a path that is off */
+static uint16_t lcd_bounce[2][2] __attribute__((aligned(4)));   /* path off */
 #endif
 static bool lcd_dma_ok = YP3_LCD_DMA;
 static bool lcd_dma_ready;
@@ -345,6 +351,9 @@ static void lcd_dma_open(void)
     DMA_IRQST(LCD_DMA_CH) = DMA_IRQST(LCD_DMA_CH);
     DMA_CFG(LCD_DMA_CH)   = (DMA_CFG(LCD_DMA_CH) & 0x3fffu) | LCD_DMA_CFG;
     lcd_dma_ready = true;
+    logf("lcd dma: open ctrl=%08lx len=%08lx cfg=%08lx",
+         (unsigned long)DMA_CTRL(LCD_DMA_CH), (unsigned long)DMA_LEN(LCD_DMA_CH),
+         (unsigned long)DMA_CFG(LCD_DMA_CH));
 }
 
 /* Thread context, interrupts on, kernel ticking: the only place yield() is
@@ -376,78 +385,88 @@ static void LCDICODE lcd_fill_bounce(uint16_t *dst, int x, int y, int w,
     }
 }
 
-static bool lcd_dma_wait(bool yield_ok)
+/* Returns the channel status seen at LCDC DONE, or 0xffffffff on timeout. */
+static uint32_t lcd_dma_wait(bool yield_ok)
 {
+    uint32_t st;
     long deadline = current_tick + HZ / 10;
     uint32_t spins = 0;
 
     while (!(LCDC_STATUS & LCDC_ST_DONE)) {
         if (yield_ok) {
             if (TIME_AFTER(current_tick, deadline))
-                return false;
+                return 0xffffffffu;
             yield();
         } else if (++spins > 4u * LCDC_SPIN) {
-            return false;
+            return 0xffffffffu;
         }
     }
     LCDC_STATUS = LCDC_ST_DONE;
-    DMA_IRQST(LCD_DMA_CH) = DMA_IRQST(LCD_DMA_CH);
-    return true;
+    /* The channel finishes its last FIFO write before the LCDC can clock the
+     * last byte out, so its DONE is already up. Bounded short poll anyway. */
+    for (spins = 0; !((st = DMA_IRQST(LCD_DMA_CH)) & DMA_IRQST_DONE)
+                    && spins < 1000u; spins++)
+        ;
+    DMA_IRQST(LCD_DMA_CH) = st;
+    return st;
 }
 
-/* One-shot record of the first chunk: does the channel MOVE bytes? On
- * 2026-08-21 the length register never decremented and DONE was the LCDC
- * finishing an empty transaction; today the panel again shows a stale image
- * while every chunk reports DONE. dma_get_remaining (SRAM 0x814d1c) is
- * ch[0x0c] & 0x3ffff, so a moving channel counts down. */
-static bool lcd_dma_dumped;
-static uint32_t lcd_dd[12];
+static void lcd_dma_fail(const char *why, int sent, int total)
+{
+    DMA_CTRL(LCD_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
+    logf("lcd: DMA %s at %d/%d px: lst=%08lx ctrl=%08lx len=%08lx irq=%08lx "
+         "cfg10=%08lx - PIO from now on", why, sent, total,
+         (unsigned long)LCDC_STATUS, (unsigned long)DMA_CTRL(LCD_DMA_CH),
+         (unsigned long)DMA_LEN(LCD_DMA_CH), (unsigned long)DMA_IRQST(LCD_DMA_CH),
+         (unsigned long)LCDC_CFG10);
+    lcd_dma_ok = false;
+}
 
-static bool lcd_update_rect_dma(int x, int y, int w, int h)
+static unsigned long lcd_dma_chunks;
+
+static bool lcd_update_rect_dma(int x, int y, int w, int h, bool yield_ok)
 {
     int total = w * h, sent = 0, k = 0;
-    bool yield_ok = lcd_may_yield();
+    uint32_t cfg10;
+    bool ok = true;
 
     if (!lcd_dma_ready)
         lcd_dma_open();
 
     lcd_set_window(x, y, w, h);
-    lcd_fill_bounce(lcd_bounce[0], x, y, w, 0,
-                    total < LCD_CHUNK_PIX ? total : LCD_CHUNK_PIX);
+    lcd_write_cmd(0x2c);                                /* RAMWR */
 
+    /* An odd pixel count would leave a chunk that is not a whole number of
+     * 32-bit FIFO words: the first pixel goes by PIO, as the vendor does. */
+    if (total & 1) {
+        unsigned v = *FBADDR(x, y);
+        lcd_write_data_n(((v & 0xff) << 8) | (v >> 8), 2);
+        sent = 1;
+    }
+    if (sent < total)
+        lcd_fill_bounce(lcd_bounce[0], x, y, w, sent,
+                        total - sent < LCD_CHUNK_PIX ? total - sent : LCD_CHUNK_PIX);
+
+    cfg10 = LCDC_CFG10;
     while (sent < total) {
         int n = total - sent;
         unsigned nbytes;
 
         if (n > LCD_CHUNK_PIX)
             n = LCD_CHUNK_PIX;
-        nbytes = (unsigned)n * 2u;
+        nbytes = (unsigned)n * 2u;                      /* a multiple of 4 */
 
-        LCDC_CMD = sent ? 0x3c : 0x2c;          /* RAMWR, then continue */
+        /* FIRM 0xc4235e, in its order. */
+        LCDC_CMD = 0;
         LCDC_DATALEN = nbytes - 1u;
         lcdc_wait_idle();
-        LCDC_CFG10 = (LCDC_CFG10 & ~0x30u) | 8u;
-
-        DMA_DST(LCD_DMA_CH) = LCDC_FIFO;
-        DMA_SRC(LCD_DMA_CH) = (uint32_t)lcd_bounce[k];
+        LCDC_CFG10 = (LCDC_CFG10 & ~0x300000u) | LCDC_CFG10_TXDMA;
+        DMA_SRC(LCD_DMA_CH) = (uint32_t)lcd_bounce[k];          /* +0x04 */
+        DMA_DST(LCD_DMA_CH) = LCDC_WFIFO;                       /* +0x08 */
         DMA_LEN(LCD_DMA_CH) = (DMA_LEN(LCD_DMA_CH) & ~DMA_LEN_MASK) | nbytes;
         DMA_CTRL(LCD_DMA_CH) = (DMA_CTRL(LCD_DMA_CH) & ~DMA_CTRL_CONT)
                              | DMA_CTRL_GO;
-        if (!lcd_dma_dumped) {
-            lcd_dd[0] = DMA_LEN(LCD_DMA_CH);
-            lcd_dd[1] = DMA_CTRL(LCD_DMA_CH);
-            lcd_dd[2] = DMA_IRQST(LCD_DMA_CH);
-            lcd_dd[3] = LCDC_STATUS;
-            lcd_dd[4] = LCDC_CFG10;
-        }
-        LCDC_CTRL = (LCDC_CTRL & ~0x30cu & ~0x2u) | 1u;     /* cmdlen 1 */
-        if (!lcd_dma_dumped) {
-            volatile uint32_t d;
-            for (d = 0; d < 2000u; d++) ;
-            lcd_dd[5] = DMA_LEN(LCD_DMA_CH);        /* shortly after the kick */
-            lcd_dd[6] = LCDC_DATALEN;
-            lcd_dd[7] = LCDC_STATUS;
-        }
+        LCDC_CTRL = (LCDC_CTRL & ~0x30eu) | 0xbu;       /* data only, write */
 
         /* Prepare the next chunk while this one is on the wire. */
         if (sent + n < total) {
@@ -456,37 +475,27 @@ static bool lcd_update_rect_dma(int x, int y, int w, int h)
                             m < LCD_CHUNK_PIX ? m : LCD_CHUNK_PIX);
         }
 
-        if (!lcd_dma_wait(yield_ok)) {
-            DMA_CTRL(LCD_DMA_CH) &= ~(DMA_CTRL_GO | DMA_CTRL_CONT);
-            logf("lcd: DMA chunk timed out at %d/%d px, st=%08lx dma ctrl=%08lx "
-                 "len=%08lx irq=%08lx - PIO from now on", sent, total,
-                 (unsigned long)LCDC_STATUS, (unsigned long)DMA_CTRL(LCD_DMA_CH),
-                 (unsigned long)DMA_LEN(LCD_DMA_CH),
-                 (unsigned long)DMA_IRQST(LCD_DMA_CH));
-            lcd_dma_ok = false;
-            return false;
+        uint32_t st = lcd_dma_wait(yield_ok);
+        if (st == 0xffffffffu) {
+            lcd_dma_fail("timeout", sent, total);
+            ok = false;
+            break;
         }
-        if (!lcd_dma_dumped) {
-            lcd_dd[8]  = DMA_LEN(LCD_DMA_CH);
-            lcd_dd[9]  = DMA_CTRL(LCD_DMA_CH);
-            lcd_dd[10] = LCDC_CTRL;
-            lcd_dd[11] = LCDC_DATALEN;
-            lcd_dma_dumped = true;
-            logf("lcd dma: armed len=%08lx ctrl=%08lx irq=%08lx lst=%08lx cfg10=%08lx",
-                 (unsigned long)lcd_dd[0], (unsigned long)lcd_dd[1],
-                 (unsigned long)lcd_dd[2], (unsigned long)lcd_dd[3],
-                 (unsigned long)lcd_dd[4]);
-            logf("lcd dma: kicked len=%08lx dlen=%08lx lst=%08lx",
-                 (unsigned long)lcd_dd[5], (unsigned long)lcd_dd[6],
-                 (unsigned long)lcd_dd[7]);
-            logf("lcd dma: done len=%08lx ctrl=%08lx lctrl=%08lx dlen=%08lx",
-                 (unsigned long)lcd_dd[8], (unsigned long)lcd_dd[9],
-                 (unsigned long)lcd_dd[10], (unsigned long)lcd_dd[11]);
+        if (!(st & DMA_IRQST_DONE)) {
+            logf("lcd dma: LCDC done, channel not: irqst=%08lx", (unsigned long)st);
+            lcd_dma_fail("no channel completion", sent, total);
+            ok = false;
+            break;
         }
+        if (lcd_dma_chunks++ == 0)
+            logf("lcd dma: first chunk %u bytes, irqst=%08lx ctrl=%08lx cfg10=%08lx",
+                 nbytes, (unsigned long)st, (unsigned long)DMA_CTRL(LCD_DMA_CH),
+                 (unsigned long)LCDC_CFG10);
         sent += n;
         k ^= 1;
     }
-    return true;
+    LCDC_CFG10 = cfg10;                     /* see "one departure" above */
+    return ok;
 }
 
 /* PIO redraws YIELD every 8 rows. A full frame takes ~69 ms of busy-waited
@@ -531,23 +540,29 @@ void lcd_update_rect(int x, int y, int width, int height)
     /* Full-frame timings, one number per path: the first 16 of each. */
     full = (width == LCD_WIDTH && height == LCD_HEIGHT);
 
-    if (lcd_dma_ok && lcd_update_rect_dma(x, y, width, height)) {
-        if (full && lcd_dma_frames < 16 && lcd_dma_frames++ == 0)
-            lcd_dma_t0 = current_tick;
-        else if (full && lcd_dma_frames == 16)
-            logf("lcd: DMA, 15 full frames in %ld ticks",
-                 current_tick - lcd_dma_t0), lcd_dma_frames++;
-        return;
-    }
     {
         bool yield_ok = lcd_may_yield();
+        bool done = false;
 
+        /* Both paths yield mid-frame, so both are serialised. */
         if (yield_ok)
             while (lcd_xfer_busy)
                 yield();
         lcd_xfer_busy = true;
-        lcd_update_rect_pio(x, y, width, height, yield_ok);
+        if (lcd_dma_ok)
+            done = lcd_update_rect_dma(x, y, width, height, yield_ok);
+        if (!done)          /* also redraws whatever a failed DMA left */
+            lcd_update_rect_pio(x, y, width, height, yield_ok);
         lcd_xfer_busy = false;
+
+        if (done) {
+            if (full && lcd_dma_frames < 16 && lcd_dma_frames++ == 0)
+                lcd_dma_t0 = current_tick;
+            else if (full && lcd_dma_frames == 16)
+                logf("lcd: DMA, 15 full frames in %ld ticks",
+                     current_tick - lcd_dma_t0), lcd_dma_frames++;
+            return;
+        }
     }
     if (full && lcd_pio_frames < 16 && lcd_pio_frames++ == 0)
         lcd_pio_t0 = current_tick;
