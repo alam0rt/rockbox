@@ -1225,6 +1225,84 @@ static void st_set_gain(unsigned mask, unsigned g)
     if (mask & 4u) field_set(&AUD(0x2c), 0x001f0000u, g);
 }
 
+/* --- stock replay -----------------------------------------------------------
+ *
+ * The vendor's own play-time register writes, RECORDED from the stock
+ * firmware on this unit (2026-11-07, tools/61_stockpatch_session.sh: the DWT
+ * write recorder patched into stock FIRM, tones audible while it ran).
+ * captures/stocktrace-20261107/run2-capped/stock-trace.json, traps 4717..4797 = pressing
+ * play; values are what each word read back after the write. Not a
+ * transcription - a recording. Applied in stock's order.
+ *
+ * Where stock and this driver differ (the last Rockbox trace,
+ * captures/wtrace-rockbox-selftest-20261107.json):
+ *   - module 0x20 (ASRC window): stock enables it only to zero the ASRC RAM
+ *     (traps 186..317) and turns it OFF; this driver leaves it on. ROM 0x2571
+ *     is the disable stock uses on 0x27/0x29 and usb-yp3box.c already uses.
+ *   - the +0x100 file: stock sets run (bit 1) and channel words 3 at play,
+ *     and CLEARS bit 31 of +0x138/+0x158 (this driver leaves 8000a1ff).
+ *   - analogue: channels 0 and 1 only (+0x40 = a20, +0x4c ends 130030); this
+ *     driver also half-raises channel 2 (0x1a20 / 0x530430).
+ *   - trims 0x0b / 0x4a are written mid-sequence.
+ *   - port 1 pad words +0x48/+0x54/+0x58: stock's pins 14/15 and 20/21 config.
+ *     Pin 10 (LCD reset) is not in any differing field.
+ * GPIO bit 29 of +0x68/+0x70 is the PA (P1.30) - both firmwares set it. */
+#ifndef YP3_STOCK_REPLAY
+#define YP3_STOCK_REPLAY 0
+#endif
+#if YP3_STOCK_REPLAY
+#define ROM_CLK_DISABLE_ ((void (*)(unsigned))0x2571u)
+struct st_rp { uint32_t addr, val; uint16_t ms; };
+static const struct st_rp st_replay[] = {
+    /* t4730..4737: digital, the +0x100 file */
+    { 0x40009000, 0x85000022, 1 }, { 0x40009100, 0x00055700, 1 },
+    { 0x40009100, 0x00055802, 1 }, { 0x40009108, 0x00040300, 1 },
+    { 0x40009108, 0x00040384, 1 }, { 0x40009130, 0x00000003, 1 },
+    { 0x40009138, 0x0000a000, 1 }, { 0x40009150, 0x00000003, 1 },
+    { 0x40009158, 0x0000a000, 1 }, { 0x40009170, 0x00000000, 1 },
+    /* t4741..4758: analogue bring-up, channels 0 and 1 */
+    { 0x40009030, 0x00000001, 1 }, { 0x40009030, 0x00000011, 1 },
+    { 0x40009040, 0x00000210, 1 }, { 0x4000904c, 0x00020000, 1 },
+    { 0x4000904c, 0x00030000, 1 }, { 0x40009040, 0x00000220, 1 },
+    { 0x4000904c, 0x00130000, 1 }, { 0x40009040, 0x00000a20, 1 },
+    { 0x40009050, 0x00028000, 1 }, { 0x40009054, 0x00028000, 5 },
+    { 0x40009064, 0x0000000b, 1 }, { 0x40009068, 0x0000004a, 10 },
+    /* t4769..4787: power-up, settle, gain */
+    { 0x40009050, 0x10028000, 1 }, { 0x40009054, 0x10028000, 1 },
+    { 0x40009050, 0x30028000, 1 }, { 0x40009054, 0x30028000, 1 },
+    { 0x4000904c, 0x00130030, 1 }, { 0x4000904c, 0x00130033, 1 },
+    { 0x40009050, 0x30028fff, 1 }, { 0x40009054, 0x30028fff, 20 },
+    { 0x4000904c, 0x00130030, 1 },
+    /* t4790..4794 and boot: port 1 pad configuration */
+    { 0x40081048, 0xff99fc5f, 1 }, { 0x40081054, 0x55455000, 1 },
+    { 0x40081058, 0x05555041, 1 },
+};
+
+static void st_stock_replay(void)
+{
+    unsigned i;
+
+    ROM_CLK_DISABLE_(ASRC_MODULE);              /* stock trap 316 */
+    logf("rp: asrc module 0x20 off, on=%d", ROM_CLK_IS_ON(ASRC_MODULE));
+    for (i = 0; i < ARRAYLEN(st_replay); i++) {
+        REG32(st_replay[i].addr) = st_replay[i].val;
+        st_wait_ms(st_replay[i].ms);
+        if (REG32(st_replay[i].addr) != st_replay[i].val)
+            logf("rp: %08lx wrote %08lx read %08lx",
+                 (unsigned long)st_replay[i].addr,
+                 (unsigned long)st_replay[i].val,
+                 (unsigned long)REG32(st_replay[i].addr));
+    }
+    logf("rp: done 000=%08lx 100=%08lx 138=%08lx 040=%08lx 04c=%08lx 050=%08lx",
+         (unsigned long)AUD(0x00), (unsigned long)AUD(0x100),
+         (unsigned long)AUD(0x138), (unsigned long)AUD(0x40),
+         (unsigned long)AUD(0x4c), (unsigned long)AUD(0x50));
+    logf("rp: 200=%08lx 208=%08lx clk64=%08lx gpio68=%08lx",
+         (unsigned long)AUD(0x200), (unsigned long)AUD(0x208),
+         (unsigned long)REG32(0x40080064), (unsigned long)REG32(0x40081068));
+}
+#endif
+
 /* The analogue output pads, transcribed from the vendor's own walk.
  *
  * Each analogue channel owns TWO pads, which is what a differential output
@@ -1430,6 +1508,18 @@ void yp3_audio_selftest(void)
          (unsigned long)AUD(0x08), (unsigned long)AUD(0x0c));
     yp3_speaker_pa(true);
 
+#if YP3_STOCK_REPLAY
+    /* Stock's recorded sequence, then a long steady tone for the listener.
+     * The rungs below rewrite gains and would undo it, so they are skipped. */
+    st_fill(SAMPR_44, 1000);
+    st_stock_replay();
+    yp3_regsnap_take('R');
+    logf("st: replay tone 1000Hz, holding 15s");
+    st_wait_ms(15000);
+    logf("st: replay done irqs=%lu", (unsigned long)st_irqs);
+    goto st_teardown;
+#endif
+
     for (k = 0; k < 5; k++) {
         st_path_gain(gain[k]);
         st_fill(SAMPR_44, freq[k]);
@@ -1442,6 +1532,9 @@ void yp3_audio_selftest(void)
         st_wait_ms(700);
     }
 
+#if YP3_STOCK_REPLAY
+st_teardown:
+#endif
     yp3_speaker_pa(false);
     st_active = false;
     yp3_irq_disable(DMA_IRQ(PCM_DMA_CH));

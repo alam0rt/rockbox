@@ -50,8 +50,40 @@
 #ifndef WTRACE_SECTION_RING
 #define WTRACE_SECTION_RING __attribute__((section(".yp3snap")))
 #endif
+#ifndef WTRACE_QUOTA_OTHER
+#define WTRACE_QUOTA_OTHER 0    /* records allowed outside the audio window;
+                                 * 0 = no limit. The vendor's boot chatters on
+                                 * GPIO and the clocks, and its ring is small. */
+#endif
 #ifndef WTRACE_RECORDS
 #define WTRACE_RECORDS 2048   /* 3072 starved the audio arena: "EOM 42044 > 39784" */
+#endif
+#ifndef WTRACE_HEAD
+#define WTRACE_HEAD WTRACE_RECORDS  /* records kept from the start; the rest
+                                     * of the ring is a circular TAIL holding
+                                     * the newest. HEAD == RECORDS: linear. */
+#endif
+#ifndef WTRACE_BULK
+#define WTRACE_BULK 24      /* more changed words than this in one trap is a
+                             * block powering up or a RAM window mapping in,
+                             * not a write: one summary record. The first stock
+                             * trace lost 300 records to one such trap. */
+#endif
+#ifndef WTRACE_SNAP
+#define WTRACE_SNAP 0       /* 1: one full-state snapshot while playing - see
+                             * wt_snap_take. The bulk summaries hide init
+                             * values, so the first stock trace could not say
+                             * what the +0x200 file or the DMA engine held. */
+#endif
+#ifndef WTRACE_SNAP_DELAY
+#define WTRACE_SNAP_DELAY 300   /* traps after the trigger: ~1 s of stock play */
+#endif
+#ifndef WTRACE_CAP_AUD
+#define WTRACE_CAP_AUD 24   /* records per audio-block word; 0 = no cap */
+#endif
+#ifndef WTRACE_CAP_OTHER
+#define WTRACE_CAP_OTHER 8  /* records per GPIO/clock word: a calibration
+                             * loop at stock boot rewrote 20 words 380 times */
 #endif
 
 #define WT_REG(a)        (*(volatile uint32_t *)(a))
@@ -74,6 +106,8 @@
 #define WT_MAGIC         0x43525457u    /* "WTRC" */
 #define WT_NWIN          4
 #define WT_TOUCH         0xFFFF0000u    /* addr of a touch record: | window */
+#define WT_BULKREC       0xFFFE0000u    /* addr of a bulk summary: | window;
+                                         * val = words that changed */
 
 /* The four windows. Sizes are what gets diffed; mask bits are what the
  * comparator ignores, so the watched span is 1 << mask. Not const: a const
@@ -94,6 +128,9 @@ static struct wt_win wt_win[WT_NWIN] __attribute__((section(".data"))) = {
     { 0x40085000u, 0x200u / 4,  9 },   /* clock control, PMU mailbox, PHY  */
 };
 #define WT_SHADOW_WORDS  ((0x600u + 0x100u + 0x200u + 0x200u) / 4)
+_Static_assert(WTRACE_RECORDS * 16 >= WT_SHADOW_WORDS * 4,
+               "the learning snapshot borrows the ring");
+_Static_assert(WTRACE_HEAD <= WTRACE_RECORDS, "head larger than the ring");
 
 struct wt_rec {
     uint32_t ev;        /* trap number: this core has no DWT_CYCCNT
@@ -116,8 +153,26 @@ struct wt_ring {
     uint32_t volatile_n;    /* words learned volatile, all windows */
     uint32_t dhcsr;         /* C_DEBUGEN set = DebugMonitor cannot fire */
     uint32_t start_cyc;
-    uint32_t reserved;
+    uint32_t quota_dropped; /* non-audio records refused by the quota */
+    uint32_t head;          /* rec[0..head) is the start; the rest circular */
+    uint32_t bulk;          /* traps summarised as bulk */
+    uint32_t capped;        /* records refused by the per-word cap */
+    uint32_t nwords;        /* entries in changes[] */
     struct wt_rec rec[WTRACE_RECORDS];
+#if WTRACE_SNAP
+    /* filled once: WTRACE_SNAP_DELAY traps after AUD+0x50 first reads
+     * 0x30028fff (stock's analogue fully up, trap 4775 of the 2026-11-07 run) */
+    uint32_t snap_magic;    /* "SNAP" when taken */
+    uint32_t snap_trigger;  /* trap number of the trigger */
+    uint32_t snap_ev;       /* trap number when taken */
+    uint32_t snap_aud[0x600 / 4];       /* 0x40009000; FIFO words read as 0 */
+    uint32_t snap_gpio[0x100 / 4];      /* 0x40081000 */
+    uint32_t snap_clk80[0x200 / 4];     /* 0x40080000 */
+    uint32_t snap_clk85[0x200 / 4];     /* 0x40085000 */
+    uint32_t snap_dma[0x200 / 4];       /* 0x40001000, the general DMA engine */
+#endif
+    uint16_t changes[WT_SHADOW_WORDS]; /* per watched word: times it changed (saturating),
+                             * window order as wt_win - the hammered registers */
 };
 
 struct wt_ring yp3_wtrace WTRACE_SECTION_RING;
@@ -125,6 +180,7 @@ struct wt_ring yp3_wtrace WTRACE_SECTION_RING;
 static uint32_t wt_shadow[WT_SHADOW_WORDS];
 static uint32_t wt_volatile[(WT_SHADOW_WORDS + 31) / 32];
 static uint32_t wt_off[WT_NWIN];        /* shadow offset of each window */
+static uint32_t wt_other;               /* non-audio records stored */
 
 /* Never read: the read has a side effect, or the word is input data. */
 static inline int WTRACE_SECTION_CODE wt_skip(unsigned w, unsigned i)
@@ -139,34 +195,76 @@ static inline int WTRACE_SECTION_CODE wt_skip(unsigned w, unsigned i)
 
 #define WT_DEDUPE 16
 
-static void WTRACE_SECTION_CODE wt_put(uint32_t pc, uint32_t addr, uint32_t val)
+/* Logical record k -> slot. The head is fixed; past it the ring wraps. */
+static inline uint32_t WTRACE_SECTION_CODE wt_slot(uint32_t k)
+{
+    uint32_t h = WTRACE_HEAD;
+    return k < h ? k : h + (k - h) % (WTRACE_RECORDS - h);
+}
+
+/* s: the word's shadow index, for the per-word cap; -1 for touch/bulk. */
+static void WTRACE_SECTION_CODE wt_put(uint32_t pc, uint32_t addr, uint32_t val, int s)
 {
     struct wt_ring *r = &yp3_wtrace;
-    uint32_t n = r->count, k;
+    uint32_t n = r->count, k, live;
 
-    for (k = 1; k <= WT_DEDUPE && k <= n; k++) {
-        struct wt_rec *p = &r->rec[n - k];
+    if (s >= 0) {
+        uint32_t c = yp3_wtrace.changes[s];
+        uint32_t cap = (uint32_t)s < wt_win[0].words ? WTRACE_CAP_AUD : WTRACE_CAP_OTHER;
+        if (cap && c > cap) {
+            r->capped++;
+            return;
+        }
+    }
+    live = n < WTRACE_RECORDS ? n : WTRACE_RECORDS;
+    for (k = 1; k <= WT_DEDUPE && k <= live; k++) {
+        struct wt_rec *p = &r->rec[wt_slot(n - k)];
         if (p->pc == pc && p->addr == addr && p->val == val) {
             r->suppressed++;
             return;
         }
     }
     if (n >= r->cap) {
-        r->dropped++;
-        return;
+        if (WTRACE_HEAD >= WTRACE_RECORDS) {
+            r->dropped++;
+            return;
+        }
+        r->dropped++;                   /* now: overwritten, oldest tail first */
     }
-    r->rec[n].ev   = r->events;
-    r->rec[n].pc   = pc;
-    r->rec[n].addr = addr;
-    r->rec[n].val  = val;
+    if (WTRACE_QUOTA_OTHER && (addr >> 12) != 0x40009u && addr != WT_TOUCH) {
+        if (wt_other >= WTRACE_QUOTA_OTHER) {
+            r->quota_dropped++;
+            return;
+        }
+        wt_other++;
+    }
+    k = wt_slot(n);
+    r->rec[k].ev   = r->events;
+    r->rec[k].pc   = pc;
+    r->rec[k].addr = addr;
+    r->rec[k].val  = val;
     r->count = n + 1;
 }
 
 static void WTRACE_SECTION_CODE wt_diff(unsigned w, uint32_t pc)
 {
     uint32_t base = wt_win[w].base, nw = wt_win[w].words, o = wt_off[w];
-    uint32_t i, changed = 0;
+    uint32_t i, changed = 0, bulk;
 
+    /* Count first: a trap that changes a whole block is not a write. */
+    for (i = 0; i < nw; i++) {
+        uint32_t s = o + i;
+        if (wt_skip(w, i) || (wt_volatile[s >> 5] & (1u << (s & 31))))
+            continue;
+        if (WT_REG(base + i * 4) != wt_shadow[s])
+            changed++;
+    }
+    bulk = changed > WTRACE_BULK;
+    if (bulk) {
+        yp3_wtrace.bulk++;
+        wt_put(pc, WT_BULKREC | w, changed, -1);
+    }
+    changed = 0;
     for (i = 0; i < nw; i++) {
         uint32_t s = o + i, v;
         if (wt_skip(w, i) || (wt_volatile[s >> 5] & (1u << (s & 31))))
@@ -174,19 +272,62 @@ static void WTRACE_SECTION_CODE wt_diff(unsigned w, uint32_t pc)
         v = WT_REG(base + i * 4);
         if (v != wt_shadow[s]) {
             wt_shadow[s] = v;
-            wt_put(pc, base + i * 4, v);
             changed++;
+            if (!bulk) {
+                if (yp3_wtrace.changes[s] != 0xffffu)
+                    yp3_wtrace.changes[s]++;
+                wt_put(pc, base + i * 4, v, (int)s);
+            }
         }
     }
     if (!changed)
-        wt_put(pc, WT_TOUCH | w, 0);
+        wt_put(pc, WT_TOUCH | w, 0, -1);
     if (w == 3) {
         /* The PMU mailbox repeats commands with identical values, which a
          * diff cannot see; keep the raw words on every trap. */
-        wt_put(pc, base + 0x104, WT_REG(base + 0x104));
-        wt_put(pc, base + 0x108, WT_REG(base + 0x108));
+        wt_put(pc, base + 0x104, WT_REG(base + 0x104), (int)(o + 0x104 / 4));
+        wt_put(pc, base + 0x108, WT_REG(base + 0x108), (int)(o + 0x108 / 4));
     }
 }
+
+#if WTRACE_SNAP
+#define WT_SNAP_MAGIC 0x50414e53u     /* "SNAP" */
+static uint32_t wt_snap_trigger;
+
+static void WTRACE_SECTION_CODE wt_copy(uint32_t *dst, uint32_t base, uint32_t bytes)
+{
+    uint32_t i;
+    for (i = 0; i < bytes / 4; i++)
+        dst[i] = WT_REG(base + i * 4);
+}
+
+static void WTRACE_SECTION_CODE wt_snap_check(void)
+{
+    struct wt_ring *r = &yp3_wtrace;
+    uint32_t i;
+
+    if (r->snap_magic == WT_SNAP_MAGIC)
+        return;
+    if (!wt_snap_trigger) {
+        if (WT_REG(0x40009050u) == 0x30028fffu) {
+            wt_snap_trigger = r->events;
+            r->snap_trigger = r->events;
+        }
+        return;
+    }
+    if (r->events - wt_snap_trigger < WTRACE_SNAP_DELAY)
+        return;
+    r->snap_ev = r->events;
+    for (i = 0; i < 0x600 / 4; i++)                 /* never read a FIFO */
+        r->snap_aud[i] = (i * 4 == 0x10c || i * 4 == 0x20c)
+                       ? 0 : WT_REG(0x40009000u + i * 4);
+    wt_copy(r->snap_gpio, 0x40081000u, sizeof r->snap_gpio);
+    wt_copy(r->snap_clk80, 0x40080000u, sizeof r->snap_clk80);
+    wt_copy(r->snap_clk85, 0x40085000u, sizeof r->snap_clk85);
+    wt_copy(r->snap_dma, 0x40001000u, sizeof r->snap_dma);
+    r->snap_magic = WT_SNAP_MAGIC;
+}
+#endif
 
 /* Called from the naked handler with the stacked PC. Returns through the
  * EXC_RETURN the handler left in lr. */
@@ -203,6 +344,9 @@ void WTRACE_SECTION_CODE __attribute__((used)) wtrace_event(uint32_t pc)
     for (w = 0; w < WT_NWIN; w++)
         if (hit & (1u << w))
             wt_diff(w, pc);
+#if WTRACE_SNAP
+    wt_snap_check();
+#endif
     WT_REG(WT_DFSR) = 0x1fu;            /* write-one-to-clear, DWTTRAP etc. */
 }
 
@@ -231,7 +375,9 @@ static void wt_snapshot(uint32_t *dst)
 uint32_t wtrace_start(void)
 {
     struct wt_ring *r = &yp3_wtrace;
-    static uint32_t again[WT_SHADOW_WORDS];
+    /* The second learning snapshot borrows the ring, which is not live yet:
+     * 2.8 KB the vendor-side build does not have to spare. */
+    uint32_t *again = (uint32_t *)r->rec;
     uint32_t o = 0, i, numcomp, mrb = 0;
     unsigned w;
     volatile uint32_t spin;
@@ -246,7 +392,18 @@ uint32_t wtrace_start(void)
 
     r->magic = 0;
     r->count = r->dropped = r->suppressed = r->events = 0;
+    r->quota_dropped = 0;
+    wt_other = 0;
     r->cap = WTRACE_RECORDS;
+    r->head = WTRACE_HEAD;
+    r->bulk = r->capped = 0;
+    r->nwords = WT_SHADOW_WORDS;
+#if WTRACE_SNAP
+    r->snap_magic = r->snap_trigger = r->snap_ev = 0;
+    wt_snap_trigger = 0;
+#endif
+    for (i = 0; i < WT_SHADOW_WORDS; i++)
+        yp3_wtrace.changes[i] = 0;
     r->dwt_ctrl = WT_REG(WT_DWT_CTRL);
     r->dhcsr = WT_REG(WT_DHCSR);
 
@@ -265,7 +422,9 @@ uint32_t wtrace_start(void)
             r->volatile_n++;
         }
 
-    r->start_cyc = 0;
+    r->start_cyc = WTRACE_SNAP;     /* reused as a layout flag: 1 = a snapshot
+                                     * block sits between rec[] and changes[]
+                                     * (this core has no cycle counter) */
 
     for (w = 0; w < WT_NWIN && w < numcomp; w++) {
         WT_REG(WT_DWT_FUNC(w)) = 0;
