@@ -721,6 +721,10 @@ static void yp3_dma_play(const void *addr, size_t size)
 static int16_t st_tone[ST_FRAMES * 2] __attribute__((aligned(4)));
 static volatile bool st_active;
 static volatile uint32_t st_irqs;
+/* bytes the IRQ re-arms with; the pad sweep shortens it so a rung's pitch
+ * closes exactly at the loop point (441 frames = 10 ms = whole cycles of
+ * every multiple of 100 Hz; 880 frames is 19.95 ms and closes none). */
+static size_t st_len = ST_FRAMES * 4;
 void yp3_audio_selftest(void);       /* defined at the foot of this file */
 
 /* A register snapshot taken while the self-test tone is playing, in .persist
@@ -831,7 +835,7 @@ void yp3_dma2_irq(void)
     if (st_active) {
         st_irqs++;
         if (status & DMA_IRQST_DONE)
-            yp3_dma_play(st_tone, sizeof st_tone);
+            yp3_dma_play(st_tone, st_len);
         return;
     }
 #endif
@@ -1337,7 +1341,7 @@ static void st_stock_replay(void)
  * already been tested and logged. */
 #define PAD_MODE15  0x780u
 
-static void st_pad_walk(unsigned ch)
+static void __attribute__((unused)) st_pad_walk(unsigned ch)
 {
     unsigned a = 0x15000u + ch * 0x1000u;       /* 0x15000/0x16000/0x17000 */
     unsigned b = a + 0x800u;
@@ -1447,6 +1451,116 @@ static void st_tx_channels(unsigned mask)
  * clear. docs/AUDIO.md already records this exact failure for the DIGITAL
  * volume - "clocked, configured, actively transferring and still silent" -
  * and it is the same trap one layer down. */
+/* --- the output pad sweep ---------------------------------------------------
+ *
+ * The only sound this port has ever made (1a49b16552, build d19b8dab14) came
+ * during a pad walk whose one visible effect was clearing the PULL field of
+ * P1.12..P1.15 from 01 to 00 [L]. Replaying stock's recorded register writes
+ * was silent [L]. So this measures the pads directly: each rung sets the two
+ * output pairs to one (mode, pull) and plays ONE sine pitch, 300 Hz + 100 Hz
+ * per rung, so the microphone recording names the rung by frequency alone
+ * (tools/listen.py analyse --tones 300,400,...,2700) - no clock alignment.
+ *
+ * Every rung sets BOTH pairs, so rungs are independent of their order. The
+ * resting state is mode 15 pull 1, which is stock's while it plays (gpio+054
+ * = 55455000 in run 2). Rung 0 and the two pull-1 rungs are that same state:
+ * three controls that must agree.
+ *
+ * The descriptor is ROM 0x7ac's: port [19:16], pin [15:11], mode [10:7],
+ * level [6], pull [5:4], alt [3:0] - read from ROM 0x7b8..0x7c4, and alt 0
+ * maps to 0x80000000, i.e. both alt fields 0, which is what these pads hold
+ * in both firmwares. P1.10/P1.11 (pair 0) are never touched: P1.10 is the
+ * panel reset.
+ *
+ * Sines, not squares: a square's odd harmonics would land on other rungs'
+ * pitches. Bhaskara's sine approximation (error < 0.2%, harmonics below
+ * -50 dB) in integer arithmetic, no libm. */
+#ifndef YP3_PAD_SWEEP
+#define YP3_PAD_SWEEP 0
+#endif
+#if YP3_PAD_SWEEP
+#define SW_P12  0x16000u        /* P1.12 */
+#define SW_P13  0x16800u        /* P1.13 */
+#define SW_P14  0x17000u        /* P1.14 */
+#define SW_P15  0x17800u        /* P1.15 */
+
+static void sw_pad(unsigned pad, unsigned mode, unsigned pull)
+{
+    ROM_GPIO_CFG1(pad | (mode << 7) | (pull << 4));
+}
+
+static void sw_pairs(unsigned m1, unsigned p1, unsigned m2, unsigned p2)
+{
+    sw_pad(SW_P12, m1, p1);
+    sw_pad(SW_P13, m1, p1);
+    sw_pad(SW_P14, m2, p2);
+    sw_pad(SW_P15, m2, p2);
+}
+
+static void sw_sine(unsigned freq, int amp)
+{
+    const int64_t P = 1 << 15;                  /* half a cycle */
+    unsigned i;
+
+    for (i = 0; i < ST_FRAMES; i++) {
+        int64_t x = (int64_t)((i * freq) % SAMPR_44) * 2 * P / SAMPR_44;
+        int neg = x >= P;
+        int64_t t, v;
+
+        if (neg)
+            x -= P;
+        t = x * (P - x);
+        v = (16 * t * amp) / (5 * P * P - 4 * t);
+        st_tone[i * 2] = st_tone[i * 2 + 1] = (int16_t)(neg ? -v : v);
+    }
+}
+
+static void sw_silence(void)
+{
+    unsigned i;
+
+    for (i = 0; i < ST_FRAMES * 2; i++)
+        st_tone[i] = 0;
+}
+
+/* m1/p1 for P1.12+13, m2/p2 for P1.14+15 */
+static const struct { uint8_t m1, p1, m2, p2; } sw_rung[] = {
+    { 15, 1, 15, 1 },                                       /*  0 control */
+    { 15, 0, 15, 1 }, { 15, 1, 15, 1 }, { 15, 2, 15, 1 }, { 15, 3, 15, 1 },
+    { 15, 1, 15, 0 }, { 15, 1, 15, 1 }, { 15, 1, 15, 2 }, { 15, 1, 15, 3 },
+    { 15, 0, 15, 0 },                                       /*  9 v3's end */
+    {  0, 0,  0, 0 }, {  1, 0,  1, 0 }, {  2, 0,  2, 0 }, {  3, 0,  3, 0 },
+    {  4, 0,  4, 0 }, {  5, 0,  5, 0 }, {  6, 0,  6, 0 }, {  7, 0,  7, 0 },
+    {  8, 0,  8, 0 }, {  9, 0,  9, 0 }, { 10, 0, 10, 0 }, { 11, 0, 11, 0 },
+    { 12, 0, 12, 0 }, { 13, 0, 13, 0 }, { 14, 0, 14, 0 },   /* 24 */
+};
+
+static void st_pad_sweep(void)
+{
+    unsigned k, n = sizeof sw_rung / sizeof sw_rung[0];
+
+    logf("st: ==== pad sweep: %u rungs, rung k = %u Hz + 100k ====", n, 300u);
+    st_len = 441u * 4u;             /* takes effect at the next completion */
+    for (k = 0; k < n; k++) {
+        unsigned f = 300u + 100u * k;
+
+        sw_pairs(sw_rung[k].m1, sw_rung[k].p1, sw_rung[k].m2, sw_rung[k].p2);
+        sw_sine(f, 12000);
+        /* readback: P1 modes 8-15 (+0x44), pulls 0-15 (+0x54) */
+        logf("sw: %2u %4uHz m%u/p%u m%u/p%u 44=%08lx 54=%08lx irq=%lu", k, f,
+             sw_rung[k].m1, sw_rung[k].p1, sw_rung[k].m2, sw_rung[k].p2,
+             (unsigned long)*(volatile uint32_t *)0x40081044u,
+             (unsigned long)*(volatile uint32_t *)0x40081054u,
+             (unsigned long)st_irqs);
+        st_wait_ms(2500);
+        sw_silence();
+        st_wait_ms(400);
+    }
+    sw_pairs(15, 1, 15, 1);
+    logf("st: ==== pad sweep done irq=%lu ====", (unsigned long)st_irqs);
+}
+#endif /* YP3_PAD_SWEEP */
+
 static void st_path_gain(unsigned g)
 {
     field_set(&AUD(0x08), 0x00001f00u, g);          /* channel 0, 5 bits */
@@ -1495,7 +1609,9 @@ void yp3_audio_selftest(void)
         ROM_CLK_ENABLE(2u);
     ROM_CLK_DIV(0x2cu, 8u);
     ROM_CLK_APPLY(0x2cu);
-    st_pad_walk(2);
+#if !YP3_PAD_SWEEP
+    st_pad_walk(2);                 /* the sweep sets every pad itself */
+#endif
 
     yp3_dma_open();
     st_irqs = 0;
@@ -1519,6 +1635,10 @@ void yp3_audio_selftest(void)
     logf("st: replay done irqs=%lu", (unsigned long)st_irqs);
     goto st_teardown;
 #endif
+#if YP3_PAD_SWEEP
+    st_pad_sweep();
+    goto st_teardown;
+#endif
 
     for (k = 0; k < 5; k++) {
         st_path_gain(gain[k]);
@@ -1532,7 +1652,7 @@ void yp3_audio_selftest(void)
         st_wait_ms(700);
     }
 
-#if YP3_STOCK_REPLAY
+#if YP3_STOCK_REPLAY || YP3_PAD_SWEEP
 st_teardown:
 #endif
     yp3_speaker_pa(false);
