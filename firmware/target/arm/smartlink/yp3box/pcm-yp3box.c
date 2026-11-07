@@ -1561,6 +1561,186 @@ static void st_pad_sweep(void)
 }
 #endif /* YP3_PAD_SWEEP */
 
+/* --- signal injection: which pad, if any, is wired to the amplifier ---------
+ *
+ * Every audio test so far needed the DAC to make a signal first, so none of
+ * them could tell "the DAC is silent" from "the DAC is fine and not wired to
+ * where we think". This one bypasses the DAC: it puts a square wave straight
+ * onto one pad at a time, with the PA open, and the microphone says whether
+ * the amplifier hears it. One pitch per (pass, pad), so the recording names
+ * the pad by frequency.
+ *
+ * The GPIO helpers, read from the boot ROM:
+ *   level  ROM 0x556: write 1 << pin to +0x34 to set, +0x38 to clear
+ *   pull   ROM 0x5e2: 2-bit field per pin, +0x14 (pins 0-15), +0x18 (16-31)
+ *   mode   ROM 0x568: 4-bit field per pin, +0x00..+0x0c
+ *   output ROM 0x590: mode 1, then set/clear - so mode 1 is a GPIO output
+ *
+ *   A  pull toggled 1 <-> 2 in the pad's current mode (15)    1000 + 200j Hz
+ *   B  mode 0, pull toggled 1 <-> 2                          1100 + 200j Hz
+ *   C  mode 1 output, level toggled - P1.11..15 only           400 + 100j Hz
+ *
+ * A and B drive through the pull resistor, so they cannot fight another
+ * driver. C is a real push-pull drive and is limited to the vendor's own
+ * audio pads. Every pad is put back to its saved mode and pull afterwards.
+ *
+ * Edges are timed on the DWT cycle counter, and the counter is calibrated
+ * against 100 completions of the 441-frame silence buffer (exactly 1 s at
+ * 44.1 kHz) in the same boot, so the pitches are exact whatever the core
+ * clock really is. */
+#ifndef YP3_PAD_INJECT
+#define YP3_PAD_INJECT 0
+#endif
+#if YP3_PAD_INJECT
+#define P1_BASE     0x40081040u
+#define P1_REG(o)   (*(volatile uint32_t *)(P1_BASE + (o)))
+/* NO DWT CYCCNT on this part: DWT_CTRL reads 0x4f000000, bit 25 NOCYCCNT
+ * (the stock-recorder header, 2026-11-07), and the first injection build
+ * measured 0 Hz. So time comes from SysTick: its 24-bit countdown is
+ * accumulated across reloads into a 32-bit count. That only works while it
+ * is polled at least once per reload period (one 10 ms tick), which every
+ * loop here does. */
+#define SYST_RVR_R  (*(volatile uint32_t *)0xe000e014u)
+#define SYST_CVR_R  (*(volatile uint32_t *)0xe000e018u)
+
+static uint32_t inj_hz;         /* core cycles per second, measured */
+static uint32_t inj_acc, inj_last;
+
+static inline __attribute__((always_inline)) uint32_t inj_now(void)
+{
+    uint32_t c = SYST_CVR_R & 0xffffffu;
+
+    inj_acc += (inj_last >= c) ? inj_last - c : inj_last + SYST_RVR_R + 1u - c;
+    inj_last = c;
+    return inj_acc;
+}
+
+static uint32_t inj_mode_get(unsigned pin)
+{
+    return (P1_REG((pin >> 3) * 4) >> ((pin & 7) * 4)) & 15u;
+}
+
+static void inj_mode_set(unsigned pin, unsigned m)
+{
+    volatile uint32_t *r = &P1_REG((pin >> 3) * 4);
+    unsigned sh = (pin & 7) * 4;
+    *r = (*r & ~(15u << sh)) | (m << sh);
+}
+
+static uint32_t inj_pull_get(unsigned pin)
+{
+    return (P1_REG(0x14 + (pin >> 4) * 4) >> ((pin & 15) * 2)) & 3u;
+}
+
+static void inj_pull_set(unsigned pin, unsigned p)
+{
+    volatile uint32_t *r = &P1_REG(0x14 + (pin >> 4) * 4);
+    unsigned sh = (pin & 15) * 2;
+    *r = (*r & ~(3u << sh)) | (p << sh);
+}
+
+/* Toggle for `ms` at `freq`: drive != 0 toggles the output level, else the
+ * pull field between 1 and 2. Absolute edge times, so an interrupt delays an
+ * edge without changing the pitch. In SRAM: a flash-resident loop would add
+ * microseconds of jitter per edge. */
+static void __attribute__((section(".icode"), noinline))
+inj_toggle(unsigned pin, unsigned freq, unsigned ms, int drive)
+{
+    volatile uint32_t *pr = &P1_REG(0x14 + (pin >> 4) * 4);
+    uint32_t sh = (pin & 15) * 2, bit = 1u << pin;
+    uint32_t half = inj_hz / (2u * freq);
+    uint32_t edges = (uint32_t)(((uint64_t)freq * 2u * ms) / 1000u);
+    uint32_t t = inj_now(), e;
+
+    for (e = 0; e < edges; e++) {
+        t += half;
+        while ((int32_t)(inj_now() - t) < 0)
+            ;
+        if (drive)
+            P1_REG((e & 1) ? 0x38 : 0x34) = bit;
+        else
+            *pr = (*pr & ~(3u << sh)) | (((e & 1) ? 1u : 2u) << sh);
+    }
+}
+
+static void st_pad_inject(void)
+{
+    static const uint8_t ab_pins[] = { 11, 12, 13, 14, 15, 16, 19, 20, 21 };
+    static const uint8_t c_pins[] = { 11, 12, 13, 14, 15 };
+    unsigned j, i0;
+    uint32_t c0;
+
+    inj_last = SYST_CVR_R & 0xffffffu;
+    i0 = st_irqs;
+    while (st_irqs == i0)
+        inj_now();
+    c0 = inj_now();
+    i0 = st_irqs;
+    while (st_irqs - i0 < 100u)
+        inj_now();
+    inj_hz = inj_now() - c0;
+    logf("inj: core %lu Hz (100 DMA periods of 10 ms)", (unsigned long)inj_hz);
+    if (inj_hz < 10000000u || inj_hz > 400000000u) {
+        logf("inj: implausible clock, abort");
+        return;
+    }
+
+    /* POSITIVE CONTROL, independent of the DAC and of every pad below: the
+     * PA's own enable, toggled at ~5 Hz. docs/AUDIO.md records opening and
+     * closing the PA as audible (its noise floor), so the microphone must
+     * see the room's broadband level pump at this rate. If it does not, the
+     * microphone cannot hear the speaker and no silence below means anything.
+     * On and off differ only in alt (11 vs 0) - SPK_PA_ON/OFF. */
+    logf("inj: PA ctrl 5Hz x20 irq=%lu", (unsigned long)st_irqs);
+    for (j = 0; j < 40; j++) {
+        ROM_GPIO_CFG1((j & 1) ? SPK_PA_OFF : SPK_PA_ON);
+        st_wait_ms(70);                 /* ~100 ms: udelay runs ~1.44x long */
+    }
+    ROM_GPIO_CFG1(SPK_PA_ON);
+    logf("inj: PA ctrl done irq=%lu", (unsigned long)st_irqs);
+    st_wait_ms(700);
+
+#if YP3_PAD_INJECT == 1
+    for (j = 0; j < sizeof ab_pins; j++) {
+        unsigned pin = ab_pins[j], m = inj_mode_get(pin), p = inj_pull_get(pin);
+        logf("inj: A P1.%u %uHz mode %u pull %u irq=%lu", pin, 1000u + 200u * j,
+             m, p, (unsigned long)st_irqs);
+        inj_toggle(pin, 1000u + 200u * j, 2500, 0);
+        inj_pull_set(pin, p);
+        st_wait_ms(700);
+    }
+    for (j = 0; j < sizeof ab_pins; j++) {
+        unsigned pin = ab_pins[j], m = inj_mode_get(pin), p = inj_pull_get(pin);
+        inj_mode_set(pin, 0);
+        logf("inj: B P1.%u %uHz mode0 m=%lx irq=%lu", pin, 1100u + 200u * j,
+             (unsigned long)inj_mode_get(pin), (unsigned long)st_irqs);
+        inj_toggle(pin, 1100u + 200u * j, 2500, 0);
+        inj_pull_set(pin, p);
+        inj_mode_set(pin, m);
+        st_wait_ms(700);
+    }
+#else
+    (void)ab_pins;
+#endif
+    for (j = 0; j < sizeof c_pins; j++) {
+        unsigned pin = c_pins[j], m = inj_mode_get(pin), p = inj_pull_get(pin);
+        P1_REG(0x38) = 1u << pin;       /* start low */
+        inj_mode_set(pin, 1);
+        logf("inj: C P1.%u %uHz drive m=%lx irq=%lu", pin, 400u + 100u * j,
+             (unsigned long)inj_mode_get(pin), (unsigned long)st_irqs);
+        inj_toggle(pin, 400u + 100u * j, 2000, 1);
+        P1_REG(0x38) = 1u << pin;
+        inj_mode_set(pin, m);
+        inj_pull_set(pin, p);
+        st_wait_ms(700);
+    }
+    logf("inj: done irq=%lu 44=%08lx 48=%08lx 54=%08lx 58=%08lx",
+         (unsigned long)st_irqs, (unsigned long)P1_REG(0x04),
+         (unsigned long)P1_REG(0x08), (unsigned long)P1_REG(0x14),
+         (unsigned long)P1_REG(0x18));
+}
+#endif /* YP3_PAD_INJECT */
+
 static void st_path_gain(unsigned g)
 {
     field_set(&AUD(0x08), 0x00001f00u, g);          /* channel 0, 5 bits */
@@ -1609,7 +1789,7 @@ void yp3_audio_selftest(void)
         ROM_CLK_ENABLE(2u);
     ROM_CLK_DIV(0x2cu, 8u);
     ROM_CLK_APPLY(0x2cu);
-#if !YP3_PAD_SWEEP
+#if !YP3_PAD_SWEEP && !YP3_PAD_INJECT
     st_pad_walk(2);                 /* the sweep sets every pad itself */
 #endif
 
@@ -1639,6 +1819,13 @@ void yp3_audio_selftest(void)
     st_pad_sweep();
     goto st_teardown;
 #endif
+#if YP3_PAD_INJECT
+    for (i = 0; i < ST_FRAMES * 2; i++)
+        st_tone[i] = 0;             /* the DAC plays silence throughout */
+    st_len = 441u * 4u;             /* 10 ms: the clock calibration's unit */
+    st_pad_inject();
+    goto st_teardown;
+#endif
 
     for (k = 0; k < 5; k++) {
         st_path_gain(gain[k]);
@@ -1652,7 +1839,7 @@ void yp3_audio_selftest(void)
         st_wait_ms(700);
     }
 
-#if YP3_STOCK_REPLAY || YP3_PAD_SWEEP
+#if YP3_STOCK_REPLAY || YP3_PAD_SWEEP || YP3_PAD_INJECT
 st_teardown:
 #endif
     yp3_speaker_pa(false);
