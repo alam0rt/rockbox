@@ -172,6 +172,23 @@
 #define PMU_KEY_RELEASE            0x10   /* vendor "sk",  event 2 */
 #define PMU_KEY_ANY  (PMU_KEY_PRESS | PMU_KEY_LONG | PMU_KEY_RELEASE)
 
+/* The other two interrupt pairs, same convention as the key pair above. */
+#define PMU_REG_INT0_STATUS        0x30
+#define PMU_REG_INT0_ENABLE        0x19
+#define PMU_REG_INT2_STATUS        0x4a
+#define PMU_REG_INT2_ENABLE        0x4b
+
+/* Why the PMU last powered on and off. The PMU keeps these across its own
+ * sleep, which is why the vendor reads them at boot: FIRM 0xcf7e0a..0xcf7e3c
+ * reads 0x27, 0x29 and 0x28, writes 0x29 back with its own value - the same
+ * write-1-to-clear the interrupt handler uses - and logs
+ * "pon reason:%x-%x, poff reason:%x" (string FIRM 0xc491be). Stock's live
+ * cache at SRAM 0x81b034 +22/+23/+24 holds 0x41, 0x00, 0x04 [L]; what the
+ * individual bits mean is [U]. */
+#define PMU_REG_PON_REASON0        0x27
+#define PMU_REG_PON_REASON1        0x28
+#define PMU_REG_POFF_REASON        0x29
+
 bool yp3_pmu_read(unsigned reg, uint8_t *value);
 bool yp3_pmu_write(unsigned reg, uint8_t value);
 

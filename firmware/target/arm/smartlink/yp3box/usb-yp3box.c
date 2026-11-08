@@ -41,6 +41,15 @@
 #ifndef YP3_RIG_USB
 #define YP3_RIG_USB 0
 #endif
+/* The card is exposed READ-ONLY unless this is 1. The write path below has
+ * never written a correct sector on hardware: on 2026-11-09 a single host
+ * rw mount stored a WRITE(10) CBW over FAT1 sector 0 and broke the card
+ * (yp3-0gn.11, root cause yp3-0gn.1). Desktops automount rw, so a writable
+ * default is a data-loss default. Flip it only for a build that is testing
+ * the write fix. */
+#ifndef YP3_USB_WRITABLE
+#define YP3_USB_WRITABLE 0
+#endif
 #ifdef ROCKBOX_HAS_LOGF
 #define LOGF_ENABLE
 #endif
@@ -180,10 +189,36 @@ static int usb_msc_ready(void)
  * 0x27, WRITE PROTECTED. */
 static int usb_msc_write_protected(void)
 {
-    /* A rig-USB build is the first time this path runs at all, and the write
-     * half is the riskier one (docs/USB.md, "What is still unverified"), so
-     * it exposes the card read-only. */
-    return YP3_RIG_USB ? 1 : 0;
+    /* A rig-USB build exposes the card read-only as well: the write half is
+     * the riskier one (docs/USB.md, "What is still unverified"). */
+    return (YP3_RIG_USB || !YP3_USB_WRITABLE) ? 1 : 0;
+}
+
+/* The ROM's MODE SENSE never reports write protection: 0x1a at ROM 0x59e4
+ * returns eight zero bytes and 0x5a at 0x59fc a bare 8-byte header, so the
+ * host mounts rw and only learns about it when WRITE(10) fails (sense 2/0x27,
+ * ROM 0x5fb0) - safe, but every write is an I/O error. Answer both the way
+ * the ROM does, same lengths and layout, with WP set: byte 2 bit 7 of the
+ * 6-byte form's header, byte 3 bit 7 of the 10-byte form's. Returns 1 when
+ * handled, which the dispatcher at ROM 0x6328 takes as "done". */
+static int usb_msc_mode_sense_wp(unsigned opcode)
+{
+    uint8_t *b = (uint8_t *)MSC_BUF;
+    unsigned i;
+
+    if ((opcode != 0x1a && opcode != 0x5a) || !usb_msc_write_protected())
+        return 0;
+
+    for (i = 0; i < 8; i++)
+        b[i] = 0;
+    if (opcode == 0x1a) {
+        b[2] = 0x80;                    /* device-specific parameter: WP */
+    } else {
+        b[1] = 0x06;                    /* mode data length, as ROM 0x5a04 */
+        b[3] = 0x80;
+    }
+    MSC_XFER_LEN = 8;                   /* ROM 0x59e8 / 0x59fe */
+    return 1;
 }
 
 /* +0x00, +0x10, +0x14, +0x18, +0x1c: the ROM calls +0x10 and +0x14 only from
@@ -344,6 +379,9 @@ static void usb_msc_write_chunk(void)
 
 static int usb_msc_hook(unsigned opcode)
 {
+    if (usb_msc_mode_sense_wp(opcode))
+        return 1;
+
     if (opcode != 0x28 && opcode != 0x2a)
         return 0;                       /* the ROM's own handlers are fine */
 

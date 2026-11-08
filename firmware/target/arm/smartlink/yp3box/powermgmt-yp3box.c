@@ -16,7 +16,11 @@
  * wrong, and that crowds the 6 KB ring: it was 21% of the first dump that
  * mattered. The driver is done (ROADMAP A3), so keep it quiet by default and
  * define YP3_LOGF_POWER when the PMU itself is the thing under suspicion. */
-#if defined(ROCKBOX_HAS_LOGF) && defined(YP3_LOGF_POWER)
+/* ON for now (2026-11-09): unplugging USB powers the device off, and the
+ * leading suspect is a low first reading here once the charger inhibit
+ * lifts. The log is per CHANGED sample, so it is cheap while the cell is
+ * steady. Put the YP3_LOGF_POWER guard back once that is settled. */
+#if defined(ROCKBOX_HAS_LOGF)
 #define LOGF_ENABLE
 #endif
 #include "logf.h"

@@ -24,11 +24,12 @@
 #include "backlight.h"
 #include "backlight-target.h"
 #include "sl6801-regs.h"
-/* The power path polls, so it logs on a timer whether or not anything is
- * wrong, and that crowds the 6 KB ring: it was 21% of the first dump that
- * mattered. The driver is done (ROADMAP A3), so keep it quiet by default and
- * define YP3_LOGF_POWER when the PMU itself is the thing under suspicion. */
-#if defined(ROCKBOX_HAS_LOGF) && defined(YP3_LOGF_POWER)
+/* Everything this file logs is once per boot: the power-on/power-off reasons
+ * and the previous power_off()'s snapshot, two lines that say why the device
+ * is awake. The PMU register census in power_init is longer and stays behind
+ * YP3_LOGF_POWER. (The polled battery path that once crowded the ring is
+ * powermgmt-yp3box.c, not this file.) */
+#if defined(ROCKBOX_HAS_LOGF)
 #define LOGF_ENABLE
 #endif
 #include "logf.h"
@@ -145,6 +146,232 @@ yp3_pmu_write(unsigned reg, uint8_t value)
     return ok;
 }
 
+/* Power-off woke straight back up, from Shut down and from the idle timer
+ * alike, "instantly" by the user's account [L]. This chip's off IS a PMU
+ * sleep (see yp3_pmu_arm_sleep) and a failed one ends in a reset that keeps
+ * SRAM, so the device simply boots again.
+ *
+ * yp3_pmu_quiesce() was the first hypothesis: the vendor never sleeps with a
+ * latched PMU interrupt (init FIRM 0xcf7db4 clears all three status registers
+ * and programs the enables, 0xcf7b0c; the PMU ISR 0xcf7c6c clears status on
+ * every event), and Rockbox let 0x30 and 0x4a latch from boot. It DID NOT FIX
+ * IT [L]: with the status clean and stock's enables, the chip still reset out
+ * of the first wfi. The fix is pwr_vendor_state() below. The quiesce stays
+ * because it was part of the configuration that then stayed off, and nobody
+ * has shown it is unnecessary.
+ *
+ * Enables at power-off: only sources stock also enables. Stock's live enable
+ * bytes are SRAM 0x81b034 +17/+18/+19 = 0x1a, 0x7c, 0x00 [L]. 0x31 keeps what
+ * the button driver set (the key bits, a subset of stock's 0x7c), so the key
+ * that wakes the device is the one it already listens to.
+ *
+ * The record is in .persist so the NEXT boot can log what was set. After a
+ * failed power-off it survives [L]; after a real one SRAM is lost [L] and the
+ * next boot says "no snapshot (cold SRAM)" - which is itself the evidence
+ * that the power really went off. */
+#define PWRLOG_MAGIC  0x504f4646u      /* "POFF" */
+#define PMU_INT0_STOCK_ENABLE  0x1au   /* SRAM 0x81b034 +17 [L] */
+#define PMU_INT2_STOCK_ENABLE  0x00u   /* SRAM 0x81b034 +19 [L] */
+#define PWR_WIN_N  16
+
+struct yp3_pwrlog {
+    uint32_t magic;       /* PWRLOG_MAGIC: the rest is valid        */
+    uint32_t count;       /* power_off() attempts since a cold SRAM  */
+    uint8_t fresh;        /* set by power_off, cleared once logged  */
+    uint8_t ok;           /* 1: every quiesce transaction succeeded */
+    uint8_t stage;        /* last yp3_power_down step STARTED       */
+    uint8_t r00, r21;     /* PMU reg 0 and 0x21 before arming       */
+    uint8_t st[3];        /* 0x30, 0x31, 0x4a before the clear      */
+    uint8_t en[3];        /* 0x19, 0x1a, 0x4b before the write      */
+    uint8_t after[3];     /* 0x30, 0x31, 0x4a after the clear       */
+    uint32_t wfi;         /* passes of the final wfi loop           */
+    uint8_t r20;          /* PMU reg 0x20, the source of +0xbc        */
+    uint32_t win[PWR_WIN_N];          /* PMU_REG window before arming */
+    uint32_t arm_b0, arm_b8, arm_d0;  /* sequencer after arming     */
+};
+static struct yp3_pwrlog yp3_pwrlog __attribute__((section(".yp3snap")));
+
+/* Written BEFORE each step, with a barrier, so a reset in the middle of
+ * yp3_power_down leaves the number of the step it was in. SRAM survives the
+ * reset that ends a failed power-off [L, 2026-11-09]. */
+#define PWR_STAGE(n) do { yp3_pwrlog.stage = (n); \
+                          __asm__ volatile ("dsb" ::: "memory"); } while (0)
+
+/* The always-on words the vendor's power init fills and Rockbox does not
+ * (docs/RTC.md "The 0x40085080..0xbc words are not the RTC"), plus the sleep
+ * sequencer. Stock: +0x80 = 0x3ff00001, +0x84 ~ 0xcf38 (a ~53 kHz LP clock in
+ * Hz [I]), +0xdc..+0xe4 computed from +0x84 at FIRM 0xcf8198, +0xbc = 0x8020
+ * (0xcf7d82). Open-coded: this also runs with the flash clock parked, and a
+ * table would live in .rodata, which is flash. Keep in step with PWR_WIN_N
+ * and the log format in yp3_power_reasons. */
+static void __attribute__((section(".icode"), noinline))
+pwr_window(uint32_t *w)
+{
+    w[0]  = PMU_REG(0x60);  w[1]  = PMU_REG(0x74);  w[2]  = PMU_REG(0x80);
+    w[3]  = PMU_REG(0x84);  w[4]  = PMU_REG(0x88);  w[5]  = PMU_REG(0x8c);
+    w[6]  = PMU_REG(0xa4);  w[7]  = PMU_REG(0xac);  w[8]  = PMU_REG(0xb0);
+    w[9]  = PMU_REG(0xb8);  w[10] = PMU_REG(0xbc);  w[11] = PMU_REG(0xd0);
+    w[12] = PMU_REG(0xd8);  w[13] = PMU_REG(0xdc);  w[14] = PMU_REG(0xe0);
+    w[15] = PMU_REG(0xe4);
+}
+
+static void pwr_log_window(const char *tag, const uint32_t *w)
+{
+    logf("%s 60=%08lx 74=%08lx 80=%08lx 84=%08lx", tag,
+         (unsigned long)w[0], (unsigned long)w[1],
+         (unsigned long)w[2], (unsigned long)w[3]);
+    logf("%s 88=%08lx 8c=%08lx a4=%08lx ac=%08lx", tag,
+         (unsigned long)w[4], (unsigned long)w[5],
+         (unsigned long)w[6], (unsigned long)w[7]);
+    logf("%s b0=%08lx b8=%08lx bc=%08lx d0=%08lx", tag,
+         (unsigned long)w[8], (unsigned long)w[9],
+         (unsigned long)w[10], (unsigned long)w[11]);
+    logf("%s d8=%08lx dc=%08lx e0=%08lx e4=%08lx", tag,
+         (unsigned long)w[12], (unsigned long)w[13],
+         (unsigned long)w[14], (unsigned long)w[15]);
+}
+
+/* First thing in yp3_power_down: make the record valid before any step can
+ * reset the chip. */
+static void __attribute__((section(".icode"), noinline))
+pwr_log_begin(void)
+{
+    struct yp3_pwrlog *p = &yp3_pwrlog;
+
+    if (p->magic != PWRLOG_MAGIC)
+        p->count = 0;
+    p->count++;
+    p->fresh = 1;
+    p->ok = 0;
+    p->wfi = 0;
+    p->stage = 1;
+    p->magic = PWRLOG_MAGIC;
+    __asm__ volatile ("dsb" ::: "memory");
+}
+
+/* The vendor always-on state a power-off needs, found by a ladder on
+ * 2026-11-09. Without it every power-off reached the final wfi (stage 13,
+ * wfi 1 [L]) and the chip reset straight out of the sleep. Each Shut down then
+ * applied one more piece of the vendor's state, cumulatively:
+ *
+ *   rung 1  vendor power-off step 0x80d66c, which this driver used to skip:
+ *           +0x80 bit 31 cleared, then +0x80 = 0xbff00001 from the struct at
+ *           SRAM 0x81b060 (01 .. 00 .. 3ff .. 00 01) [C]. It starts the LP
+ *           clock measurement: +0x84 read 0xcf27 on the next boot, against
+ *           stock's 0xcf38 and Rockbox's untouched 0x8000 [L].
+ *           STILL WOKE AT ONCE [L].
+ *   rung 2  + vendor power init 0xcf7d28 with this device's config (SRAM
+ *           0x81b034 +0 = 0x30, +6..+9 = 01 01 01 02): +0xac = 0x30, +0xa4
+ *           bits 1, 0, 4 set and 6:5 = 2 -> 0x53, = stock [C][L]; and +0xbc
+ *           as 0xcf806e builds it, (PMU reg 0x20 | 0x80) << 8 | 0x20, stock
+ *           0xaf20 [C][L].
+ *           STAYED OFF [L]: the user saw it, and the next boot found the
+ *           black box cold, which no failed power-off had done.
+ *
+ * Both are applied, because that pair is what was tested. Whether rung 2
+ * alone would do is [U], and so is which of its three words matters. The
+ * ladder's rung 3 (sequencer timings from +0x84, FIRM 0xcf8198) was never
+ * reached and is not applied.
+ *
+ * The vendor writes the rung-2 words once at boot; this writes them at
+ * power-off only, which is where they were proven, so the running system is
+ * unchanged. */
+static void __attribute__((section(".icode"), noinline))
+pwr_vendor_state(void)
+{
+    struct yp3_pwrlog *p = &yp3_pwrlog;
+    uint8_t v = 0;
+
+    PMU_REG(0x80) &= ~0x80000000u;                  /* 0x80d670..0x80d678 */
+    PMU_REG(0x80) = 0xbff00001u;                    /* 0x80d696 */
+
+    PMU_REG(0xac) = 0x30;                           /* 0xcf7d2e */
+    PMU_REG(0xa4) |= 0x13;                          /* 0xcf7d3e/4e/60 */
+    PMU_REG(0xa4) = (PMU_REG(0xa4) & ~0x60u) | (2u << 5);   /* 0xcf7d7e */
+    (void)yp3_pmu_read(0x20, &v);                   /* 0xcf8070 */
+    p->r20 = v;
+    PMU_REG(0xbc) = ((uint32_t)(uint8_t)(v | 0x80) << 8) | 0x20;
+}
+
+/* Runs with the clocks collapsed: no tables in .rodata, which is flash. */
+static inline bool __attribute__((always_inline))
+pwr_rd(unsigned reg, uint8_t *dst)
+{
+    uint8_t v = 0;
+    bool ok = yp3_pmu_read(reg, &v);
+    *dst = v;
+    return ok;
+}
+
+static void __attribute__((section(".icode"), noinline))
+yp3_pmu_quiesce(void)
+{
+    struct yp3_pwrlog *p = &yp3_pwrlog;
+    bool ok = true;
+
+    ok &= pwr_rd(PMU_REG_INT0_STATUS, &p->st[0]);
+    ok &= pwr_rd(PMU_REG_KEY_STATUS,  &p->st[1]);
+    ok &= pwr_rd(PMU_REG_INT2_STATUS, &p->st[2]);
+    ok &= pwr_rd(PMU_REG_INT0_ENABLE, &p->en[0]);
+    ok &= pwr_rd(PMU_REG_KEY_ENABLE,  &p->en[1]);
+    ok &= pwr_rd(PMU_REG_INT2_ENABLE, &p->en[2]);
+
+    /* enables hold the inverted mask, FIRM 0xcf7b18 */
+    ok &= yp3_pmu_write(PMU_REG_INT0_ENABLE, (uint8_t)~PMU_INT0_STOCK_ENABLE);
+    ok &= yp3_pmu_write(PMU_REG_INT2_ENABLE, (uint8_t)~PMU_INT2_STOCK_ENABLE);
+
+    /* write-1-to-clear, FIRM 0xcf7c88..0xcf7c9a */
+    ok &= yp3_pmu_write(PMU_REG_INT0_STATUS, p->st[0]);
+    ok &= yp3_pmu_write(PMU_REG_KEY_STATUS,  p->st[1]);
+    ok &= yp3_pmu_write(PMU_REG_INT2_STATUS, p->st[2]);
+
+    ok &= pwr_rd(PMU_REG_INT0_STATUS, &p->after[0]);
+    ok &= pwr_rd(PMU_REG_KEY_STATUS,  &p->after[1]);
+    ok &= pwr_rd(PMU_REG_INT2_STATUS, &p->after[2]);
+    ok &= pwr_rd(0x00, &p->r00);
+    ok &= pwr_rd(0x21, &p->r21);
+
+    p->ok = ok;
+}
+
+/* Once per boot, before anything else touches the PMU: why it is awake, and
+ * what the last power_off() saw. Then clear the off reason as the vendor init
+ * does (FIRM 0xcf7e2e). */
+static void yp3_power_reasons(void)
+{
+    struct yp3_pwrlog *p = &yp3_pwrlog;
+    uint32_t w[PWR_WIN_N];
+    uint8_t on0 = 0, on1 = 0, off = 0;
+    bool ok = yp3_pmu_read(PMU_REG_PON_REASON0, &on0)
+           && yp3_pmu_read(PMU_REG_PON_REASON1, &on1)
+           && yp3_pmu_read(PMU_REG_POFF_REASON, &off);
+
+    logf("pmu pon %02x-%02x poff %02x%s", on0, on1, off, ok ? "" : " (failed)");
+    if (ok)
+        (void)yp3_pmu_write(PMU_REG_POFF_REASON, off);
+
+    pwr_window(w);
+    pwr_log_window("pwin boot", w);
+
+    if (p->magic != PWRLOG_MAGIC) {
+        logf("poff: no snapshot (cold SRAM)");
+    } else if (!p->fresh) {
+        logf("poff: none since last boot (#%lu)", (unsigned long)p->count);
+    } else {
+        logf("poff#%lu stage %u wfi %lu ok %u r20 %02x",
+             (unsigned long)p->count, p->stage,
+             (unsigned long)p->wfi, p->ok, p->r20);
+        logf("poff st %02x %02x %02x en %02x %02x %02x after %02x %02x %02x",
+             p->st[0], p->st[1], p->st[2], p->en[0], p->en[1], p->en[2],
+             p->after[0], p->after[1], p->after[2]);
+        logf("poff r00 %02x r21 %02x arm b0=%08lx b8=%08lx d0=%08lx",
+             p->r00, p->r21, (unsigned long)p->arm_b0,
+             (unsigned long)p->arm_b8, (unsigned long)p->arm_d0);
+        pwr_log_window("pwin off", p->win);
+        p->fresh = 0;
+    }
+}
+
 /* Enable the PMU's voltage measurement.
  *
  * Register 0x2e read back 0x80 on hardware: bit 7 set, all seven value bits
@@ -168,13 +395,14 @@ void power_init(void)
 {
     uint8_t before = 0, after = 0;
 
+    yp3_power_reasons();
+
     if (yp3_pmu_read(PMU_REG_VOLTAGE_CONFIG, &before)
             && yp3_pmu_write(PMU_REG_VOLTAGE_CONFIG, (uint8_t)(before | 1u)))
         (void)yp3_pmu_read(PMU_REG_VOLTAGE_CONFIG, &after);
 
+#ifdef YP3_LOGF_POWER
     logf("pmu 0x47: %02x -> %02x", before, after);
-
-#ifdef ROCKBOX_HAS_LOGF
     /* One line that characterises the block, so a single dump can rule the
      * rest of the vendor's init in or out. Exists only to feed the log. */
     {
@@ -235,49 +463,73 @@ yp3_power_down(void)
 {
     unsigned i;
 
+    pwr_log_begin();                                /* stage 1 */
+
     /* stop the tick before the clock it counts goes away */
+    PWR_STAGE(2);
     REG32(0xE000E010) &= ~3u;                       /* vendor 0x80d278 */
     disable_irq();                                  /* vendor 0x804ec8 */
 
     /* peripheral clocks 0x11-0x14 and 0x16-0x20, vendor 0xcf8138 */
+    PWR_STAGE(3);
     for (i = 0x11; i <= 0x20; i++)
         if (i != 0x15)
             ROM_CLK_STOP(i);
 
     /* park the CPU, bus and flash clocks on source 10 before the PLLs go */
+    PWR_STAGE(4);
     ROM_CLK_SET_SRC(3, 10);
     ROM_CLK_SET_SRC(6, 10);
     ROM_CLK_SET_SRC(NORF_CLK, 10);
     udelay(100);
 
+    PWR_STAGE(5);
     ROM_CLK_DIV(3, 1);
     ROM_CLK_DIV(4, 1);
     ROM_CLK_DIV(5, 1);
     ROM_CLK_DIV(6, 1);
     udelay(100);
 
+    PWR_STAGE(6);
     ROM_CLK_STOP(0x29);
     ROM_CLK_STOP(8);
     ROM_CLK_STOP(9);
     ROM_CLK_STOP(0x26);
     udelay(100);
+    PWR_STAGE(7);
     ROM_CLK_STOP(2);
     ROM_CLK_STOP(0);
 
+    PWR_STAGE(8);
     PMU_REG(0x60) = 1;                                  /* vendor 0xcf7d10 */
     PMU_REG(0xd8) &= ~6u;
     /* vendor 0xcf7cf0(0): clear the two-bit field at PMU reg 0 bits 6-7 */
+    PWR_STAGE(9);
     {
         uint8_t v;
         if (yp3_pmu_read(0, &v))
             (void)yp3_pmu_write(0, (uint8_t)(v & ~0xc0u));
     }
 
+    PWR_STAGE(10);
     yp3_mask_all_irqs();  /* vendor 0x80d1b4/0x80d1e0 */
+    PWR_STAGE(14);
+    pwr_vendor_state();
+    pwr_window(yp3_pwrlog.win);
+    PWR_STAGE(11);
+    yp3_pmu_quiesce();    /* NOT vendor here: see the block above it */
+    PWR_STAGE(12);
     yp3_pmu_arm_sleep();
+    yp3_pwrlog.arm_b0 = PMU_REG(0xb0);
+    yp3_pwrlog.arm_b8 = PMU_REG(0xb8);
+    yp3_pwrlog.arm_d0 = PMU_REG(0xd0);
 
-    while (1)
+    PWR_STAGE(13);
+    while (1) {
+        yp3_pwrlog.wfi++;
+        __asm__ volatile ("dsb" ::: "memory");
         asm volatile ("wfi");
+    }
 }
 
 void power_off(void)
