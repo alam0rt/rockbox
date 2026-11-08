@@ -85,21 +85,57 @@ static inline void pmu_unlock(uint32_t old)
     __asm__ volatile ("msr basepri, %0" :: "r"(old) : "memory");
 }
 
+/* The mailbox bus init, ROM 0x3c2c: two pin configs, a self-clearing reset
+ * at bit 31 of +0x100, then +0x100 = 0x0001b082. usb_hw_enable() used to call
+ * it as "the USB PHY init" because the ROM's download mode runs it before
+ * USB; it is the PMU bus, and it left every later transaction at half rate -
+ * 4690 of 4690 PMU ops over 1 ms, ~3.2 ms each, on a boot that came up into
+ * USB mode [L]. Kept as the ROM call, since the USB path has only ever been
+ * tested with it, followed by the vendor's word (sl6801-regs.h). Under the
+ * lock, because the reset would otherwise cut a transaction from the tick
+ * in half. */
+#define ROM_PMU_BUS_INIT    ((void (*)(void))0x3c2du)
+
+void yp3_pmu_bus_init(void)
+{
+    uint32_t oldlevel = pmu_lock();
+    ROM_PMU_BUS_INIT();
+    PMU_REG(PMU_BUS_CFG) = PMU_BUS_CFG_VENDOR;
+    pmu_unlock(oldlevel);
+}
+
 /* How long a transaction really takes, in core cycles off SysTick, and how
- * many there are. Read and cleared by the PCM beacon. */
-uint32_t yp3_pmu_cost_max, yp3_pmu_ops;
+ * many there are. Read and cleared by the PCM beacon.
+ *
+ * The max alone was read as "every transaction is 3.4 ms, ~14% CPU". It is
+ * 3323-3324 us in EVERY one-second window [L], which looks like one kind of
+ * transaction rather than an outlier - so also keep the total, which
+ * register the max came from (bit 8 = write), and how many exceeded 1 ms. */
+uint32_t yp3_pmu_cost_max, yp3_pmu_ops, yp3_pmu_cost_sum;
+uint32_t yp3_pmu_max_reg, yp3_pmu_slow;
 #define SYST_RVR_   (*(volatile uint32_t *)0xE000E014)
 #define SYST_CVR_   (*(volatile uint32_t *)0xE000E018)
+#define PMU_SLOW_CYCLES  (CPU_FREQ / 1000u)        /* 1 ms */
 
-static inline uint32_t pmu_t0(void) { return SYST_CVR_; }
+static inline __attribute__((always_inline)) uint32_t pmu_t0(void)
+{
+    return SYST_CVR_;
+}
 
-static inline void pmu_t1(uint32_t t0)
+/* always_inline: the callers are .icode and run with the flash clock parked
+ * during power-off. Out of line, this landed in flash (0xc45a94). */
+static inline __attribute__((always_inline)) void pmu_t1(uint32_t t0, unsigned tag)
 {
     uint32_t t1 = SYST_CVR_;
     uint32_t d = t0 >= t1 ? t0 - t1 : t0 + (SYST_RVR_ + 1u) - t1;
     yp3_pmu_ops++;
-    if (d > yp3_pmu_cost_max)
+    yp3_pmu_cost_sum += d;
+    if (d > PMU_SLOW_CYCLES)
+        yp3_pmu_slow++;
+    if (d > yp3_pmu_cost_max) {
         yp3_pmu_cost_max = d;
+        yp3_pmu_max_reg = tag;
+    }
 }
 
 bool __attribute__((section(".icode"), noinline))
@@ -120,7 +156,7 @@ yp3_pmu_read(unsigned reg, uint8_t *value)
     if (ok)
         *value = (uint8_t)PMU_REG(PMU_MB_RDATA);
 
-    pmu_t1(t0);
+    pmu_t1(t0, reg);
     pmu_unlock(oldlevel);
     return ok;
 }
@@ -141,7 +177,7 @@ yp3_pmu_write(unsigned reg, uint8_t value)
 
     ok = !(PMU_REG(PMU_MB_CMD) & PMU_GO)
       && !(PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK);
-    pmu_t1(t0);
+    pmu_t1(t0, reg | 0x100u);
     pmu_unlock(oldlevel);
     return ok;
 }

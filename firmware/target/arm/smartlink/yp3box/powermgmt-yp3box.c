@@ -16,11 +16,15 @@
  * wrong, and that crowds the 6 KB ring: it was 21% of the first dump that
  * mattered. The driver is done (ROADMAP A3), so keep it quiet by default and
  * define YP3_LOGF_POWER when the PMU itself is the thing under suspicion. */
-/* ON for now (2026-11-09): unplugging USB powers the device off, and the
- * leading suspect is a low first reading here once the charger inhibit
- * lifts. The log is per CHANGED sample, so it is cheap while the cell is
- * steady. Put the YP3_LOGF_POWER guard back once that is settled. */
-#if defined(ROCKBOX_HAS_LOGF)
+/* NEVER ungate this in a normal build. _battery_voltage() runs on the power
+ * thread, whose stack is DEFAULT_STACK_SIZE/2 = 512 bytes (powermgmt.c), and
+ * logf is vsnprintf. It was turned on for yp3-0gn.10 on 2026-11-09 and the
+ * device panicked "Stkov power" with the screen's last line a `batt:` record
+ * cut in half by another thread's [L] - an exception frame landing on the
+ * thread stack while vsnprintf is at its deepest. Intermittent, so the boot
+ * before it survived. If the PMU is under suspicion, log from a thread with
+ * room, or record into .persist and logf it from somewhere else. */
+#if defined(ROCKBOX_HAS_LOGF) && defined(YP3_LOGF_POWER)
 #define LOGF_ENABLE
 #endif
 #include "logf.h"

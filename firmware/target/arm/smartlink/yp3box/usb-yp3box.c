@@ -135,10 +135,9 @@
  * 0x590c -> 0x55b8 -> 0x51f0, so this is the known-good enumeration path. */
 #define ROM_USB_CONNECT     ((void (*)(void))0x7f4du)
 #define ROM_USB_DISCONNECT  ((void (*)(void))0x7f61u)
-/* USB pad and PHY configuration: two more pin-mux writes (port 2 pins 0 and
- * 1, mode 2) and a configuration word into the PHY register at 0x40085100,
- * behind a busy bit. See the comment on usb_hw_enable(). */
-#define ROM_USB_PHY_INIT    ((void (*)(void))0x3c2du)
+/* ROM 0x3c2c, once called ROM_USB_PHY_INIT here, is the PMU mailbox bus
+ * init: 0x40085100 is the mailbox's bus configuration, not a PHY. It now
+ * goes through yp3_pmu_bus_init() in power-yp3box.c. See usb_hw_enable(). */
 #define ROM_CLK_DISABLE     ((void (*)(unsigned))0x2571u)
 
 #define USB_MODULE          0x23u   /* FIRM 0xd66d98 clk_enable, 0xd66c40 off */
@@ -490,16 +489,20 @@ usb_hw_enable(void)
      * the module enable. Two of them, 0x3cd4 and 0x3b98, reconfigure the
      * whole clock tree onto sources 15 and 10; those are download mode
      * setting up the machine and must not be repeated here, or the CPU clock
-     * moves under us. The third, 0x3c2c, is USB-specific and is this:
+     * moves under us. The third, 0x3c2c, was taken to be USB-specific:
      *
-     *     gpio_cfg(0x00020100)          port 2 pin 0, mode 2
-     *     gpio_cfg(0x0002090b)          port 2 pin 1, mode 2
-     *     [0x40085100] |= 0x80000000;   start, then poll until it clears
-     *     [0x40085100] = 0x0001b082;    the PHY configuration word
+     *     gpio_cfg(0x00020100)
+     *     gpio_cfg(0x0002090b)          the vendor's copy uses 0x00020908
+     *     [0x40085100] |= 0x80000000;   reset, then poll until it clears
+     *     [0x40085100] = 0x0001b082;    the vendor writes 0x0001b080
      *
-     * Called rather than transcribed: it is mask ROM, it takes no arguments,
-     * and it touches nothing else. */
-    ROM_USB_PHY_INIT();
+     * It is not. 0x40085100 is the PMU MAILBOX's bus configuration, one word
+     * below its command register, and 0x0001b082 runs that bus at half the
+     * vendor's rate - every PMU transaction from then on cost ~3.2 ms, with
+     * interrupts masked [L]. Whether USB needs this call at all is [U]; it
+     * stays because every working USB session so far has had it, and
+     * yp3_pmu_bus_init() puts the vendor's word back straight after. */
+    yp3_pmu_bus_init();
 
     /* Unconditionally, as the vendor does at FIRM 0xd66d98 - it calls ROM
      * 0x2564 straight, with no is-it-already-on check. */
