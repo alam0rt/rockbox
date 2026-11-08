@@ -54,7 +54,8 @@
  * make the next boot read the old ring at the new offset and dump convincing
  * garbage. A changed magic forces a clean cold init instead, costing exactly
  * one log - the one spanning the change, which is never the interesting one. */
-#define BLACKBOX_MAGIC      0x59503344u
+/* 0x...44 -> 0x...45: yp3_usblog (64 bytes) went in ahead of the logf ring. */
+#define BLACKBOX_MAGIC      0x59503345u
 /* Stop a fault that reproduces immediately from rebooting for ever. */
 #define BLACKBOX_MAX_FAULTS 3
 

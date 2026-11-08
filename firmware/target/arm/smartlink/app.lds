@@ -143,6 +143,8 @@ SECTIONS
         . += 192;                       /* struct yp3_blackbox */
         yp3_flashlog = .;
         . += 16;                        /* quad switch stages, see system-yp3box.c */
+        yp3_usblog = .;
+        . += 64;                        /* USB MSC stage words, see usb-yp3box.c */
         *logf.o(.bss* COMMON);
         /* pcm-yp3box.c's register snapshot - self-test builds only, so this
            is empty otherwise. After the ring: nothing addresses it by a

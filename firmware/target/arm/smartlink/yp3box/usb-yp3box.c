@@ -41,6 +41,13 @@
 #ifndef YP3_RIG_USB
 #define YP3_RIG_USB 0
 #endif
+/* YP3_USB_WRITE_FIX=0 builds the old WRITE(10) path, which never arms the
+ * data-out receive and hangs the host on the first write (see the comment
+ * above usb_msc_write_start). It exists only so the diagnosis can be checked
+ * on hardware with the same breadcrumbs; 1 is the default and the fix. */
+#ifndef YP3_USB_WRITE_FIX
+#define YP3_USB_WRITE_FIX 1
+#endif
 #ifdef ROCKBOX_HAS_LOGF
 #define LOGF_ENABLE
 #endif
@@ -100,6 +107,112 @@
 #define MSC_ST_LAST         3
 #define MSC_ST_FAIL         5
 
+/* The CBW as the ROM stores it (0x63c6 reads 31 bytes to +0x208): length at
+ * +0x210, flags at +0x214 (bit 7 = data-in). The ROM's own WRITE(10) rejects
+ * a data-in flag at 0x5f80 and a length that is not count * blocksize at
+ * 0x601e; the write hook delegates both so the ROM fails them. */
+#define MSC_CBW_BUF         ((void *)(MSC_BASE + 0x208))
+#define MSC_CBW_LEN         MSC32(0x210)
+#define MSC_CBW_FLAGS       MSC8(0x214)
+
+/* MUSB indexed RXCOUNT. 0x6454 sets INDEX (0x4004000e) to 1 on entry, so
+ * inside the hook this is endpoint 1's. Read for the breadcrumb only. */
+#define USB_RXCOUNT         REG16(0x40040018)
+
+
+/* --- breadcrumbs ------------------------------------------------------------
+ *
+ * The hook runs inside the USB interrupt, and a write that went wrong there
+ * left NOTHING in the ring: the log of 2026-11-07 ends at post-connect. So
+ * every stage of a command writes a stage word here BEFORE it does the step,
+ * in .persist (app.lds), where it survives the pinhole reset the hang needs.
+ * tools/50_read_logring.sh decodes it straight out of SRAM, and the next boot
+ * logs the previous run's copy (usb_init_device), so it reaches the card too.
+ *
+ * Plain stores, no logf: a stage word costs a few cycles, a logf from flash
+ * costs about a millisecond, and a 512 KB write is 8192 packets. The per-
+ * command logf lines are capped (MSC_LOG_CMDS). */
+#define USBLOG_MAGIC        0x05b00000u
+#define USBLOG_MASK         0xffff0000u
+
+enum {
+    UL_BOOT        = 0x00,  /* cleared at boot after reporting the last run */
+    UL_ATTACHED    = 0x01,  /* usb_enable(true) finished */
+    UL_DETACHED    = 0x02,  /* usb_enable(false) */
+    UL_HOOK        = 0x03,  /* hook entered for 0x28/0x2a */
+    UL_REJECT      = 0x04,  /* delegated to the ROM's own handler */
+
+    UL_R_CBW       = 0x10,  /* READ(10) accepted */
+    UL_R_SD        = 0x11,  /* calling sd_read_sectors */
+    UL_R_SD_DONE   = 0x12,  /* ... returned */
+    UL_R_SEND      = 0x13,  /* calling ROM 0x5930 */
+    UL_R_SENT      = 0x14,  /* ... returned, back to the ROM */
+
+    UL_W_CBW       = 0x20,  /* WRITE(10) accepted, first pass */
+    UL_W_ARM       = 0x21,  /* calling ROM 0x5944 (ack + arm the receive) */
+    UL_W_ARMED     = 0x22,  /* ... returned, back to the ROM, waiting */
+    UL_W_PKT       = 0x23,  /* a data-out packet arrived (0x6454 re-dispatch) */
+    UL_W_SD        = 0x24,  /* calling sd_write_sectors */
+    UL_W_SD_DONE   = 0x25,  /* ... returned, rc in sd_rc */
+    UL_W_CSW       = 0x26,  /* calling ROM 0x5e70 */
+    UL_W_IDLE      = 0x27,  /* CSW queued, command complete */
+    UL_W_RUNAWAY   = 0x28,  /* packet with no command in flight */
+    UL_W_OLD_WAIT  = 0x29,  /* OLD path: first pass returned without arming */
+};
+
+struct yp3_usblog {
+    uint32_t stage;     /* USBLOG_MAGIC | UL_*, written BEFORE each step */
+    uint32_t seq;       /* bumps with every stage write: is it moving? */
+    uint32_t op;        /* opcode | MSC_STATE << 8, last hook entry */
+    uint32_t lba;       /* current command's first LBA */
+    uint32_t blocks;    /* current command's block count */
+    uint32_t left;      /* data-out bytes still to arrive (write) */
+    uint32_t pkts;      /* data-out packets taken, this command */
+    uint32_t secs;      /* sectors written, this command */
+    uint32_t sd_calls;  /* sd_write_sectors calls since attach */
+    uint32_t sd_errs;   /* ... that returned non-zero */
+    uint32_t sd_rc;     /* last return code (read or write) */
+    uint32_t sd_lba;    /* last LBA handed to the SD driver */
+    uint32_t wr_begun;  /* WRITE(10) commands accepted since attach */
+    uint32_t wr_done;   /* ... finished with a CSW */
+    uint32_t rx;        /* RXCOUNT << 16 | armed length, last packet */
+    uint32_t tick;      /* current_tick at the last stage write */
+};
+extern volatile struct yp3_usblog yp3_usblog;     /* app.lds, in .persist */
+
+static inline void usblog_stage(unsigned stage)
+{
+    yp3_usblog.stage = USBLOG_MAGIC | stage;
+    yp3_usblog.seq++;
+    yp3_usblog.tick = (uint32_t)current_tick;
+}
+
+#ifdef ROCKBOX_HAS_LOGF
+static void usblog_report(const char *when)
+{
+    volatile struct yp3_usblog *u = &yp3_usblog;
+
+    logf("usblog %s: stage=%02lx seq=%lu op=%04lx t=%lu", when,
+         (unsigned long)(u->stage & ~USBLOG_MASK), (unsigned long)u->seq,
+         (unsigned long)u->op, (unsigned long)u->tick);
+    logf("usblog %s: lba=%lu n=%lu left=%lu pkts=%lu secs=%lu rx=%08lx", when,
+         (unsigned long)u->lba, (unsigned long)u->blocks,
+         (unsigned long)u->left, (unsigned long)u->pkts,
+         (unsigned long)u->secs, (unsigned long)u->rx);
+    logf("usblog %s: wr=%lu/%lu sd=%lu err=%lu rc=%ld sdlba=%lu", when,
+         (unsigned long)u->wr_done, (unsigned long)u->wr_begun,
+         (unsigned long)u->sd_calls, (unsigned long)u->sd_errs,
+         (long)u->sd_rc, (unsigned long)u->sd_lba);
+}
+#else
+static inline void usblog_report(const char *when) { (void)when; }
+#endif
+
+/* Per-command logf lines, capped so a long copy cannot push the interesting
+ * first commands out of a 6 KB ring. The stage words keep counting past it. */
+#define MSC_LOG_CMDS        16
+static unsigned msc_wr_logged;
+
 /* Boot ROM entry points, thumb bit included. Local to this file because
  * nothing else has any business calling them. */
 #define ROM_USB_SET_USERFN  ((void (*)(const void *))0x5915u)
@@ -107,6 +220,23 @@
 /* send one data-in chunk from a buffer; ROM 0x5930, used by the ROM's own
  * multi-chunk pump at 0x5c4c */
 #define ROM_MSC_SEND        ((void (*)(const void *, unsigned))0x5931u)
+/* Arm a data-out receive of `len` bytes, ROM 0x5944: [ctx+0x3a] = 64,
+ * [ctx+0x48] = len, then 0x5044, which in device mode ends in 0x4fac,
+ * RXCSR |= 0x10 (FlushFIFO) - i.e. it ACKS the packet now sitting in the
+ * endpoint FIFO, freeing it for the next one. The ROM's own WRITE(10) calls
+ * it at 0x6034 (first pass) and 0x5f5e (after every packet). */
+#define ROM_MSC_RECV        ((void (*)(void *, unsigned))0x5945u)
+/* Send the CSW with bCSWStatus = status, ROM 0x5e70: sets MSC_STATE = 0,
+ * queues 13 bytes from +0x228 through 0x5920, and re-arms the next CBW
+ * receive with 0x5944(+0x208, 31). Residue is NOT recomputed. */
+#define ROM_MSC_CSW         ((void (*)(unsigned))0x5e71u)
+/* Set sense key / ASC, ROM 0x5a7c(key, asc): e.g. (5, 0x20) at 0x62d0. */
+#define ROM_MSC_SENSE       ((void (*)(unsigned, unsigned))0x5a7du)
+/* Bulk max packet at full speed. The ROM's data-out pump moves exactly this
+ * much per packet (0x5eb4: len = min(remaining, 64)), and the link is full
+ * speed [L]. A high-speed link would deliver 512-byte packets and this path
+ * would read 64 of them; the breadcrumb records RXCOUNT to catch that. */
+#define MSC_PACKET          64u
 /* the USB PHY/controller enable the vendor reaches through SRAM thunk
  * 0x80db54, which is one branch to this */
 #define ROM_USB_PHY         ((void (*)(unsigned))0x3ad5u)
@@ -210,8 +340,12 @@ static uint32_t msc_lba;
 static uint32_t msc_blocks_left;
 
 /* Counters, not logf: the hook runs in the USB interrupt (ROM 0x631c is
- * reached from the IRQ 41/42 handlers), and logf is not interrupt-safe. They
- * are reported from usb_enable(false), in thread context.
+ * reached from the IRQ 41/42 handlers). logf has no lock, so a line from here
+ * can interleave with one a thread was half-way through - garbled text, not a
+ * hang - and it formats from flash, about a millisecond a line. So the hot
+ * path writes stage words (yp3_usblog, above) and the only logf lines are one
+ * per WRITE(10) command, capped at MSC_LOG_CMDS. The counters are reported
+ * from usb_enable(false), in thread context.
  *
  * The host's READ(10) for 8 sectors at LBA 0 comes back DID_ERROR, and there
  * are three candidate explanations that these numbers separate cleanly:
@@ -292,7 +426,10 @@ static void usb_msc_read_chunk(void)
         return;
     }
 
-    if (sd_read_sectors(IF_MD(0,) msc_lba, 1, MSC_BUF) != 0) {
+    usblog_stage(UL_R_SD);
+    yp3_usblog.sd_rc = (uint32_t)sd_read_sectors(IF_MD(0,) msc_lba, 1, MSC_BUF);
+    usblog_stage(UL_R_SD_DONE);
+    if (yp3_usblog.sd_rc != 0) {
         msc_sderrs++;
         /* Nothing here can fail the command either: by this point the data
          * phase is in flight and the only paths out of ROM 0x6380 are "send
@@ -315,32 +452,205 @@ static void usb_msc_read_chunk(void)
      * 0x6380 falls into its state 3..4 arm and sends the CSW itself. */
     MSC_STATE = msc_blocks_left ? MSC_ST_DATA_IN : MSC_ST_LAST;
     MSC_XFER_LEN = 512;
+    usblog_stage(UL_R_SEND);
     ROM_MSC_SEND(MSC_BUF, 512);
+    usblog_stage(UL_R_SENT);
 }
 
-/* The data-out completion at ROM 0x6454 has already re-armed the receive into
- * the staging buffer before it re-dispatches, so on entry the block the host
- * sent is sitting in MSC_BUF. */
-static void usb_msc_write_chunk(void)
+/* One sector through the SD driver, with its breadcrumbs. Shared by both
+ * write paths so the old one can be compared on hardware like for like. */
+static int usb_msc_write_sector(uint32_t lba, const void *buf)
+{
+    int rc;
+
+    yp3_usblog.sd_lba = lba;
+    yp3_usblog.sd_calls++;
+    usblog_stage(UL_W_SD);
+    rc = sd_write_sectors(IF_MD(0,) lba, 1, buf);
+    yp3_usblog.sd_rc = (uint32_t)rc;
+    usblog_stage(UL_W_SD_DONE);
+    if (rc != 0) {
+        yp3_usblog.sd_errs++;
+        msc_sderrs++;
+    }
+    return rc;
+}
+
+#if YP3_USB_WRITE_FIX
+/* ==== THE FIX (YP3_USB_WRITE_FIX) ==========================================
+ *
+ * WRITE(10), transcribed from the ROM's own data-out pump rather than
+ * mirrored from the read path. The old version assumed "0x6454 re-arms the
+ * receive into the staging buffer before it re-dispatches, so a whole block
+ * is waiting in MSC_BUF". The ROM says otherwise, and the old path is wrong in
+ * three independent ways, all [C]:
+ *
+ * 1. NOTHING ARMED THE RECEIVE. 0x6454 does not arm anything: it copies
+ *    [ctx+0x48] bytes OUT of the endpoint FIFO with 0x5378 (a PIO read of
+ *    0x40040024) and re-dispatches. The arm/ack is 0x5944, which ends in
+ *    RXCSR |= FlushFIFO and so releases the FIFO for the next packet. The
+ *    ROM's WRITE(10) calls it on the first pass (0x6034) and after every
+ *    packet (0x5f5e). The old hook called it nowhere, so the CBW's packet was
+ *    never acknowledged, the controller NAKed every data-out packet, and the
+ *    host sat on its 30 s SCSI timeout - "hangs on the USB screen, silently".
+ *    The READ path never noticed because the CSW (0x5e70) ends by arming the
+ *    next CBW, which acks the old one.
+ *
+ * 2. A RE-DISPATCH IS ONE 64-BYTE PACKET, NOT A 512-BYTE BLOCK. The ROM pump
+ *    0x5eb4 moves min(remaining, 64) per call, and 0x6454 reads exactly the
+ *    length the last 0x5944 armed. With nothing armed that was 31 - the CBW's
+ *    length, left in [ctx+0x48] - so even a delivered packet would have
+ *    become a 512-byte sector of 31 new bytes and stale data.
+ *
+ * 3. NO CSW AT THE END. 0x6454 switches on the state byte and only handles 0
+ *    (a new CBW, 0x63b8) and 1 (data, re-dispatch); anything else returns
+ *    without doing anything (0x6466). Unlike 0x6380 on the data-in side,
+ *    state 3 does NOT send a CSW for data-out. The ROM's pump sends it itself
+ *    (0x5f46, 0x5e70(0)); the old hook set state 3 and stopped.
+ *
+ * The ROM's 0x60f8/0x6050 (vendor command 0xc0, subcommands 1, 2, 9 - the
+ * smartlink_flash write and write_mem path) use the same 64-byte 0x5944 loop,
+ * so this protocol is the one every flash of this device has exercised [L].
+ * The vendor's own hook (SRAM 0x813550) uses 512-byte DMA receives through
+ * FIRM 0xd7eda4 and replaces the ROM's DMA callback (table 0x8004e0 +0x20 ->
+ * 0x813371) to skip the PIO copy; that is faster and is NOT what this does -
+ * it needs the callback table patched and a DMA path nobody here has run.
+ *
+ * Packets are gathered into msc_sector, which is .bss (SRAM, so the SD
+ * IDMAC may read it), and written one sector at a time, after which the next
+ * packet is armed - the same order as 0x5eb4 (write op, then 0x5944). Nothing
+ * here waits: everything between packets is the host's problem. */
+static uint8_t  msc_sector[512] __attribute__((aligned(4)));
+static uint32_t msc_wr_bytes;           /* data-out bytes still to arrive */
+static uint32_t msc_wr_fill;            /* bytes of msc_sector filled */
+static bool     msc_wr_err;             /* a sector failed this command */
+static unsigned msc_wr_armed;           /* length the last 0x5944 asked for */
+
+static void usb_msc_write_arm(void)
+{
+    unsigned n = msc_wr_bytes < MSC_PACKET ? msc_wr_bytes : MSC_PACKET;
+
+    msc_wr_armed = n;
+    yp3_usblog.left = msc_wr_bytes;
+    yp3_usblog.rx = (yp3_usblog.rx & 0xffff0000u) | n;
+    usblog_stage(UL_W_ARM);
+    ROM_MSC_RECV(MSC_BUF, n);
+    usblog_stage(UL_W_ARMED);
+}
+
+/* First pass, from the CBW handler 0x63b8 with the state byte 0: what the
+ * ROM's WRITE(10) does at 0x602e..0x6034 - state 1, arm the first packet. */
+static void usb_msc_write_start(void)
+{
+    msc_wr_bytes = msc_blocks_left * 512u;
+    msc_wr_fill = 0;
+    msc_wr_err = false;
+    MSC_STATE = MSC_ST_DATA_OUT;
+    usb_msc_write_arm();
+}
+
+/* Every later pass, from 0x6454 with the state byte 1: the packet armed last
+ * time is in MSC_BUF. */
+static void usb_msc_write_packet(void)
+{
+    const uint32_t *src = (const uint32_t *)MSC_BUF;
+    uint32_t *dst;
+    unsigned n, i;
+
+    if (msc_wr_bytes == 0) {
+        /* A packet with no write in flight. Ack it and go back to waiting
+         * for a CBW - what the vendor's TX callback does after its CSW
+         * (SRAM 0x8133a8: state 0, 0x5944(+0x208, 31)). [I]: not seen. */
+        msc_runaways++;
+        usblog_stage(UL_W_RUNAWAY);
+        MSC_STATE = MSC_ST_IDLE;
+        ROM_MSC_RECV(MSC_CBW_BUF, 31);
+        return;
+    }
+
+    n = msc_wr_armed;                       /* 0x6454 copied exactly this */
+    yp3_usblog.rx = ((uint32_t)USB_RXCOUNT << 16) | n;
+    yp3_usblog.pkts++;
+    usblog_stage(UL_W_PKT);
+
+    /* n is 64 or a multiple of 4 below it, and both buffers are aligned:
+     * MSC_BUF is 0x800df0. Open-coded - this is the per-packet path. */
+    dst = (uint32_t *)(msc_sector + msc_wr_fill);
+    for (i = 0; i < n / 4; i++)
+        dst[i] = src[i];
+
+    msc_wr_fill  += n;
+    msc_wr_bytes -= n;
+    MSC_RESIDUE  -= n;                      /* 0x5f34: residue -= len */
+
+    if (msc_wr_fill >= 512) {
+        if (usb_msc_write_sector(msc_lba, msc_sector) != 0)
+            msc_wr_err = true;
+        msc_last_lba = msc_lba;
+        msc_chunks++;
+        msc_lba++;
+        msc_blocks_left--;
+        msc_wr_fill = 0;
+        yp3_usblog.secs++;
+    }
+
+    if (msc_wr_bytes == 0) {
+        /* 0x5f42..0x5f46: the data phase is over, send the CSW. Unlike the
+         * read side a failure CAN be reported here, because the data phase
+         * has ended: MEDIUM ERROR / WRITE ERROR, then status 1. */
+        yp3_usblog.left = 0;
+        usblog_stage(UL_W_CSW);
+        if (msc_wr_err)
+            ROM_MSC_SENSE(3, 0x0c);
+        ROM_MSC_CSW(msc_wr_err ? 1 : 0);
+        yp3_usblog.wr_done++;
+        usblog_stage(UL_W_IDLE);
+        if (msc_wr_logged <= MSC_LOG_CMDS)
+            logf("msc: W done secs=%lu pkts=%lu err=%d rc=%ld",
+                 (unsigned long)yp3_usblog.secs,
+                 (unsigned long)yp3_usblog.pkts, msc_wr_err,
+                 (long)yp3_usblog.sd_rc);
+        return;
+    }
+
+    usb_msc_write_arm();                    /* 0x5f5e */
+}
+/* ==== end of THE FIX ====================================================== */
+#else
+/* The OLD path, kept only behind YP3_USB_WRITE_FIX=0 so the diagnosis can be
+ * confirmed on hardware with the same breadcrumbs. Predicted result: stage
+ * W_OLD_WAIT, pkts=0, and nothing after it until the host gives up. */
+static void usb_msc_write_start(void)
+{
+    MSC_STATE = MSC_ST_DATA_OUT;
+    usblog_stage(UL_W_OLD_WAIT);
+}
+
+static void usb_msc_write_packet(void)
 {
     if (msc_blocks_left == 0) {         /* see usb_msc_read_chunk */
         msc_runaways++;
+        usblog_stage(UL_W_RUNAWAY);
         MSC_STATE = MSC_ST_LAST;
         return;
     }
 
-    if (sd_write_sectors(IF_MD(0,) msc_lba, 1, MSC_BUF) != 0)
+    yp3_usblog.rx = (uint32_t)USB_RXCOUNT << 16;
+    yp3_usblog.pkts++;
+    usblog_stage(UL_W_PKT);
+
+    if (usb_msc_write_sector(msc_lba, MSC_BUF) != 0)
         logf("usb: write error at lba %lu", (unsigned long)msc_lba);
 
     msc_lba++;
     msc_blocks_left--;
+    yp3_usblog.secs++;
 
-    /* Same accounting as the read path: the host's data arrived and was
-     * consumed, so the residue has to shrink by it. */
     MSC_RESIDUE -= 512;
 
     MSC_STATE = msc_blocks_left ? MSC_ST_DATA_OUT : MSC_ST_LAST;
 }
+#endif /* YP3_USB_WRITE_FIX */
 
 static int usb_msc_hook(unsigned opcode)
 {
@@ -356,27 +666,46 @@ static int usb_msc_hook(unsigned opcode)
         return 0;
 
     msc_hooks++;
+    yp3_usblog.op = opcode | ((uint32_t)MSC_STATE << 8);
+    usblog_stage(UL_HOOK);
 
     if (MSC_STATE == MSC_ST_IDLE) {
-        if (!usb_msc_begin()) {
+        if (!usb_msc_begin()
+                /* The ROM's WRITE(10) checks these two (0x5f80, 0x601e);
+                 * delegate so it fails them with the right sense. */
+                || (opcode == 0x2a && ((MSC_CBW_FLAGS & 0x80)
+                        || MSC_CBW_LEN != msc_blocks_left * 512u))) {
             msc_rejects++;
+            usblog_stage(UL_REJECT);
             return 0;                   /* let the ROM fail it properly */
         }
 
-        MSC_STATE = (opcode == 0x28) ? MSC_ST_DATA_IN : MSC_ST_DATA_OUT;
-
         if (opcode == 0x2a) {
-            /* The first block has not arrived yet: the ROM armed the receive
-             * when it accepted the CBW, and 0x6454 will re-dispatch us once
-             * it lands. Nothing to do on this pass. */
+            yp3_usblog.lba = msc_lba;
+            yp3_usblog.blocks = msc_blocks_left;
+            yp3_usblog.pkts = 0;
+            yp3_usblog.secs = 0;
+            yp3_usblog.wr_begun++;
+            usblog_stage(UL_W_CBW);
+            if (++msc_wr_logged <= MSC_LOG_CMDS)
+                logf("msc: W lba=%lu n=%lu", (unsigned long)msc_lba,
+                     (unsigned long)msc_blocks_left);
+            else if (msc_wr_logged == MSC_LOG_CMDS + 1)
+                logf("msc: further writes counted in yp3_usblog only");
+            /* The first packet has not arrived: arm it and return. 0x63b8
+             * then sees state 1 and returns too (0x6428..0x6442). */
+            usb_msc_write_start();
             return 1;
         }
+
+        usblog_stage(UL_R_CBW);
+        MSC_STATE = MSC_ST_DATA_IN;
     }
 
     if (opcode == 0x28)
         usb_msc_read_chunk();
     else
-        usb_msc_write_chunk();
+        usb_msc_write_packet();
 
     return 1;
 }
@@ -507,6 +836,15 @@ usb_hw_disable(void)
 void usb_init_device(void)
 {
     usb_exposed = false;
+
+    /* Whatever the last run's USB session left in .persist - after a hang
+     * and a pinhole reset, this is the line that says where it stopped. A
+     * power-on leaves garbage, which the magic rejects. */
+    if ((yp3_usblog.stage & USBLOG_MASK) == USBLOG_MAGIC
+            && (yp3_usblog.stage & ~USBLOG_MASK) != UL_BOOT)
+        usblog_report("prev");
+    memset((void *)&yp3_usblog, 0, sizeof(yp3_usblog));
+    usblog_stage(UL_BOOT);
 }
 
 /* usb.c's non-usbstack slave mode has already unmounted the disk, reset
@@ -566,6 +904,9 @@ void usb_enable(bool on)
         msc_blocks_left = 0;
         MSC_STATE = MSC_ST_IDLE;
         msc_t0 = current_tick;
+        msc_wr_logged = 0;
+        memset((void *)&yp3_usblog, 0, sizeof(yp3_usblog));
+        usblog_stage(UL_BOOT);
 
         usb_log_state("pre");
         usb_hw_enable();
@@ -623,6 +964,9 @@ void usb_enable(bool on)
         logf("usb: wdog ctrl=%08lx load=%08lx",
              (unsigned long)WDOG_CTRL, (unsigned long)WDOG_LOAD);
         WDOG_CTRL = 0;
+        usblog_stage(UL_ATTACHED);
+        logf("usb: write path %s", YP3_USB_WRITE_FIX ? "0x5944 pump (fix)"
+                                                     : "OLD (no arm)");
     } else {
         if (!usb_exposed)
             return;
@@ -642,6 +986,8 @@ void usb_enable(bool on)
                  MSC_STATE);
             logf("msc: ticks=%ld hz=%d -> %lu KB/s", dt, HZ, kbs);
         }
+        usblog_report("detach");
+        usblog_stage(UL_DETACHED);
         msc_hooks = msc_chunks = msc_rejects = msc_sderrs = 0;
         msc_runaways = 0;
 
