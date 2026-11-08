@@ -26,6 +26,16 @@
 #define HAVE_LCD_BITMAP
 
 #define HAVE_BACKLIGHT
+/* Brightness is PWM channel 3 on P1.17 (backlight-yp3box.c). The vendor's
+ * set_brightness (FIRM 0xd106a0) takes 10..100 percent in steps of 10, built
+ * as (level + 1) * 10 by its UI (0xd0ba02), so setting n is n*10 percent. The
+ * default is the 60% read out of a live vendor system (SRAM 0x824258).
+ * Defined unconditionally: the PWM itself sits behind YP3_BL_PWM in the
+ * driver, and with that off the setting is accepted and has no effect. */
+#define HAVE_BACKLIGHT_BRIGHTNESS
+#define MIN_BRIGHTNESS_SETTING      1
+#define MAX_BRIGHTNESS_SETTING      10
+#define DEFAULT_BRIGHTNESS_SETTING  6
 /* the panel can be blanked before power-off; see lcd_shutdown() */
 #define HAVE_LCD_SHUTDOWN
 
