@@ -7,8 +7,12 @@
  *                                   dedicated PLL (24.576 or 22.579 MHz)
  *                                   committed on clock id 0
  *   the general DMA engine          0x40001000, module 0x21, peripheral
- *                                   request line 1, writing into the TX FIFO
- *                                   at 0x4000920c
+ *                                   request line 1, CONTROL 0x002812a0,
+ *                                   buffer at +0x04 (the SOURCE) into the
+ *                                   playback FIFO 0x4000910c at +0x08 - the
+ *                                   +0x100 file. 0x4000920c, which this
+ *                                   comment named until 2026-11-08, is the
+ *                                   capture FIFO.
  *   IRQ 60 + channel                the DMA channel's own completion interrupt
  *
  * Everything here is transcribed from the vendor's audio HAL; docs/AUDIO.md
