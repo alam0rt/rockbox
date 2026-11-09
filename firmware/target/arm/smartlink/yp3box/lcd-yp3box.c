@@ -407,20 +407,44 @@ static bool lcd_may_yield(void)
     return ipsr == 0 && primask == 0 && current_tick > HZ;
 }
 
-/* Swap n pixels of the rect starting at pixel index `first` into dst. */
+/* One framebuffer pixel as the byte-swapped RGB565 word the panel takes.
+ * `row` is FBADDR(0, y); x is in pixels. */
+#if LCD_DEPTH == 16
+static inline unsigned lcd_px_swapped(const fb_data *row, int x)
+{
+    unsigned v = row[x];
+    return ((v & 0xff) << 8) | (v >> 8);
+}
+#elif LCD_DEPTH == 2 && LCD_PIXELFORMAT == HORIZONTAL_PACKING
+/* lcd-2bit-horz.c stores ~brightness & 3, leftmost pixel in bits 7:6, so a
+ * stored 0 is white. Indexed by the STORED value, already byte-swapped:
+ * white, 170 grey, 85 grey, black. Any four RGB565 colours work - this is a
+ * palette, not a grey ramp. Not const: .rodata is SPI NOR, and this is read
+ * once per pixel from .icode. */
+static uint16_t lcd_palette_swapped[4] = { 0xffff, 0x55ad, 0xaa52, 0x0000 };
+
+static inline unsigned lcd_px_swapped(const fb_data *row, int x)
+{
+    return lcd_palette_swapped[(row[x >> 2] >> (6 - 2 * (x & 3))) & 3];
+}
+#else
+#error "lcd-yp3box.c: no pixel expansion for this LCD_DEPTH/LCD_PIXELFORMAT"
+#endif
+#define LCD_ROW(y)  FBADDR(0, (y))
+
+/* Expand n pixels of the rect starting at pixel index `first` into dst. */
 static void LCDICODE lcd_fill_bounce(uint16_t *dst, int x, int y, int w,
                                      int first, int n)
 {
     int r = first / w, c = first % w;
-    const fb_data *p = FBADDR(x + c, y + r);
+    const fb_data *row = LCD_ROW(y + r);
 
     while (n--) {
-        unsigned v = *p++;
-        *dst++ = (uint16_t)(((v & 0xff) << 8) | (v >> 8));
+        *dst++ = (uint16_t)lcd_px_swapped(row, x + c);
         if (++c == w) {
             c = 0;
             r++;
-            p = FBADDR(x, y + r);
+            row = LCD_ROW(y + r);
         }
     }
 }
@@ -479,8 +503,7 @@ static bool lcd_update_rect_dma(int x, int y, int w, int h, bool yield_ok)
     /* An odd pixel count would leave a chunk that is not a whole number of
      * 32-bit FIFO words: the first pixel goes by PIO, as the vendor does. */
     if (total & 1) {
-        unsigned v = *FBADDR(x, y);
-        lcd_write_data_n(((v & 0xff) << 8) | (v >> 8), 2);
+        lcd_write_data_n(lcd_px_swapped(LCD_ROW(y), x), 2);
         sent = 1;
     }
     if (sent < total)
@@ -557,14 +580,13 @@ static void LCDICODE lcd_update_rect_pio(int x, int y, int width, int height,
     for (r = 0; r < height; r++) {
         if (yield_ok && r && !(r & 7))
             yield();
-        const fb_data *p = FBADDR(x, y + r);
+        const fb_data *row = LCD_ROW(y + r);
         for (c = 0; c < width; c++) {
-            unsigned v = *p++;
             /* One 2-byte transfer of the byte-swapped colour. This is exactly
              * what the vendor's fill at 0x812dc4 does: it byte-swaps
              * (r4 = (c << 8) | (c >> 8)) and calls the count == 2 data path
              * once per pixel. */
-            lcd_write_data_n(((v & 0xff) << 8) | (v >> 8), 2);
+            lcd_write_data_n(lcd_px_swapped(row, x + c), 2);
         }
     }
 }
@@ -606,3 +628,30 @@ void lcd_update(void)
 {
     lcd_update_rect(0, 0, LCD_WIDTH, LCD_HEIGHT);
 }
+
+#if !defined(HAVE_LCD_COLOR)
+/* powermgmt.c's shutdown_hw() calls this on every non-colour target. A TFT
+ * has no contrast; HAVE_LCD_CONTRAST stays off, so there is no setting. */
+void lcd_set_contrast(int val)
+{
+    (void)val;
+}
+
+/* Greyscale targets owe these to plugin.c's API table (greylib, chip8,
+ * test_scanrate, lua). The iPod versions write an iPod-specific packed format
+ * straight to its controller. This target builds no plugins, so nothing can
+ * call them; they are deliberately empty rather than an untested guess at
+ * that format. Implement them in the commit that makes plugins build. */
+void lcd_blit_mono(const unsigned char *data, int bx, int y, int bwidth,
+                   int height, int stride)
+{
+    (void)data; (void)bx; (void)y; (void)bwidth; (void)height; (void)stride;
+}
+
+void lcd_blit_grey_phase(unsigned char *values, unsigned char *phases,
+                         int bx, int y, int bwidth, int height, int stride)
+{
+    (void)values; (void)phases; (void)bx; (void)y; (void)bwidth;
+    (void)height; (void)stride;
+}
+#endif

@@ -19,10 +19,20 @@
 #define CONFIG_LCD          LCD_YP3BOX
 #define LCD_WIDTH           128
 #define LCD_HEIGHT          160
-#define LCD_DEPTH           16
-#define LCD_PIXELFORMAT     RGB565
+/* The PANEL is RGB565; the FRAMEBUFFER is 2-bit greyscale, 4 pixels a byte,
+ * the iPod 1G-3G format (lcd-2bit-horz.c). 128x160x16 is 40,960 bytes of
+ * SRAM and 128x160x2 is 5,120: the difference goes to codecbuf (yp3-rvo).
+ * lcd-yp3box.c expands each pixel through a 4-entry palette as it fills the
+ * DMA bounce buffer, so the panel, the window and the transfer are unchanged.
+ * tools/40_build.sh picks the matching bmp2rb format from LCD_DEPTH. */
+#define LCD_DEPTH           2
+#define LCD_PIXELFORMAT     HORIZONTAL_PACKING
 #define LCD_DPI             120
-#define HAVE_LCD_COLOR
+/* For screendumps and the simulator: the palette's two ends. */
+#define LCD_DARKCOLOR       0x000000
+#define LCD_BRIGHTCOLOR     0xffffff
+#define LCD_BL_DARKCOLOR    0x000000
+#define LCD_BL_BRIGHTCOLOR  0xffffff
 #define HAVE_LCD_BITMAP
 
 #define HAVE_BACKLIGHT
