@@ -431,6 +431,14 @@ static void yp3_measure_speed(void)
         logf("speed: XIP penalty = %lu.%02lux",
              (unsigned long)(flash_cyc / sram_cyc),
              (unsigned long)((flash_cyc % sram_cyc) * 100u / sram_cyc));
+
+    /* Does this Cortex-M4 have an MPU (yp3-rvo)? MPU_TYPE is architectural
+     * and reads as zero when there is none: DREGION, bits 15:8, is the region
+     * count. Neither the ROM nor FIRM ever touches the MPU registers, so the
+     * dumps cannot answer it. A read, nothing else. */
+    logf("mpu: MPU_TYPE %08lx (%lu regions)",
+         (unsigned long)REG32(0xE000ED90u),
+         (unsigned long)((REG32(0xE000ED90u) >> 8) & 0xffu));
 }
 
 void system_init(void)
