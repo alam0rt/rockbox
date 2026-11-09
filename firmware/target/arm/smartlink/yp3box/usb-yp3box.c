@@ -706,11 +706,10 @@ void usb_attach(void)
  * connection until the host fails to enumerate. */
 int usb_detect(void)
 {
-    /* usb_tick() calls this every tick, from the tick interrupt, and each
-     * call is a PMU mailbox transaction. At HZ that is 100 transactions a
-     * second taken out of an interrupt, contending with the power thread for
-     * one register pair. Sample at 10 Hz and hand back the last answer in
-     * between; usb.c debounces over 200 ms anyway. */
+    /* usb_tick() calls this every tick, from the tick interrupt. Once the
+     * PMU engine runs, power_input_status() is its cached status (refreshed
+     * at 10 Hz, no mailbox wait); before that it is a synchronous read, so
+     * keep the 10 Hz sample here too. usb.c debounces over 200 ms anyway. */
     static long next_poll;
     static int detected = USB_EXTRACTED;
 

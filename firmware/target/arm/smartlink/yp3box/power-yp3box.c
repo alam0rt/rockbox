@@ -95,14 +95,8 @@ static inline void pmu_unlock(uint32_t old)
  * lock, because the reset would otherwise cut a transaction from the tick
  * in half. */
 #define ROM_PMU_BUS_INIT    ((void (*)(void))0x3c2du)
-
-void yp3_pmu_bus_init(void)
-{
-    uint32_t oldlevel = pmu_lock();
-    ROM_PMU_BUS_INIT();
-    PMU_REG(PMU_BUS_CFG) = PMU_BUS_CFG_VENDOR;
-    pmu_unlock(oldlevel);
-}
+/* yp3_pmu_bus_init() itself is below the PMU engine: the reset must not cut
+ * one of the engine's transactions in half. */
 
 /* How long a transaction really takes, in core cycles off SysTick, and how
  * many there are. Read and cleared by the PCM beacon.
@@ -138,48 +132,293 @@ static inline __attribute__((always_inline)) void pmu_t1(uint32_t t0, unsigned t
     }
 }
 
-bool __attribute__((section(".icode"), noinline))
-yp3_pmu_read(unsigned reg, uint8_t *value)
+/* --- The PMU engine ---------------------------------------------------------
+ *
+ * A transaction is ~1.7 ms however it is issued [L], because that is the bus:
+ * the mailbox is an RTWI (FIRM's "rtwi op in isr", 0xc492d0) already at the
+ * bottom of its divider (bits 3:0 of +0x100 = 0, the rate helper 0xc484b4).
+ * The vendor never waits for one with interrupts off and never issues one
+ * from an interrupt - every op is bracketed by a mutex (0x80d3b0/0x80d3dc)
+ * that complains if called from an ISR. This port did both: 46-48 ops a
+ * second, each a 1.7 ms spin under BASEPRI, two thirds of them from the tick.
+ *
+ * So the waiting moves off the CPU. The engine is a tick task that owns the
+ * mailbox while the scheduler runs: each tick it collects a finished
+ * transaction, if any, and starts the next one. A transaction takes a fraction
+ * of a tick, so it is always done by the next one, and nothing ever spins.
+ *
+ *   - the centre key (KEY_STATUS) and the power status (VBUS, charging) are
+ *     POLLED by the engine and cached; the tick-context callers only read the
+ *     cache. Key edges are accumulated, then write-1-cleared as their own job.
+ *   - a thread's yp3_pmu_read/write posts one request and sleeps on a
+ *     semaphore until the engine has done it - about a tick.
+ *   - with interrupts off, from an interrupt, or before the engine has run
+ *     (early boot, power-off), the old synchronous path runs instead. It
+ *     first finishes any transaction the engine has in flight and parks its
+ *     result for the engine to deliver, so the two can never interleave on
+ *     the one register pair.
+ */
+#include "kernel.h"
+
+enum { PE_IDLE, PE_BUSY, PE_DONE };
+enum { PJ_KEY, PJ_KEYCLR, PJ_STATUS, PJ_THREAD };
+enum { PR_NONE, PR_PENDING, PR_ACTIVE, PR_DONE };
+
+#define PE_KEY_TICKS      2         /* centre key at 50 Hz; was every 4th tick */
+#define PE_STATUS_TICKS   (HZ / 10) /* VBUS/charging at 10 Hz, as usb_detect was */
+#define PE_TIMEOUT_TICKS  5         /* a GO bit still set after 50 ms is a fault */
+
+static volatile bool    pe_running;     /* the tick task has run at least once */
+static volatile uint8_t pe_state;
+static uint8_t          pe_job;
+static long             pe_started;
+static uint8_t          pe_rdata;
+static bool             pe_ok;
+
+static unsigned         pe_key_div, pe_status_div;
+static bool             pe_key_due, pe_status_due;
+static volatile uint8_t pe_key_bits;    /* edges not yet taken by the button driver */
+static uint8_t          pe_key_clear;   /* edges not yet cleared in the PMU */
+static uint8_t          pe_key_clearing;
+static volatile uint8_t pe_status;
+static volatile bool    pe_status_valid;
+
+static struct mutex     pe_mtx;
+static struct semaphore pe_sem;
+static volatile uint8_t pe_req;
+static unsigned         pe_req_reg;
+static bool             pe_req_write;
+static uint8_t          pe_req_val, pe_req_out;
+static bool             pe_req_ok;
+
+uint32_t yp3_pmu_async_ops;             /* engine transactions, for the beacon */
+
+static inline __attribute__((always_inline)) bool pe_can_async(void)
+{
+    uint32_t ipsr, primask, basepri;
+
+    if (!pe_running)
+        return false;
+    __asm__ volatile ("mrs %0, ipsr"    : "=r"(ipsr));
+    __asm__ volatile ("mrs %0, primask" : "=r"(primask));
+    __asm__ volatile ("mrs %0, basepri" : "=r"(basepri));
+    return ipsr == 0 && primask == 0 && basepri == 0;
+}
+
+/* Latch a finished transaction's result. Caller owns the mailbox: the tick,
+ * or the synchronous path with the lock held. .icode, for the latter. */
+static inline __attribute__((always_inline)) void pe_collect(bool ok)
+{
+    pe_ok = ok && !(PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK);
+    pe_rdata = (uint8_t)PMU_REG(PMU_MB_RDATA);
+    pe_state = PE_DONE;
+}
+
+/* With the lock held: if the engine has a transaction on the bus, wait it
+ * out and park its result for the engine to deliver on its next tick. */
+static inline __attribute__((always_inline)) void pe_finish_inflight(void)
 {
     unsigned i;
-    uint32_t oldlevel = pmu_lock();
-    uint32_t t0 = pmu_t0();
+
+    if (pe_state != PE_BUSY)
+        return;
+    for (i = 0; i < PMU_POLL_LIMIT && (PMU_REG(PMU_MB_CMD) & PMU_GO); i++)
+        ;
+    pe_collect(!(PMU_REG(PMU_MB_CMD) & PMU_GO));
+}
+
+/* The synchronous transaction. Interrupts off, interrupt context, early boot
+ * and power-off all come here, so it stays in .icode and calls nothing. */
+static bool __attribute__((section(".icode"), noinline))
+pmu_sync(unsigned reg, bool write, uint8_t value, uint8_t *out)
+{
+    unsigned i;
+    uint32_t oldlevel = pmu_lock();     /* masks the tick: the engine is still */
+    uint32_t t0;
     bool ok;
 
-    PMU_REG(PMU_MB_CMD) = PMU_OP_READ | (reg << 8);
+    pe_finish_inflight();
+
+    t0 = pmu_t0();
+    if (write)
+        PMU_REG(PMU_MB_WDATA) = value;
+    PMU_REG(PMU_MB_CMD) = (write ? PMU_OP_WRITE : PMU_OP_READ) | (reg << 8);
     PMU_REG(PMU_MB_CMD) |= PMU_GO;
     for (i = 0; i < PMU_POLL_LIMIT && (PMU_REG(PMU_MB_CMD) & PMU_GO); i++)
         ;
 
     ok = !(PMU_REG(PMU_MB_CMD) & PMU_GO)
       && !(PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK);
-    if (ok)
-        *value = (uint8_t)PMU_REG(PMU_MB_RDATA);
+    if (ok && out)
+        *out = (uint8_t)PMU_REG(PMU_MB_RDATA);
 
-    pmu_t1(t0, reg);
+    pmu_t1(t0, reg | (write ? 0x100u : 0u));
     pmu_unlock(oldlevel);
     return ok;
+}
+
+static void pe_issue(unsigned job, unsigned reg, bool write, uint8_t value)
+{
+    if (write)
+        PMU_REG(PMU_MB_WDATA) = value;
+    PMU_REG(PMU_MB_CMD) = (write ? PMU_OP_WRITE : PMU_OP_READ) | (reg << 8);
+    PMU_REG(PMU_MB_CMD) |= PMU_GO;
+    pe_job = job;
+    pe_started = current_tick;
+    pe_state = PE_BUSY;
+    yp3_pmu_async_ops++;
+}
+
+static void pe_deliver(void)
+{
+    switch (pe_job) {
+    case PJ_KEY:
+        if (pe_ok && (pe_rdata & PMU_KEY_ANY)) {
+            pe_key_bits  |= pe_rdata & PMU_KEY_ANY;
+            pe_key_clear |= pe_rdata & PMU_KEY_ANY;
+        }
+        break;
+    case PJ_KEYCLR:
+        if (!pe_ok)
+            pe_key_clear |= pe_key_clearing;    /* try again next tick */
+        break;
+    case PJ_STATUS:
+        if (pe_ok) {
+            pe_status = pe_rdata;
+            pe_status_valid = true;
+        }
+        break;
+    case PJ_THREAD:
+        pe_req_out = pe_rdata;
+        pe_req_ok = pe_ok;
+        pe_req = PR_DONE;
+        semaphore_release(&pe_sem);
+        break;
+    }
+    pe_state = PE_IDLE;
+}
+
+static void pmu_engine_tick(void)
+{
+    pe_running = true;
+
+    if (++pe_key_div >= PE_KEY_TICKS) {
+        pe_key_div = 0;
+        pe_key_due = true;
+    }
+    if (++pe_status_div >= PE_STATUS_TICKS) {
+        pe_status_div = 0;
+        pe_status_due = true;
+    }
+
+    if (pe_state == PE_BUSY) {
+        if (!(PMU_REG(PMU_MB_CMD) & PMU_GO))
+            pe_collect(true);
+        else if (TIME_AFTER(current_tick, pe_started + PE_TIMEOUT_TICKS))
+            pe_collect(false);
+        else
+            return;
+    }
+    if (pe_state == PE_DONE)
+        pe_deliver();
+
+    /* One transaction per tick, most urgent first. */
+    if (pe_req == PR_PENDING) {
+        pe_req = PR_ACTIVE;
+        pe_issue(PJ_THREAD, pe_req_reg, pe_req_write, pe_req_val);
+    } else if (pe_key_clear) {
+        pe_key_clearing = pe_key_clear;
+        pe_key_clear = 0;
+        pe_issue(PJ_KEYCLR, PMU_REG_KEY_STATUS, true, pe_key_clearing);
+    } else if (pe_key_due) {
+        pe_key_due = false;
+        pe_issue(PJ_KEY, PMU_REG_KEY_STATUS, false, 0);
+    } else if (pe_status_due) {
+        pe_status_due = false;
+        pe_issue(PJ_STATUS, PMU_REG_STATUS, false, 0);
+    }
+}
+
+static bool pe_thread_op(unsigned reg, bool write, uint8_t value, uint8_t *out)
+{
+    long deadline;
+    bool ok = false;
+
+    mutex_lock(&pe_mtx);
+    pe_req_reg = reg;
+    pe_req_write = write;
+    pe_req_val = value;
+    __asm__ volatile ("" ::: "memory");
+    pe_req = PR_PENDING;
+
+    /* The engine finishes or fails a request within PE_TIMEOUT_TICKS of
+     * starting it; the second's grace only covers a tick that has stopped. */
+    deadline = current_tick + HZ;
+    while (pe_req != PR_DONE && !TIME_AFTER(current_tick, deadline))
+        semaphore_wait(&pe_sem, HZ / 10);
+
+    if (pe_req == PR_DONE) {
+        ok = pe_req_ok;
+        if (ok && out)
+            *out = pe_req_out;
+    }
+    pe_req = PR_NONE;
+    mutex_unlock(&pe_mtx);
+    return ok;
+}
+
+bool __attribute__((section(".icode"), noinline))
+yp3_pmu_read(unsigned reg, uint8_t *value)
+{
+    if (pe_can_async())
+        return pe_thread_op(reg, false, 0, value);
+    return pmu_sync(reg, false, 0, value);
 }
 
 bool __attribute__((section(".icode"), noinline))
 yp3_pmu_write(unsigned reg, uint8_t value)
 {
-    unsigned i;
+    if (pe_can_async())
+        return pe_thread_op(reg, true, value, NULL);
+    return pmu_sync(reg, true, value, NULL);
+}
+
+/* The centre key's edges since the last call (PMU_KEY_* bits), cleared in the
+ * PMU by the engine. Tick context; never touches the mailbox. */
+uint8_t yp3_pmu_key_take(void)
+{
+    int oldlevel = disable_irq_save();
+    uint8_t bits = pe_key_bits;
+    pe_key_bits = 0;
+    restore_irq(oldlevel);
+    return bits;
+}
+
+/* PMU_REG_STATUS. The engine's cached copy (at most 100 ms old) once it is
+ * running; a synchronous read before that and in the power-off path. */
+static bool pmu_status(uint8_t *status)
+{
+    if (pe_running && pe_status_valid) {
+        *status = pe_status;
+        return true;
+    }
+    return pmu_sync(PMU_REG_STATUS, false, 0, status);
+}
+
+static void pmu_engine_init(void)
+{
+    mutex_init(&pe_mtx);
+    semaphore_init(&pe_sem, 1, 0);
+    tick_add_task(pmu_engine_tick);
+}
+
+void yp3_pmu_bus_init(void)
+{
     uint32_t oldlevel = pmu_lock();
-    uint32_t t0 = pmu_t0();
-    bool ok;
-
-    PMU_REG(PMU_MB_WDATA) = value;
-    PMU_REG(PMU_MB_CMD) = PMU_OP_WRITE | (reg << 8);
-    PMU_REG(PMU_MB_CMD) |= PMU_GO;
-    for (i = 0; i < PMU_POLL_LIMIT && (PMU_REG(PMU_MB_CMD) & PMU_GO); i++)
-        ;
-
-    ok = !(PMU_REG(PMU_MB_CMD) & PMU_GO)
-      && !(PMU_REG(PMU_MB_STATUS) & PMU_ERROR_MASK);
-    pmu_t1(t0, reg | 0x100u);
+    pe_finish_inflight();
+    ROM_PMU_BUS_INIT();
+    PMU_REG(PMU_BUS_CFG) = PMU_BUS_CFG_VENDOR;
     pmu_unlock(oldlevel);
-    return ok;
 }
 
 /* Power-off woke straight back up, from Shut down and from the idle timer
@@ -437,6 +676,10 @@ void power_init(void)
             && yp3_pmu_write(PMU_REG_VOLTAGE_CONFIG, (uint8_t)(before | 1u)))
         (void)yp3_pmu_read(PMU_REG_VOLTAGE_CONFIG, &after);
 
+    /* Last: everything above ran synchronously. From the first tick after
+     * this, the engine owns the mailbox. */
+    pmu_engine_init();
+
 #ifdef YP3_LOGF_POWER
     logf("pmu 0x47: %02x -> %02x", before, after);
     /* One line that characterises the block, so a single dump can rule the
@@ -583,15 +826,16 @@ bool charging_state(void)
 {
     uint8_t status;
 
-    return yp3_pmu_read(PMU_REG_STATUS, &status)
+    return pmu_status(&status)
         && (status & PMU_STATUS_CHARGING) != 0;
 }
 
+/* usb_detect() calls this from the tick interrupt: cached, see pmu_status. */
 unsigned int power_input_status(void)
 {
     uint8_t status;
 
-    if (!yp3_pmu_read(PMU_REG_STATUS, &status)
+    if (!pmu_status(&status)
             || !(status & PMU_STATUS_POWER_INPUT))
         return POWER_INPUT_NONE;
 

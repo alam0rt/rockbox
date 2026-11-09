@@ -1178,15 +1178,20 @@ static void pcm_beacon(void)
     unsigned long ps = yp3_pmu_cost_sum / (CPU_FREQ / 1000000u);
     unsigned long po = yp3_pmu_ops, pslow = yp3_pmu_slow;
     unsigned long preg = yp3_pmu_max_reg;
+    extern uint32_t yp3_pmu_async_ops;
+    unsigned long pa = yp3_pmu_async_ops;
+    yp3_pmu_async_ops = 0;
     yp3_tick_cost_max = 0;
     yp3_pmu_cost_max = 0;
     yp3_pmu_ops = 0;
     yp3_pmu_cost_sum = 0;
     yp3_pmu_slow = 0;
     /* pmu=<ops>/<total us>/<max us>@<reg, 1xx = write> slow=<ops over 1 ms>
-     * bus=<PMU +0x100>: b082 is the ROM's half-rate word, b080 the vendor's */
-    logf("pcmb: irqs=%lu tk=%luus pmu=%lu/%lu/%luus@%03lx slow=%lu bus=%lx plays=%lu playing=%d mix=%d free=%lu descs=%d",
-         (unsigned long)pcm_irqs, tk, po, ps, pm, preg, pslow,
+     * bus=<PMU +0x100>: b082 is the ROM's half-rate word, b080 the vendor's
+     * pmu= counts only SPINNING (synchronous) ops; async= the engine's, which
+     * cost no CPU wait. Under playback pmu= should be 0. */
+    logf("pcmb: irqs=%lu tk=%luus pmu=%lu/%lu/%luus@%03lx slow=%lu async=%lu bus=%lx plays=%lu playing=%d mix=%d free=%lu descs=%d",
+         (unsigned long)pcm_irqs, tk, po, ps, pm, preg, pslow, pa,
          (unsigned long)(*(volatile uint32_t *)(PMU_BASE + PMU_BUS_CFG)),
          (unsigned long)pcm_plays,
          (int)pcm_is_playing(), (int)mixer_channel_status(PCM_MIXER_CHAN_PLAYBACK),

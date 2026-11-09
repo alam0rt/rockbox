@@ -147,19 +147,21 @@ static bool right_held, left_held;
  * this call and the release on the next, or the tap disappears. */
 static bool play_held, play_release_pending;
 
+/* The edges come from the PMU engine in power-yp3box.c, which polls
+ * KEY_STATUS at 50 Hz and write-1-clears what it saw, all without spinning.
+ * This used to be a mailbox transaction of its own from the tick, every 4th
+ * tick, each a ~1.7 ms wait with interrupts masked. */
 static void play_read_pmu(void)
 {
-    uint8_t status;
+    uint8_t status = yp3_pmu_key_take();
 
-    if (!yp3_pmu_read(PMU_REG_KEY_STATUS, &status) || !(status & PMU_KEY_ANY)) {
+    if (!(status & PMU_KEY_ANY)) {
         if (play_release_pending) {
             play_release_pending = false;
             play_held = false;
         }
         return;
     }
-
-    (void)yp3_pmu_write(PMU_REG_KEY_STATUS, status & PMU_KEY_ANY);
 
     if (status & PMU_KEY_PRESS) {
         play_held = true;
@@ -197,18 +199,10 @@ int button_read_device(void)
     if (left_held)
         btn |= BUTTON_PREV;                      /* back / left, id 0x42 */
 
-    /* Every fourth tick only. Each read is a PMU mailbox transaction, and
-     * measured on hardware one takes up to 3.4 ms - 100 a second was a third
-     * of the CPU spent spinning inside the tick (pmu=116/3386us, tk=6.7 ms of
-     * every 10). The PMU latches press and release as edges, and a press and
-     * release seen in the same read are already split across two calls
-     * below, so a slower poll loses no taps; it only adds up to 40 ms of
-     * latency to the centre key. */
-    static unsigned pmu_div;
-    if (++pmu_div >= 4) {
-        pmu_div = 0;
-        play_read_pmu();
-    }
+    /* Every tick: it only takes the engine's latched edges now. A press and
+     * release that arrive in one engine read are split across two calls by
+     * play_read_pmu, so no tap is lost. */
+    play_read_pmu();
     if (play_held)
         btn |= BUTTON_PLAY;                      /* centre, id 0x21 "enter" */
 

@@ -192,6 +192,7 @@
 bool yp3_pmu_read(unsigned reg, uint8_t *value);
 bool yp3_pmu_write(unsigned reg, uint8_t value);
 void yp3_pmu_bus_init(void);
+uint8_t yp3_pmu_key_take(void);     /* centre-key edges, from the PMU engine */
 
 /* The mailbox's own bus configuration word, PMU_BASE + 0x100. NOT a USB PHY
  * register, which is what this port called it for months: it sits directly
