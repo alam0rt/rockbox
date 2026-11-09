@@ -4,4 +4,5 @@
 bool backlight_hw_init(void);
 void backlight_hw_on(void);
 void backlight_hw_off(void);
+void backlight_hw_brightness(int level);
 #endif
