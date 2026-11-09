@@ -196,7 +196,24 @@
  * decodes with an 18 KB working buffer and NO file readahead at all, because
  * this board streams from SD by design. A 148 KB arena is still far more than
  * the hardware was built around. */
-#define CODEC_SIZE          0x1b000
+/* yp3-rvo: the 2-bit framebuffer, a 2 KB plugin buffer and 1 KB LCD bounce
+ * buffers freed 50,240 bytes of SRAM (measured, logf build: arena 141,312 ->
+ * 191,552 at the old CODEC_SIZE). 0x20800 (133,120) takes 22,528 of it:
+ *
+ *   - It admits cook 130,852, ay 123,328 and gbs 112,776 (measured links;
+ *     the SOURCES gate for all three is 0x20000), 2.3 KB of headroom on cook.
+ *   - It stays BELOW 0x21000, the Opus gate, on purpose. That gate is a LINK
+ *     threshold: at start opus.c also takes a 64 KB ogg sync buffer, a 23 KB
+ *     output frame and the decoder state from what is left of codecbuf,
+ *     ~107 KB of heap on a 130 KB image `[I]`. No size this target can free
+ *     runs it, and any size that builds it would ship a codec that fails at
+ *     its first allocation.
+ *   - Nothing between 0x21000 and 0x48000 is built at all (the shared gate
+ *     drops FLAC, AAC, MPC, APE, WMA and ASAP as one group), so going higher
+ *     here buys no codec, only a smaller arena.
+ *
+ * The other 27,712 go to the audio arena. */
+#define CODEC_SIZE          0x20800
 
 /* The tree cache is allocated before playback. The generic 1,000-entry default
  * consumes 52 KiB (40-byte names plus 12-byte entries) from the small core
