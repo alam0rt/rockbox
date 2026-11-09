@@ -224,6 +224,15 @@
 #define PCM_PLAY_DBL_BUF_SAMPLES 256
 
 #define AUDIO_BUFFER_RESERVE   0x4000
+
+/* The file buffer here is ~54 KB and a 320 kbps watermark is 40 KB, so every
+ * half-second low event rebuffered, could not load the next track while the
+ * current one was still filling, and cleared and retried for ever - the PCM
+ * ring ran dry ~11 times in 200 log records and the track stuttered (yp3-ov6).
+ * With this, apps/playback.c lets the buffering thread finish the last track
+ * before it tries to load another. Shared-core ledger entry in CLAUDE.md. */
+#define AUDIO_BUFFER_LOW_WAITS_FOR_LAST
+
 /* A 128x160 RGB565 default backdrop costs 40 KiB in core buflib. Keep that
  * memory available for the PCM ring and compressed-file buffer. */
 #define DEFAULT_BACKDROP      "-"
