@@ -99,6 +99,9 @@
 #include "sdmmc.h"
 #include <string.h>
 #include <stdint.h>
+/* Build switches (YP3_SD_BENCH) arrive through this generated header; without
+ * the include an #ifndef default below would silently win. */
+#include "yp3-buildstamp.h"
 #ifdef ROCKBOX_HAS_LOGF
 #define LOGF_ENABLE
 #endif
@@ -545,7 +548,11 @@ static uint32_t sd_identify(void);
 static void SDICODE sd_dma_enable(void);
 static void SDICODE sd_dma_disable(void);
 
-/* Two sectors, for the post-identification checks. .bss, not const: it is a
+/* Two sectors, for the post-identification checks - 1 KB, which is all any
+ * probe reads: sd_verify one sector at a time, sd_verify_multi two. It was
+ * 4 KB for the benchmark's 8-sector runs, permanently resident to serve a
+ * measurement nobody needs on a normal boot; that has its own buffer now, in
+ * YP3_SD_BENCH builds only (yp3-1bw). .bss, not const: it is a
  * DMA-free PIO read, but keeping card buffers out of flash is the standing
  * rule in this port. Two, because proving a multi-block transfer needs the
  * SECOND block to land in the right place, which one sector cannot show. */
@@ -556,7 +563,7 @@ static void SDICODE sd_dma_disable(void);
  * verifies a path that is not the one real reads take, because the buffers the
  * filesystem hands sd_read_sectors are aligned. This buffer landed at
  * 0x00834e6b once, and the whole ladder was measuring the wrong drain. */
-static uint8_t sd_probe_buf[4096] __attribute__((aligned(4)));
+static uint8_t sd_probe_buf[1024] __attribute__((aligned(4)));
 
 /* Does this bus width and rate actually work? Content, never a return code.
  *
@@ -994,6 +1001,14 @@ tCardInfo *card_get_info_target(int card_no)
  * filesystem actually asks for. current_tick is only HZ resolution, but a
  * megabyte takes 300 ms at the link's theoretical 3 MB/s and 14 seconds at the
  * ~70 KB/s the log gaps imply - the two are never going to be confused. */
+#ifndef YP3_SD_BENCH
+#define YP3_SD_BENCH 0
+#endif
+#if YP3_SD_BENCH
+/* One SD_MULTI_MAX run, aligned so the reads take the IDMAC path that real
+ * filesystem reads take. Only in benchmark builds. */
+static uint8_t sd_bench_buf[SD_MULTI_MAX * 512] __attribute__((aligned(4)));
+
 static void sd_benchmark(void)
 {
     long t0, dt;
@@ -1002,7 +1017,7 @@ static void sd_benchmark(void)
     t0 = current_tick;
     for (i = 0; i < 2048u / SD_MULTI_MAX; i++) {
         if (sd_read_sectors(IF_MD(0,) (sector_t)(i * SD_MULTI_MAX),
-                            SD_MULTI_MAX, sd_probe_buf) != 0) {
+                            SD_MULTI_MAX, sd_bench_buf) != 0) {
             logf("sd: benchmark read failed at run %u", i);
             return;
         }
@@ -1013,6 +1028,7 @@ static void sd_benchmark(void)
     logf("sd: 1024 KB in %ld ticks (HZ=%d) -> %ld KB/s",
          dt, (int)HZ, (long)(1024L * HZ / dt));
 }
+#endif /* YP3_SD_BENCH */
 
 int sd_init(void)
 {
@@ -1246,7 +1262,11 @@ int sd_init(void)
                 sd_multi = sd_verify_multi();
                 logf("sd: ok %s 1-bit div=%u multi=%d",
                      sd_dma_on ? "dma" : "pio", divs[i], sd_multi);
+                /* About half a second of reads for a number that has been
+                 * known since 2026-09 (2 MB/s): YP3_SD_BENCH=1 builds only. */
+#if YP3_SD_BENCH
                 sd_benchmark();
+#endif
                 return 0;
             }
             logf("sd: bad pio 1-bit div=%u", divs[i]);
