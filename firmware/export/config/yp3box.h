@@ -212,8 +212,32 @@
  *     drops FLAC, AAC, MPC, APE, WMA and ASAP as one group), so going higher
  *     here buys no codec, only a smaller arena.
  *
- * The other 27,712 go to the audio arena. */
-#define CODEC_SIZE          0x20800
+ * The other 27,712 go to the audio arena.
+ *
+ * yp3-spike-flac: 0x30000 (196,608) for the UNMODIFIED FLAC codec, which
+ * needs 196,352 (measured link: code 7,188, .bss 189,164 - seven 18 KB
+ * channel buffers and a 60,000-byte seek table). 256 bytes of headroom, and
+ * the linker enforces it. Everyone pays: the arena is ~64 KB smaller than at
+ * 0x20800, for MP3 as much as for FLAC. Opus links from 0x21000 on and still
+ * cannot run here (66 KB of heap left, ~107 KB wanted), so it is built but
+ * never packed.
+ *
+ * DO NOT FLASH THIS LAYOUT: IT PLAYS NOTHING. It proves FLAC builds, packs and
+ * passes the slot checks without touching SOURCES, and that is all. The arena
+ * left (110,656) minus the runtime core allocations, scratch, PCM ring and
+ * buffering's 32 KB guard is a compressed ring of about zero - estimated
+ * -1,428 by tools/arena_report.py, which warns. And FLAC could not use a small
+ * ring anyway: flac.c reads MAX_FRAMESIZE+16 = 65,552 contiguous bytes, and
+ * bufgetdata waits until the ring holds all of them (prep_bufdata), so a ring
+ * under ~66 KB hangs the first read. Unmodified FLAC therefore needs 196,608
+ * + ~180 KB of arena = ~376 KB against 307 KB available: ~69 KB short. The
+ * largest codec region that leaves a 66 KB ring here is ~127 KB - which a
+ * two-channel FLAC (104,192, measured) fits. That is a codec change. */
+#define CODEC_SIZE          0x30000
+/* Read by tools/40_build.sh: FLAC sits in SOURCES' 0x48000 group and is
+ * built explicitly; Opus is built by the gates and refused at load. */
+#define YP3_EXTRA_CODECS    "flac"
+#define YP3_NOPACK_CODECS   "opus"
 
 /* The tree cache is allocated before playback. The generic 1,000-entry default
  * consumes 52 KiB (40-byte names plus 12-byte entries) from the small core
