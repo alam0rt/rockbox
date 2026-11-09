@@ -95,6 +95,36 @@ static void bl_note(const char *what, unsigned *n, void *lr)
     (*n)++;
 }
 
+/* What the pad actually does, sampled every tick (yp3-061). The first probe
+ * showed one software 'off' and no other call in the ~15 s around the
+ * flashing, so the flicker is below backlight_hw_on/off. The level is read
+ * back from the pad (port 1 pin 17). Edges in a second mean something is
+ * driving the pin; a steady level while the light flashes puts it past the
+ * pin, in the LED supply. Logs a second that had edges, and a 5 s
+ * heartbeat otherwise, so a steady pad does not flood the ring. */
+#define BL_PAD_PORT 1
+#define BL_PAD_BIT  17
+static int bl_pad_last = -1;
+static unsigned bl_pad_edges, bl_pad_ticks, bl_pad_quiet;
+
+static void bl_pad_tick(void)
+{
+    int lvl = (GPIO_IN(BL_PAD_PORT) >> BL_PAD_BIT) & 1;
+    if (bl_pad_last >= 0 && lvl != bl_pad_last)
+        bl_pad_edges++;
+    bl_pad_last = lvl;
+    if (++bl_pad_ticks < HZ)
+        return;
+    if (bl_pad_edges || ++bl_pad_quiet >= 5) {
+        logf("bl pad t=%ld lvl=%d edges=%u pwm0=%lx pwm10=%lx",
+             current_tick, lvl, bl_pad_edges,
+             (unsigned long)PWMR(0x00), (unsigned long)PWMR(0x10));
+        bl_pad_quiet = 0;
+    }
+    bl_pad_ticks = 0;
+    bl_pad_edges = 0;
+}
+
 void backlight_hw_on(void)
 {
     static unsigned ons;
@@ -145,6 +175,7 @@ bool backlight_hw_init(void)
 
 
     backlight_hw_on();
+    tick_add_task(bl_pad_tick);
 
     return true;
 }
