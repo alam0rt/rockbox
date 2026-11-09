@@ -40,10 +40,32 @@ OUTPUT_ARCH(arm)
     *librbcodec.a:dsp_sample_input.o *librbcodec.a:dsp_sample_output.o \
     *librbcodec.a:dsp_misc.o
 
+/* The boot ROM's own STACK, dead once crt0 has moved SP (yp3-rvo). The ROM's
+ * reset handler (ROM 0x40-0xa6) lays out 0x800000-0x806000 as:
+ *
+ *   .data   0x800000-0x8006b4   copied from ROM 0x5b800
+ *   .bss    0x800800-0x804ab0   zeroed; the end is the literal at ROM 0xc0
+ *   stack   0x804ab0-0x806000   SP = vector 0 = 0x806000
+ *
+ * Every ROM literal pointing into this range lies below 0x804ab0 (337 of
+ * them, 19 clusters), so no ROM routine addresses the stack window by name.
+ * ROM routines called from Rockbox run on Rockbox's stacks. The only ROM code
+ * that reloads MSP is the scheduler start at 0x9a3e (from 0x9c36), which
+ * Rockbox never calls, and an uncalled newlib _mainCRTStartup at 0x22d4.
+ * crt0 leaves the ROM stack on its first instructions (exec path) or at the
+ * "set up the stack" step (ROM boot path).
+ *
+ * `[C]` from the dump, `[I]` until a boot has run with something here: the
+ * ROM re-initialises the window on every reset, so nothing that must survive
+ * one may live here - .persist stays above 0x806000. */
+#define ROMSTACK_ORIG 0x00804ab0
+#define ROMSTACK_END  0x00806000
+
 MEMORY
 {
     FLASH (rx)  : ORIGIN = FLASH_XIP, LENGTH = FLASH_END - FLASH_XIP
     SRAM  (rwx) : ORIGIN = SRAM_ORIG, LENGTH = SRAM_END - SRAM_ORIG
+    ROMSTACK (rw) : ORIGIN = ROMSTACK_ORIG, LENGTH = ROMSTACK_END - ROMSTACK_ORIG
 }
 
 SECTIONS
@@ -112,10 +134,22 @@ SECTIONS
         *(.ibss);
         /* logf.o is excluded: its ring, index and wrap flag go into .persist
            below so they survive a reset. crt0 clears _bssbegin.._bssend. */
-        *(EXCLUDE_FILE (*logf.o) .bss*);
-        *(EXCLUDE_FILE (*logf.o) COMMON);
+        *(EXCLUDE_FILE (*logf.o *lcd-2bit-horz.o) .bss*);
+        *(EXCLUDE_FILE (*logf.o *lcd-2bit-horz.o) COMMON);
         _bssend = .;
     } > SRAM
+
+    /* The 2-bit framebuffer driver's .bss - the 5,120-byte framebuffer and
+       4 bytes beside it - in the dead ROM stack (see ROMSTACK above). Empty
+       in a colour build: lcd-16bit.o's framebuffer stays in .bss. crt0 clears
+       _romwinbegin.._romwinend with .bss. */
+    .romwin (NOLOAD) : ALIGN(4)
+    {
+        _romwinbegin = .;
+        *lcd-2bit-horz.o(.bss* COMMON);
+        . = ALIGN(4);
+        _romwinend = .;
+    } > ROMSTACK
 
     /* --- the black box -----------------------------------------------------
      *
