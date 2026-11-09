@@ -133,7 +133,15 @@
  * (Game Boy) - see the gates in lib/rbcodec/codecs/SOURCES. FLAC, AAC and Opus
  * did not fit at 128 KB either. */
 
-#define PLUGIN_BUFFER_SIZE  0x2000
+/* 2 KB, not 0. With no plugins built the buffer is still the CORE's scratch:
+ * plugin_get_buffer() hands it to bookmark.c (the bookmark list, which writes
+ * its header into it without checking the size, so 0 would write past the
+ * top of SRAM), to fileop.c (file copy, which falls back to a 512-byte stack
+ * buffer below 512) and to cuesheet.c (which needs a 99-track struct far
+ * larger than 8 KB and so already declined here). 2 KB holds the bookmark
+ * header and a handful of entries per page `[I]`; the other 6 KB go to
+ * codecbuf (yp3-rvo). */
+#define PLUGIN_BUFFER_SIZE  0x800
 
 /* Codec slots in flash, COPIED TO SRAM AT LOAD. Each codec's whole image is
  * linked into a per-codec slot in SPI NOR; lc_open() memcpys it into codecbuf

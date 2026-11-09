@@ -331,7 +331,11 @@ static void lcd_set_window(int x, int y, int w, int h)
 #define LCD_DMA_CFG         0x00080002u     /* +0x20: (32 << 14) | 2, +0 == 0 */
 #define LCDC_WFIFO          (LCDC_BASE + 0x30)
 #define LCDC_CFG10_TXDMA    (1u << 19)
-#define LCD_CHUNK_PIX       2048                /* 4096 bytes, the vendor cap */
+/* 4096 bytes is the vendor cap, not a requirement. 512 pixels (1 KB a bounce
+ * buffer) is four times the chunks per frame - 40 rather than 10 - and gives
+ * 6 KB back to codecbuf (yp3-rvo). Each chunk is still a whole number of
+ * 32-bit FIFO words. Untested on hardware at this size. */
+#define LCD_CHUNK_PIX       512
 
 #if YP3_LCD_DMA
 static uint16_t lcd_bounce[2][LCD_CHUNK_PIX] __attribute__((aligned(4)));
