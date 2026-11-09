@@ -10,9 +10,14 @@
  * The explicit channel-3 backlight path uses module 0x44 and clock 0x27;
  * the separate generic helper IDs 0x49/0x2b must not be substituted here.
  */
+#define LOGF_ENABLE
 #include "config.h"
 #include "backlight-target.h"
 #include <stdint.h>
+#include "logf.h"
+#include "kernel.h"
+#include "button.h"
+#include "power.h"
 
 #define PWM3    0x40084080u
 #define PWMR(o) (*(volatile uint32_t *)(PWM3 + (o)))
@@ -76,8 +81,25 @@
  * leaves the PWM unconfigured and it never drives the pin. */
 #define PWM_MODE 0x7fu
 
+/* Every on/off, with the tick, the caller and what could have asked for it
+ * (yp3-061: the backlight flashes for ~10 s before it stays off, and this
+ * driver has no fading, so something is switching it). A key event or a
+ * charger edge turns the backlight on through the backlight thread; anything
+ * else shows up as a different caller. The first 40 of each are logged, then
+ * every 100th, so a fast toggle cannot flood the ring. */
+static void bl_note(const char *what, unsigned *n, void *lr)
+{
+    if (*n < 40 || (*n % 100) == 0)
+        logf("bl %s #%u t=%ld lr=%p btn=%x chg=%d", what, *n, current_tick,
+             lr, (unsigned)button_status(), (int)charger_inserted());
+    (*n)++;
+}
+
 void backlight_hw_on(void)
 {
+    static unsigned ons;
+    bl_note("on", &ons, __builtin_return_address(0));
+
     /* PWM first, then claim the pad as a GPIO driven high. If the PWM route
      * works the pad mux below would override it, so drive the simple path last:
      * it is the one the LCD driver itself uses. */
@@ -89,6 +111,9 @@ void backlight_hw_on(void)
 
 void backlight_hw_off(void)
 {
+    static unsigned offs;
+    bl_note("off", &offs, __builtin_return_address(0));
+
     /* Mirrors the vendor's pwm_off (FIRM 0xd67b88): run bit first, then enable.
      *   0xc4843c: [base+0x10] bit0 = run
      *   0xc483fc: [base+0x00] bit4 = enable
