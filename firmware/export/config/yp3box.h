@@ -213,6 +213,16 @@
  * cannot drift apart again. */
 #define PCMBUF_LOOKAHEAD_DEN   4
 
+/* The software-volume double buffer (pcm_sw_volume.c) at the size the mixer
+ * actually fills. It defaults to 1024 samples a half, 8 KB in all, but it only
+ * ever receives the mixer's frame - mix_frame_size = MIX_FRAME_SAMPLES * 4 =
+ * 1024 bytes, with MIX_FRAME_SAMPLES 256 on this CPU (pcm_mixer.h) - so
+ * update_frame_params() always computes one frame and 6 KB of the 8 were
+ * never written. The 1024-byte DMA transfers measured on hardware are that
+ * frame. 256 samples is exactly one mixer frame, so the transfers do not
+ * change; the 6 KB goes back to the audio arena (yp3-1bw). */
+#define PCM_PLAY_DBL_BUF_SAMPLES 256
+
 #define AUDIO_BUFFER_RESERVE   0x4000
 /* A 128x160 RGB565 default backdrop costs 40 KiB in core buflib. Keep that
  * memory available for the PCM ring and compressed-file buffer. */
