@@ -172,6 +172,31 @@
 #define PMU_KEY_RELEASE            0x10   /* vendor "sk",  event 2 */
 #define PMU_KEY_ANY  (PMU_KEY_PRESS | PMU_KEY_LONG | PMU_KEY_RELEASE)
 
+/* What the centre key looked like to the button driver, for yp3-0gn.10
+ * (unplugging USB powers the device off). A BUTTON_PLAY that reads as held
+ * while the charger is in counts repeats that firmware/drivers/button.c may
+ * not act on until the charger goes: then sys_poweroff() and, past
+ * POWEROFF_COUNT * 10 repeats, power_off() straight from the tick. This
+ * records whether the driver was holding PLAY, since when, and which 0x31
+ * byte set it. In .yp3snap, so it survives a reset (not a real power-off) and
+ * power_init logs the previous run's copy before button_init clears it.
+ * Ticks are that run's current_tick, HZ = 100. */
+#define YP3_KEYTRACE_MAGIC  0x4b455931u   /* "KEY1" */
+struct yp3_keytrace {
+    uint32_t magic;
+    uint32_t downs, ups;    /* play_held edges since button_init       */
+    int32_t down_tick;      /* play_held last went true                */
+    int32_t up_tick;        /* play_held last went false               */
+    int32_t last_tick;      /* last successful 0x31 read               */
+    int32_t odd_tick;       /* first read with a bit outside 0x70, -1  */
+    uint8_t down_st;        /* the 0x31 byte that set play_held        */
+    uint8_t held;           /* play_held after the last read           */
+    uint8_t seen;           /* OR of every 0x31 byte read              */
+    uint8_t odd_st;         /* that first odd byte                     */
+    uint8_t chg_down;       /* charger_inserted() as play_held went true */
+};
+extern struct yp3_keytrace yp3_keytrace;
+
 /* The other two interrupt pairs, same convention as the key pair above. */
 #define PMU_REG_INT0_STATUS        0x30
 #define PMU_REG_INT0_ENABLE        0x19

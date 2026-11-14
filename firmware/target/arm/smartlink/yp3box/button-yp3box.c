@@ -9,6 +9,9 @@
 #include "lcd.h"
 #include "font.h"
 #include "system.h"
+#include "kernel.h"
+#include "power.h"
+#include "string.h"
 
 #define ADC(o)       ADC_REG(o)     /* base and per-channel regs */
 #define ADC_MODULE   0x54u          /* FIRM 0xd65fac: clk_enable(0x54) */
@@ -101,6 +104,11 @@ static void key_init_pmu(void)
     (void)yp3_pmu_write(PMU_REG_KEY_ENABLE, (uint8_t)~PMU_KEY_ANY);
     if (yp3_pmu_read(PMU_REG_KEY_STATUS, &status) && (status & PMU_KEY_ANY))
         (void)yp3_pmu_write(PMU_REG_KEY_STATUS, status & PMU_KEY_ANY);
+
+    /* power_init has already logged the previous run's trace. */
+    memset(&yp3_keytrace, 0, sizeof(yp3_keytrace));
+    yp3_keytrace.odd_tick = -1;
+    yp3_keytrace.magic = YP3_KEYTRACE_MAGIC;
 }
 
 
@@ -147,14 +155,46 @@ static bool right_held, left_held;
  * this call and the release on the next, or the tap disappears. */
 static bool play_held, play_release_pending;
 
+/* yp3-0gn.10, see struct yp3_keytrace. Tick context: plain stores only. */
+struct yp3_keytrace yp3_keytrace __attribute__((section(".yp3snap")));
+
+static void keytrace_note(bool was_held, uint8_t status)
+{
+    struct yp3_keytrace *k = &yp3_keytrace;
+
+    k->last_tick = current_tick;
+    k->seen |= status;
+    if ((status & (uint8_t)~PMU_KEY_ANY) && k->odd_tick < 0) {
+        k->odd_st = status;
+        k->odd_tick = current_tick;
+    }
+    if (play_held && !was_held) {
+        k->downs++;
+        k->down_tick = current_tick;
+        k->down_st = status;
+        k->chg_down = charger_inserted();
+    } else if (!play_held && was_held) {
+        k->ups++;
+        k->up_tick = current_tick;
+    }
+    k->held = play_held;
+}
+
 static void play_read_pmu(void)
 {
     uint8_t status;
+    bool was_held = play_held;
 
-    if (!yp3_pmu_read(PMU_REG_KEY_STATUS, &status) || !(status & PMU_KEY_ANY)) {
+    if (!yp3_pmu_read(PMU_REG_KEY_STATUS, &status))
+        status = 0;                 /* a failed read is not recorded */
+    else
+        keytrace_note(was_held, status);    /* note the raw byte first */
+
+    if (!(status & PMU_KEY_ANY)) {
         if (play_release_pending) {
             play_release_pending = false;
             play_held = false;
+            keytrace_note(was_held, 0);
         }
         return;
     }
@@ -169,6 +209,7 @@ static void play_read_pmu(void)
         play_held = false;
         play_release_pending = false;
     }
+    keytrace_note(was_held, status);
 }
 
 int button_read_device(void)
