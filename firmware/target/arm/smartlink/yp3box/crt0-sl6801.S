@@ -209,6 +209,15 @@ reset_handler:
     strlo   r0, [r2], #4
     blo     2b
 
+    /* and .bss_lo, the part app.lds links below the Bluetooth hole. The two
+       symbols are equal in every build without YP3_BT_BLOB. */
+    ldr     r2, =_bsslobegin
+    ldr     r3, =_bssloend
+6:  cmp     r2, r3
+    it      lo
+    strlo   r0, [r2], #4
+    blo     6b
+
 
     /* The vector table has to live at 0x800000 - not in flash - because the
        boot ROM writes into it.

@@ -1995,6 +1995,9 @@ target/arm/smartlink/yp3box/lc-yp3box.c
 #ifndef BOOTLOADER
 target/arm/smartlink/yp3box/usb-yp3box.c
 #endif
+#if !defined(BOOTLOADER) && defined(YP3_BT_BLOB)
+target/arm/smartlink/yp3box/bt-yp3box.c
+#endif
 #ifndef BOOTLOADER
 target/arm/smartlink/yp3box/pcm-yp3box.c
 #endif

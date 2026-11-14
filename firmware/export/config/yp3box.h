@@ -150,7 +150,25 @@
  * (Game Boy) - see the gates in lib/rbcodec/codecs/SOURCES. FLAC, AAC and Opus
  * did not fit at 128 KB either. */
 
+/* YP3_BT_BLOB: the yp3-bt branch only, never master. The vendor Bluetooth
+ * stack runs in place from the user's own flash dump (yp3box tools/bt/
+ * btpack.py, docs/BLUETOOTH.md); app.lds leaves a 54.5 KB hole in SRAM for it
+ * and bt-yp3box.c is the Rockbox side. NOT YET RUN ON HARDWARE (2026-11-15).
+ *
+ * The hole comes straight out of the audio arena, so this branch also gives
+ * back what it can: no plugins are built, so the plugin buffer shrinks to a
+ * stub. The vendor's strings sit where two codec slots are, so those two are
+ * built and refused rather than packed. Four more kernel threads: the
+ * monitor, the host, btc and the interrupt bottom half. */
+#define YP3_BT_BLOB 1
+#define YP3_NOPACK_CODECS "a52_rm atrac3_oma"
+#define TARGET_EXTRA_THREADS 4
+
+#ifdef YP3_BT_BLOB
+#define PLUGIN_BUFFER_SIZE  0x800
+#else
 #define PLUGIN_BUFFER_SIZE  0x2000
+#endif
 
 /* Codec slots in flash, COPIED TO SRAM AT LOAD. Each codec's whole image is
  * linked into a per-codec slot in SPI NOR; lc_open() memcpys it into codecbuf
@@ -277,7 +295,14 @@
  * never reach a watermark still sized against the full-rate ring. The fraction
  * below is stated once and pcmbuf.c derives the watermark from it, so the two
  * cannot drift apart again. */
+#ifdef YP3_BT_BLOB
+/* yp3-bt bring-up only, NOT YET RUN: three chunks instead of five. This
+ * build cannot play music anyway (docs/BLUETOOTH.md); the 16 KB is margin
+ * against audio_reset_buffer's EOM panic, which would cost the whole boot. */
+#define PCMBUF_LOOKAHEAD_DEN   6
+#else
 #define PCMBUF_LOOKAHEAD_DEN   4
+#endif
 
 /* The software-volume double buffer (pcm_sw_volume.c) at the size the mixer
  * actually fills. It defaults to 1024 samples a half, 8 KB in all, but it only

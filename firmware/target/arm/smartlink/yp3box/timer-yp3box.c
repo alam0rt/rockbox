@@ -280,21 +280,24 @@ yp3_stall_sample(const uint32_t *frame)
  * prologue moves the stack: EXC_RETURN bit 2 says which stack it is on. */
 void __attribute__((naked)) systick_handler(void)
 {
-#if YP3_PROFILE || YP3_STALLWATCH
+#if YP3_PROFILE || YP3_STALLWATCH || defined(YP3_BT_BLOB)
     __asm__ volatile (
         "tst    lr, #4              \n"
         "ite    eq                  \n"
         "mrseq  r0, msp             \n"
         "mrsne  r0, psp             \n"
         "push   {r4, lr}            \n"
+        "mov    r4, r0              \n"    /* r4 = the stacked frame */
 #if YP3_STALLWATCH
-        "mov    r4, r0              \n"
         "bl     yp3_stall_sample    \n"
-        "mov    r0, r4              \n"
 #endif
 #if YP3_PROFILE
-        "ldr    r0, [r0, #24]       \n"    /* stacked PC */
+        "ldr    r0, [r4, #24]       \n"    /* stacked PC */
         "bl     yp3_prof_sample     \n"
+#endif
+#ifdef YP3_BT_BLOB
+        "ldr    r0, [r4, #24]       \n"    /* stacked PC */
+        "bl     yp3_bt_tick         \n"    /* the BT dead-man, bt-yp3box.c */
 #endif
         "pop    {r4, lr}            \n"
         "b      yp3_systick_body    \n");
