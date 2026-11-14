@@ -116,6 +116,11 @@ void button_init_device(void)
 {
     adc_init_device();
     key_init_pmu();
+#ifdef YP3_BT_BLOB
+    /* The first target hook that runs with the kernel up. The thread it
+     * starts waits for the card before it does anything (bt-yp3box.c). */
+    yp3_bt_boot();
+#endif
 }
 
 /* MEASURED on hardware with the probe above, channel 1:

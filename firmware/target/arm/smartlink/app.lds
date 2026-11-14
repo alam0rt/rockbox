@@ -33,18 +33,45 @@ OUTPUT_ARCH(arm)
  * SPI NOR at ~132x the SRAM cost, and 15% the scheduler. These nine objects
  * are ~10 KB of code. Archive members are named exactly: "*thread.o" would
  * also catch codec_thread.o and audio_thread.o. */
+#ifdef YP3_BT_BLOB
+#define SRAM_HOT_BT *libfirmware.a:semaphore.o
+#else
+#define SRAM_HOT_BT
+#endif
 #define SRAM_HOT \
     *libfirmware.a:thread.o *libfirmware.a:pcm_mixer.o \
     *libfirmware.a:pcm_sw_volume.o *pcmbuf.o \
     *librbcodec.a:resample.o *librbcodec.a:dsp_core.o \
     *librbcodec.a:dsp_sample_input.o *librbcodec.a:dsp_sample_output.o \
-    *librbcodec.a:dsp_misc.o
+    *librbcodec.a:dsp_misc.o SRAM_HOT_BT
+
+/* YP3_BT_BLOB (config/yp3box.h, the yp3-bt branch only): the vendor
+ * Bluetooth stack runs at its own SRAM addresses, so one hole is left for it
+ * - BT_HOLE_LO..BT_HOLE_HI, tools/bt/btpack.py HOLE_LO/HOLE_HI in the yp3box
+ * repository, and bt-yp3box.c checks the two agree. Below the hole go three
+ * things whose size no build switch moves: the stacks, the framebuffer and
+ * the buffering thread's tables. Everything else links above it, so the
+ * hole costs its own 54.5 KB and about 2 KB of slack. NOT YET RUN. */
+#ifdef YP3_BT_BLOB
+#define BT_HOLE_LO  0x008172e0
+#define BT_HOLE_HI  0x008247e8
+#define SRAM_BASE   BT_HOLE_HI
+#define LO_OBJECTS  *libfirmware.a:lcd-16bit.o *buffering.o
+#else
+#define SRAM_BASE   SRAM_ORIG
+#endif
 
 MEMORY
 {
     FLASH (rx)  : ORIGIN = FLASH_XIP, LENGTH = FLASH_END - FLASH_XIP
-    SRAM  (rwx) : ORIGIN = SRAM_ORIG, LENGTH = SRAM_END - SRAM_ORIG
+#ifdef YP3_BT_BLOB
+    SRAM_LO (rwx) : ORIGIN = SRAM_ORIG, LENGTH = BT_HOLE_LO - SRAM_ORIG
+#endif
+    SRAM  (rwx) : ORIGIN = SRAM_BASE, LENGTH = SRAM_END - SRAM_BASE
 }
+#ifndef YP3_BT_BLOB
+REGION_ALIAS("SRAM_LO", SRAM)
+#endif
 
 SECTIONS
 {
@@ -82,6 +109,10 @@ SECTIONS
         *librbcodec.a:dsp_sample_input.o(.text* .rodata*);
         *librbcodec.a:dsp_sample_output.o(.text* .rodata*);
         *librbcodec.a:dsp_misc.o(.text* .rodata*);
+#ifdef YP3_BT_BLOB
+        /* The BT interrupt posts to a semaphore on every event. */
+        *libfirmware.a:semaphore.o(.text* .rodata*);
+#endif
         *(.irodata);
         *(.idata);
         . = ALIGN(4);
@@ -102,7 +133,19 @@ SECTIONS
 
         stackend = .;
 
-    } > SRAM
+    } > SRAM_LO
+
+    /* Cleared by crt0 like .bss. Empty unless YP3_BT_BLOB. */
+    .bss_lo (NOLOAD) :
+    {
+        _bsslobegin = .;
+#ifdef YP3_BT_BLOB
+        *libfirmware.a:lcd-16bit.o(.bss* COMMON);
+        *buffering.o(.bss* COMMON);
+#endif
+        . = ALIGN(4);
+        _bssloend = .;
+    } > SRAM_LO
 
     .bss (NOLOAD) :
     {
@@ -114,6 +157,7 @@ SECTIONS
            below so they survive a reset. crt0 clears _bssbegin.._bssend. */
         *(EXCLUDE_FILE (*logf.o) .bss*);
         *(EXCLUDE_FILE (*logf.o) COMMON);
+        . = ALIGN(4);
         _bssend = .;
     } > SRAM
 
@@ -151,6 +195,8 @@ SECTIONS
            fixed offset. */
         . = ALIGN(4);
         KEEP(*(.yp3snap));
+        /* bt-yp3box.c's stage crumb; empty without YP3_BT_BLOB. */
+        KEEP(*(.yp3bt));
         _persistend = .;
     } > SRAM
 

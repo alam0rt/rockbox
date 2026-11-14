@@ -39,4 +39,8 @@ void yp3_watchdog_disable(void);
 void yp3_reboot(void) __attribute__((noreturn));
 void yp3_reboot_to_bootloader(void) __attribute__((noreturn));
 
+/* bt-yp3box.c, YP3_BT_BLOB builds only. */
+void yp3_bt_boot(void);
+void yp3_bt_tick(uint32_t interrupted_pc);
+
 #endif
