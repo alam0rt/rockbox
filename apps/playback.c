@@ -2550,6 +2550,28 @@ static void audio_on_buffering(int event)
         if (filling != STATE_FULL && filling != STATE_END_OF_PLAYLIST)
             return; /* Should be nothing left to fill */
 
+#ifdef AUDIO_BUFFER_LOW_WAITS_FOR_LAST
+        {
+            /* While the last track's audio is still being buffered, a
+               rebuffer cannot add anything: buffering only appends after a
+               complete handle, so loading the next track's metadata fails
+               with ERR_BUFFER_FULL and the clear-and-refill repeats on
+               every low event. That happens whenever the file buffer is
+               not much bigger than the watermark. The buffering thread
+               tops this handle up by itself when it sends BUFFER_LOW.
+               Re-arm the one-shot low event (zero the watermark, which is
+               what track_list_clear() did for the old path) and try again
+               when it next fires. */
+            struct track_info last;
+            if (track_list_last(0, &last) &&
+                buf_handle_remaining(last.audio_hid) > 0)
+            {
+                buf_set_watermark(0);
+                return;
+            }
+        }
+#endif
+
         /* Clear old tracks and continue buffering where it left off */
         action = TRACK_LIST_KEEP_NEW;
         peek_offset = playlist_peek_offset;

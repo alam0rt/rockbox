@@ -56,6 +56,7 @@
  * bit 6 = 1, on), cmd 1 -> gpio_config(0x00018880) (off). Whichever of the
  * two configures the pad last owns it.
  */
+#define LOGF_ENABLE
 #include "config.h"
 #include "system.h"
 #include "backlight.h"
@@ -63,6 +64,9 @@
 #include "sl6801-regs.h"
 #include "yp3-buildstamp.h"
 #include <stdint.h>
+#include "kernel.h"
+#include "button.h"
+#include "power.h"
 #ifdef ROCKBOX_HAS_LOGF
 #define LOGF_ENABLE
 #endif
@@ -75,12 +79,60 @@
 #define BL_PIN_ON     0x000188c0u   /* P1.17 func 1 (GPIO), bit 6 high */
 #define BL_PIN_OFF    0x00018880u   /* P1.17 func 1 (GPIO), bit 6 low  */
 
+/* Channel 3's register file, at the base the vendor's open path stores in the
+ * handle table (0xd7e340). The pad probe below reads it on BOTH paths, so it
+ * is not behind YP3_BL_PWM; on the GPIO path the values mean nothing. */
+#define PWM3          0x40084080u
+#define PWMR(o)       (*(volatile uint32_t *)(PWM3 + (o)))
+
 static int bl_level = DEFAULT_BRIGHTNESS_SETTING;
+
+/* Every on/off, with the tick, the caller and what could have asked for it
+ * (yp3-061: the backlight flashes for ~10 s before it stays off, and this
+ * driver has no fading, so something is switching it). A key event or a
+ * charger edge turns the backlight on through the backlight thread; anything
+ * else shows up as a different caller. The first 40 of each are logged, then
+ * every 100th, so a fast toggle cannot flood the ring. */
+static void bl_note(const char *what, unsigned *n, void *lr)
+{
+    if (*n < 40 || (*n % 100) == 0)
+        logf("bl %s #%u t=%ld lr=%p btn=%x chg=%d", what, *n, current_tick,
+             lr, (unsigned)button_status(), (int)charger_inserted());
+    (*n)++;
+}
+
+/* What the pad actually does, sampled every tick (yp3-061). The first probe
+ * showed one software 'off' and no other call in the ~15 s around the
+ * flashing, so the flicker is below backlight_hw_on/off. The level is read
+ * back from the pad (port 1 pin 17). Edges in a second mean something is
+ * driving the pin; a steady level while the light flashes puts it past the
+ * pin, in the LED supply. Logs a second that had edges, and a 5 s
+ * heartbeat otherwise, so a steady pad does not flood the ring. */
+#define BL_PAD_PORT 1
+#define BL_PAD_BIT  17
+static int bl_pad_last = -1;
+static unsigned bl_pad_edges, bl_pad_ticks, bl_pad_quiet;
+
+static void bl_pad_tick(void)
+{
+    int lvl = (GPIO_IN(BL_PAD_PORT) >> BL_PAD_BIT) & 1;
+    if (bl_pad_last >= 0 && lvl != bl_pad_last)
+        bl_pad_edges++;
+    bl_pad_last = lvl;
+    if (++bl_pad_ticks < HZ)
+        return;
+    if (bl_pad_edges || ++bl_pad_quiet >= 5) {
+        logf("bl pad t=%ld lvl=%d edges=%u pwm0=%lx pwm10=%lx",
+             current_tick, lvl, bl_pad_edges,
+             (unsigned long)PWMR(0x00), (unsigned long)PWMR(0x10));
+        bl_pad_quiet = 0;
+    }
+    bl_pad_ticks = 0;
+    bl_pad_edges = 0;
+}
 
 #if YP3_BL_PWM
 
-#define PWM3          0x40084080u
-#define PWMR(o)       (*(volatile uint32_t *)(PWM3 + (o)))
 #define PWM3_OUT_PIN  0x00018a80u   /* P1.17 func 5, dev[0x48] at 0xd67b4e */
 #define PWM_MODULE    0x44u
 #define PWM_CLOCK     0x27u
@@ -158,6 +210,9 @@ static void bl_log(const char *what)
 
 void backlight_hw_on(void)
 {
+    static unsigned ons;
+
+    bl_note("on", &ons, __builtin_return_address(0));
     bl_on = true;
     if (bl_pwm_ok && bl_pwm_set_duty(bl_duty(bl_level))) {
         ROM_GPIO_CFG1(PWM3_OUT_PIN);    /* duty first, then hand it the pad */
@@ -168,6 +223,9 @@ void backlight_hw_on(void)
 
 void backlight_hw_off(void)
 {
+    static unsigned offs;
+
+    bl_note("off", &offs, __builtin_return_address(0));
     bl_on = false;
     /* Pad to GPIO low first: that off is known to work [L] whether or not the
      * PWM does. Then duty 0, which is the vendor's own off (0xcfe532). */
@@ -203,6 +261,7 @@ bool backlight_hw_init(void)
 
     backlight_hw_on();
     bl_log("on");
+    tick_add_task(bl_pad_tick);
     return true;
 }
 
@@ -210,11 +269,17 @@ bool backlight_hw_init(void)
 
 void backlight_hw_on(void)
 {
+    static unsigned ons;
+
+    bl_note("on", &ons, __builtin_return_address(0));
     ROM_GPIO_CFG1(BL_PIN_ON);
 }
 
 void backlight_hw_off(void)
 {
+    static unsigned offs;
+
+    bl_note("off", &offs, __builtin_return_address(0));
     ROM_GPIO_CFG1(BL_PIN_OFF);
 }
 
@@ -228,6 +293,7 @@ bool backlight_hw_init(void)
 {
     logf("bl: gpio only (YP3_BL_PWM=0)");
     backlight_hw_on();
+    tick_add_task(bl_pad_tick);
     return true;
 }
 
