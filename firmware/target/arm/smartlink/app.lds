@@ -40,10 +40,31 @@ OUTPUT_ARCH(arm)
     *librbcodec.a:dsp_sample_input.o *librbcodec.a:dsp_sample_output.o \
     *librbcodec.a:dsp_misc.o
 
+/* The boot ROM's own STACK, dead once crt0 has moved SP (yp3-rvo, yp3-1bw).
+ * The ROM's reset handler (ROM 0x40-0xa6) lays out 0x800000-0x806000 as:
+ *
+ *   .data   0x800000-0x8006b4   copied from ROM 0x5b800
+ *   .bss    0x800800-0x804ab0   zeroed; the end is the literal at ROM 0xc0
+ *   stack   0x804ab0-0x806000   SP = vector 0 = 0x806000
+ *
+ * Every ROM literal pointing into this range lies below 0x804ab0 (337 of
+ * them, 19 clusters), so no ROM routine addresses the stack window by name.
+ * ROM routines called from Rockbox run on Rockbox's stacks. The only ROM code
+ * that reloads MSP is the scheduler start at 0x9a3e (from 0x9c36), which
+ * Rockbox never calls, and an uncalled newlib _mainCRTStartup at 0x22d4.
+ *
+ * `[C]` from the dump. The ROM re-initialises the window on every reset, so
+ * nothing that must survive one may live here - .persist stays above
+ * 0x806000. What is here is the LCD driver's .bss, chosen because the worst
+ * that a wrong reading of the ROM can do to it is a wrong pixel. */
+#define ROMSTACK_ORIG 0x00804ab0
+#define ROMSTACK_END  0x00806000
+
 MEMORY
 {
     FLASH (rx)  : ORIGIN = FLASH_XIP, LENGTH = FLASH_END - FLASH_XIP
     SRAM  (rwx) : ORIGIN = SRAM_ORIG, LENGTH = SRAM_END - SRAM_ORIG
+    ROMSTACK (rw) : ORIGIN = ROMSTACK_ORIG, LENGTH = ROMSTACK_END - ROMSTACK_ORIG
 }
 
 SECTIONS
@@ -115,10 +136,22 @@ SECTIONS
         *(.ibss);
         /* logf.o is excluded: its ring, index and wrap flag go into .persist
            below so they survive a reset. crt0 clears _bssbegin.._bssend. */
-        *(EXCLUDE_FILE (*logf.o) .bss*);
-        *(EXCLUDE_FILE (*logf.o) COMMON);
+        *(EXCLUDE_FILE (*logf.o *lcd-yp3box.o) .bss*);
+        *(EXCLUDE_FILE (*logf.o *lcd-yp3box.o) COMMON);
         _bssend = .;
     } > SRAM
+
+    /* lcd-yp3box.o's .bss - the two DMA bounce buffers and a few counters -
+       in the dead ROM stack (see ROMSTACK above). crt0 clears
+       _romwinbegin.._romwinend with .bss; the link fails if it outgrows the
+       5,456-byte window. */
+    .romwin (NOLOAD) : ALIGN(4)
+    {
+        _romwinbegin = .;
+        *lcd-yp3box.o(.bss* COMMON);
+        . = ALIGN(4);
+        _romwinend = .;
+    } > ROMSTACK
 
     /* --- the black box -----------------------------------------------------
      *
