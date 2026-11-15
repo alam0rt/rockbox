@@ -97,8 +97,11 @@ SECTIONS
         . += 0x400;
         irqstackend = .;
         stackbegin = .;
-        /* Keep enough stack for filesystem and skin initialization. */
-        . += 0x4000;
+        /* Keep enough stack for filesystem and skin initialization.
+         * Measured 2026-11-16 (tools/sram_census.py, a boot that loaded the
+         * theme, browsed and played): deepest use 2,852 bytes. 0x2000 leaves
+         * about 5.3 KB over that; it was 0x4000. */
+        . += 0x2000;
 
         stackend = .;
 
