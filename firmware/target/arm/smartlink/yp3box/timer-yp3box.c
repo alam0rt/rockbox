@@ -6,6 +6,16 @@
 #include "yp3-buildstamp.h"
 #include <stdint.h>
 
+/* A file that only WRITES the ring still needs this, or its logf() compiles
+ * to nothing - the trap CLAUDE.md records twice. */
+#ifdef ROCKBOX_HAS_LOGF
+#define LOGF_ENABLE
+#include "logf.h"
+#define YP3_STALLWATCH 1
+#else
+#define YP3_STALLWATCH 0
+#endif
+
 #ifndef YP3_PROFILE
 #define YP3_PROFILE 0
 #endif
@@ -165,20 +175,127 @@ void __attribute__((section(".icode"), used)) yp3_prof_sample(uint32_t pc)
 }
 #endif
 
+#if YP3_STALLWATCH
+/* THE STALL WATCH. Threads are cooperative here, so one thread that spins
+ * without yielding freezes the UI, the codec and the backlight together while
+ * the tick carries on - and the black box then holds beacons and nothing else.
+ * That is exactly what the 2026-11-15 boots look like: 'playback:
+ * initializing', two 'bl on', and 115 seconds of nothing, with a key press in
+ * the middle that never lit the backlight.
+ *
+ * The tick knows what it interrupted. When the same thread slot has been
+ * found running for STALL_TICKS in a row and the interrupted PC is not the
+ * scheduler's own idle wait, it logs the slot, the PC, the LR and the first
+ * code addresses on that thread's stack - a call chain, in the log, from the
+ * hang itself. `arm-elf-eabi-addr2line -f -e rockbox.elf <addr>` names them.
+ * Stale frames show too, so read the first few.
+ *
+ * The idle test is a range around switch_thread(): the wfi is inlined into it
+ * and check_tmo_expired_inner sits just below it in thread.o (both SRAM). A
+ * build that moves them apart reports idle as a stall, which is loud rather
+ * than silent; `nm -n` settles it.
+ *
+ * logf builds only: nothing here exists in a daily image. */
+#define STALL_TICKS     (3 * HZ)
+#define STALL_LINES     8
+#define STALL_IDLE_LO   0x480u      /* below switch_thread */
+#define STALL_IDLE_SPAN 0x5c0u
+extern void switch_thread(void);
+static uint8_t  stall_slot = 0xff;
+static uint8_t  stall_lines;
+static uint16_t stall_run;
+static uint32_t stall_secs;
+#define HOG_TICKS       (HZ / 4)    /* the PCM lookahead */
+#define HOG_LINES       60
+static uint16_t hog_run;
+static uint8_t  hog_lines;
+static uint32_t hog_pc, hog_lr;
+
+static void yp3_stall_report(const uint32_t *frame, unsigned slot)
+{
+    uint32_t a[8];
+    unsigned n = 0, i;
+
+    for (i = 8; i < 8 + 160 && n < 8; i++) {
+        uint32_t v = frame[i];
+        if (!(v & 1u))
+            continue;
+        if ((v >= 0x00c0e000u && v < 0x00e00000u) ||
+            (v >= 0x00806000u && v < 0x00810000u))
+            a[n++] = v & ~1u;
+    }
+    for (; n < 8; n++)
+        a[n] = 0;
+    logf("stall: slot %u for %lus pc=%08lx lr=%08lx", slot,
+         (unsigned long)stall_secs, (unsigned long)frame[6],
+         (unsigned long)frame[5]);
+    logf("stall: stk %08lx %08lx %08lx %08lx", (unsigned long)a[0],
+         (unsigned long)a[1], (unsigned long)a[2], (unsigned long)a[3]);
+    logf("stall: stk %08lx %08lx %08lx %08lx", (unsigned long)a[4],
+         (unsigned long)a[5], (unsigned long)a[6], (unsigned long)a[7]);
+}
+
+void __attribute__((section(".icode"), used))
+yp3_stall_sample(const uint32_t *frame)
+{
+    uint32_t pc = frame[6];
+    unsigned s = thread_self() & 0xffu;
+
+    if (s != stall_slot ||
+        pc - (((uint32_t)switch_thread & ~1u) - STALL_IDLE_LO) < STALL_IDLE_SPAN) {
+        /* The run is over. One that outlasted the PCM lookahead (a quarter
+         * second) is a dropout the listener heard, whoever needed the CPU:
+         * say which slot, how long, and where it was half-way (yp3-0gn.13). */
+        if (hog_run >= HOG_TICKS && hog_lines < HOG_LINES) {
+            hog_lines++;
+            logf("hog: slot %u %u ticks pc=%08lx lr=%08lx", stall_slot,
+                 (unsigned)hog_run, (unsigned long)hog_pc,
+                 (unsigned long)hog_lr);
+        }
+        hog_run = 0;
+        stall_slot = s;
+        stall_run = 0;
+        stall_secs = 0;
+        return;
+    }
+    if (hog_run != 0xffffu)
+        hog_run++;
+    if (hog_run == HOG_TICKS / 2) {
+        hog_pc = pc;
+        hog_lr = frame[5];
+    }
+    if (++stall_run < STALL_TICKS)
+        return;
+    stall_run = 0;
+    stall_secs += STALL_TICKS / HZ;
+    if (stall_lines >= STALL_LINES)
+        return;
+    stall_lines++;
+    yp3_stall_report(frame, s);
+}
+#endif /* YP3_STALLWATCH */
+
 /* The vector table (vectors-arm-micro.S, shared) names this. Naked so the
- * profiler can read the stacked PC out of the exception frame before any
+ * profiler and the stall watch can read the exception frame before any
  * prologue moves the stack: EXC_RETURN bit 2 says which stack it is on. */
 void __attribute__((naked)) systick_handler(void)
 {
-#if YP3_PROFILE
+#if YP3_PROFILE || YP3_STALLWATCH
     __asm__ volatile (
         "tst    lr, #4              \n"
         "ite    eq                  \n"
         "mrseq  r0, msp             \n"
         "mrsne  r0, psp             \n"
-        "ldr    r0, [r0, #24]       \n"    /* stacked PC */
         "push   {r4, lr}            \n"
+#if YP3_STALLWATCH
+        "mov    r4, r0              \n"
+        "bl     yp3_stall_sample    \n"
+        "mov    r0, r4              \n"
+#endif
+#if YP3_PROFILE
+        "ldr    r0, [r0, #24]       \n"    /* stacked PC */
         "bl     yp3_prof_sample     \n"
+#endif
         "pop    {r4, lr}            \n"
         "b      yp3_systick_body    \n");
 #else
