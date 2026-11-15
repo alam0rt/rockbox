@@ -13,7 +13,13 @@ __vectors_platform:
     /* 0..59 unclaimed. IRQ 43 used to be "PCM DMA half/full transfer
        complete"; it is the USB mass-storage DMA and audio never touched it -
        see the correction at the head of docs/AUDIO.md. */
-    .rept 60
+    .rept 3
+    .word   yp3_spurious_irq
+    .endr
+    /* 3: GPIO port 2 - the PMU's interrupt line on P2.2 (FIRM 0xd67890
+       hooks IRQ 3 for it). button-yp3box.c; armed only under YP3_PMU_IRQ. */
+    .word   yp3_pmu_gpio_irq
+    .rept 60 - 4
     .word   yp3_spurious_irq
     .endr
     /* 60..67: the eight general DMA channels, 0x40001000 + ch*0x40. The

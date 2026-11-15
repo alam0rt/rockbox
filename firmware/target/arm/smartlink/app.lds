@@ -62,6 +62,58 @@ SECTIONS
         . = ALIGN(4);
     } > FLASH
 
+    /* --- the black box -----------------------------------------------------
+     *
+     * SRAM that NOTHING clears: it is outside _bssbegin.._bssend so crt0's
+     * clear skips it, outside _datastart.._dataend so the .data copy skips
+     * it, and the boot ROM only initialises 0x800000-0x806000, so it also
+     * survives a pinhole reset and a SYSRESETREQ.
+     *
+     * FIRST in SRAM, so it starts at SRAM_ORIG in every build (yp3-1so.12).
+     * It used to follow .bss, which moved it whenever .data, the stacks or
+     * .bss changed size: the next boot then found no magic where it looked,
+     * took the cold path and wiped the ring, so a series of different builds
+     * left nothing on the card. Here only a change to .persist's own layout
+     * moves the ring, and blackbox-yp3box.c folds that layout into its magic
+     * so such a change still reads as cold and not as a log. 0x806000 is the
+     * top of the boot ROM's stack, which grows down from it (ROM reset
+     * handler: .data 0x800000, .bss 0x800800-0x804ab0, stack to 0x806000
+     * `[C]`); the smtlink payloads load at 0x820000 and 0x800de8 `[C]`.
+     * NOT YET RUN ON HARDWARE at this address `[U]`.
+     *
+     * That is the whole point. A log you can only reach through Debug ->
+     * Dump Log File is worthless for the failures worth logging: a hang, a
+     * hard fault, or a dead keypad leave no way to drive the menu. Here the
+     * log outlives the crash, and the next boot writes it to the card before
+     * anything else can go wrong.
+     */
+    .persist (NOLOAD) : ALIGN(8)
+    {
+        _persistbegin = .;
+        /* FIRST, and fixed at 32 bytes: crt0 reads and writes this before
+           .data is copied or .bss is cleared, so it addresses the fields by
+           constant offset. Anything inserted ahead of it silently moves every
+           offset the assembly uses. See rig-yp3box.c for the layout. */
+        yp3_bootctl = .;
+        . += 32;                        /* struct yp3_bootctl */
+        yp3_blackbox = .;
+        . += 192;                       /* struct yp3_blackbox */
+        yp3_flashlog = .;
+        . += 16;                        /* quad switch stages, see system-yp3box.c */
+        yp3_usblog = .;
+        . += 64;                        /* USB MSC stage words, see usb-yp3box.c */
+        *logf.o(.bss* COMMON);
+        /* Everything up to here is what a boot has to find where it left it;
+           the black box hashes this extent into its magic. */
+        _persistlogend = .;
+        /* pcm-yp3box.c's register snapshot - self-test builds only, so this
+           is empty otherwise. After the ring: nothing addresses it by a
+           fixed offset. */
+        . = ALIGN(4);
+        KEEP(*(.yp3snap));
+        _persistend = .;
+    } > SRAM
+
     /* --- lives in SRAM, initialiser image stored in flash --- */
     /* .icode joins .data so crt0's copy loop brings it into SRAM. Clock changes
      * must run from RAM because an XIP fetch can stall during
@@ -116,42 +168,6 @@ SECTIONS
         *(EXCLUDE_FILE (*logf.o) COMMON);
         _bssend = .;
     } > SRAM
-
-    /* --- the black box -----------------------------------------------------
-     *
-     * SRAM that NOTHING clears: it is outside _bssbegin.._bssend so crt0's
-     * clear skips it, outside _datastart.._dataend so the .data copy skips
-     * it, and the boot ROM only initialises 0x800000-0x806000, so it also
-     * survives a pinhole reset and a SYSRESETREQ.
-     *
-     * That is the whole point. A log you can only reach through Debug ->
-     * Dump Log File is worthless for the failures worth logging: a hang, a
-     * hard fault, or a dead keypad leave no way to drive the menu. Here the
-     * log outlives the crash, and the next boot writes it to the card before
-     * anything else can go wrong.
-     */
-    .persist (NOLOAD) : ALIGN(8)
-    {
-        _persistbegin = .;
-        /* FIRST, and fixed at 32 bytes: crt0 reads and writes this before
-           .data is copied or .bss is cleared, so it addresses the fields by
-           constant offset. Anything inserted ahead of it silently moves every
-           offset the assembly uses. See rig-yp3box.c for the layout. */
-        yp3_bootctl = .;
-        . += 32;                        /* struct yp3_bootctl */
-        yp3_blackbox = .;
-        . += 192;                       /* struct yp3_blackbox */
-        yp3_flashlog = .;
-        . += 16;                        /* quad switch stages, see system-yp3box.c */
-        *logf.o(.bss* COMMON);
-        /* pcm-yp3box.c's register snapshot - self-test builds only, so this
-           is empty otherwise. After the ring: nothing addresses it by a
-           fixed offset. */
-        . = ALIGN(4);
-        KEEP(*(.yp3snap));
-        _persistend = .;
-    } > SRAM
-
 
     /* The plugin and codec buffers must be real SRAM. Keep the audio buffer
        below both regions so the allocators cannot overlap them. */

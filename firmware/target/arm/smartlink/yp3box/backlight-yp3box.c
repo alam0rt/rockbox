@@ -1,85 +1,88 @@
-/* Backlight = PWM channel 3, register base 0x40084080.
+/* Backlight: pad P1.17, driven either as a plain GPIO or by PWM channel 3.
  *
- * Reversed from the vendor driver rather than probed:
- *   /dev/pwm_ch3 struct 0x0082bdb0 -> 0x40084080 in the handle table
- *   0xc483fc(base,on)   [base+0x00] bit4 = enable
- *   0xc4843c(base,on)   [base+0x10] bit0 = run
- *   0xc48430(base,h,l)  [base+0x14] = l | (h<<16)   period
- *   0xc48438(base,v)    [base+0x18] = v             duty
- * pwm_off (0xd67b88) clears both bits, in that order.
- * The explicit channel-3 backlight path uses module 0x44 and clock 0x27;
- * the separate generic helper IDs 0x49/0x2b must not be substituted here.
+ * YP3_BL_PWM (default 0) picks the path. 0 is the GPIO on/off path that has
+ * lit this panel on every boot [L]. 1 is the vendor's PWM path, transcribed
+ * below and NOT YET RUN ON HARDWARE - see the readback breadcrumbs, which are
+ * there so the first boot answers whether it took.
+ *
+ * ---- What the vendor does, all [C], every address checked with objdump -----
+ *
+ * Open, once: backlight_open FIRM 0xd4252c -> open("/dev/pwm_ch3", 0, cfg)
+ * with cfg bytes 03 00 01 0f 00 (literal 0xd4255c, then strb 0 at 0xd42540).
+ * The PWM driver's open op is FIRM 0xd67bd0, which for channel cfg[0]=3:
+ *   0xd67c40  gpio_config(dev[0x48] = 0x00018a80)  via SRAM 0x8051f4 -> ROM 0x7ac
+ *             = port 1, pin 17, function 5 (ROM 0x77a/0x568 decode: port
+ *             [19:16], pin [15:11], func [10:7]; P1 mode words at 0x40081040)
+ *   0xd67c4c  0xd7e314(ch=3, {1, cfg[1], cfg[2], cfg[3]}, cfg[4]=0):
+ *     0xd7e31e  if (!clk_is_on(0x44)) clk_enable(0x44)     ROM 0x2518 / 0x2564
+ *     0xd7e32a  src = cfg[4] ? 16 : 10   -> cfg[4] is 0, so SOURCE 10
+ *     0xd7e330  clk_set_source(0x27, src) via the SRAM wrapper 0x8050f2
+ *     0xd7e336  clk start(0x27)           via SRAM 0x8051ec -> ROM 0x27a0
+ *     0xd7e340  base = 0x40084020 + ch*32  -> 0x40084080, into the handle
+ *               table at 0x81e59c[ch+4] (sram_live.bin holds exactly that:
+ *               [0]=0x40084000, [2]=0x40084014, [7]=0x40084080)
+ *     0xd7e35a  mode = (b0<<4 & 0x10) | (b1<<7 & 0x80) | (b3 & 0xf) | (b2<<5 & 0x20)
+ *               = 0x10 | 0 | 0x0f | 0x20 = 0x3f
+ *     0xd7e394  [base+0x00] = 0x40; [base+0x00] |= 0x3f      -> 0x7f
+ *   0xd67c54  0xc483bc(ch, &stack): writes +0x14, +0x18, +0x10, +0x1c from a
+ *             struct the caller never initialises EXCEPT byte 13 (strb 0 at
+ *             0xd67c18), which 0xc4844e puts in +0x10 bit 0. So the timer half
+ *             of the channel is configured with garbage and explicitly NOT run.
+ *             The PWM output does not need +0x10 bit 0.
+ *
+ * Set level: backlight_set(pct) FIRM 0xd42574:
+ *     pct = min(pct, 100); ioctl(h, 0, {3, -, 48000, pct * 480})
+ *   ioctl op FIRM 0xd67c80, cmd 0 -> 0xc482b8(ch, period, duty):
+ *     if (period < duty) return;
+ *     0xc48428  while ([base+0x00] & (1 << 28)) ;       (lsls #3 -> bit 28)
+ *     0xc4840e  [base+0x04] = duty | (period << 16)
+ *   THE DUTY REGISTER IS +0x04. +0x14/+0x18 belong to the timer half above;
+ *   the previous version of this file wrote 48000 there and nothing to +0x04.
+ *
+ * On/off: FIRM 0xcfe518: arg 0 -> backlight_set(get_brightness()),
+ *   arg 1 -> backlight_set(0). The vendor turns the light off with duty 0 and
+ *   leaves the pad on the PWM.
+ *
+ * Levels: set_brightness FIRM 0xd106a0 accepts 10..100 only (sub #10, cmp #90)
+ *   and stores the byte at SRAM 0x824258; the UI at 0xd0ba02 builds it as
+ *   (level + 1) * 10 for level 0..9. sram_live.bin has 0x3c = 60% there.
+ *   So Rockbox setting n in 1..10 is n*10 percent, duty n * 4800.
+ *
+ * Off (0xd67b88): +0x10 bit 0 clear (0xc4843c), then +0x00 bit 4 clear
+ *   (0xc483fc). Not used here - off is duty 0, as the vendor does it.
+ *
+ * ---- The GPIO path ----
+ * /dev/lcd ioctl FIRM 0xd66500: cmd 0 -> gpio_config(0x000188c0) (func 1,
+ * bit 6 = 1, on), cmd 1 -> gpio_config(0x00018880) (off). Whichever of the
+ * two configures the pad last owns it.
  */
 #define LOGF_ENABLE
 #include "config.h"
+#include "system.h"
+#include "backlight.h"
 #include "backlight-target.h"
+#include "sl6801-regs.h"
+#include "yp3-buildstamp.h"
 #include <stdint.h>
 #include "logf.h"
 #include "kernel.h"
 #include "button.h"
 #include "power.h"
+#include "lcd.h"
 
-#define PWM3    0x40084080u
-#define PWMR(o) (*(volatile uint32_t *)(PWM3 + (o)))
+#ifndef YP3_BL_PWM
+#define YP3_BL_PWM 0            /* untested on hardware; 1 = PWM brightness */
+#endif
 
-/* From the vendor timer/PWM init at FIRM 0xd7e314:
- *     if (!clk_is_on(0x44)) clk_enable(0x44);     module
- *     clk_set_source(0x27, 16); clk_apply(0x27);  clock
- *     base = 0x40084020 + ch*32                   ch3 -> 0x40084080
- * Without the MODULE enable the PWM registers do not hold a value - exactly the
- * symptom the LCDC had before clk_enable(0x5c). */
-/* Bindings come from sl6801-regs.h rather than a local copy: it carries
- * ROM_CLK_SET_SRC, and a safety wrapper that exists in three hand-copies is
- * a wrapper waiting to be forgotten in one of them. */
-#include "sl6801-regs.h"
+#define BL_PIN_ON     0x000188c0u   /* P1.17 func 1 (GPIO), bit 6 high */
+#define BL_PIN_OFF    0x00018880u   /* P1.17 func 1 (GPIO), bit 6 low  */
 
-/* THE PWM OUTPUT PIN.
- *
- * The driver registration for /dev/pwm_ch3 (FIRM 0xd67b38) stores a pin code in
- * dev[0x48]:  dev[0x48] = 0x00018a80
- * and the open path (FIRM 0xd67bd0) passes it to the SRAM thunk 0x8051f4, which
- * tail-calls ROM 0x7ac = gpio_config(code).
- *
- * The code packs pin AND alternate function together (ROM 0x7ac decodes
- * port=[19:16], pin=[15:11], func=[10:7], plus mode bits [6] and [5:4]):
- *     0x00018a80 -> port 1, pin 17, function 5
- *
- * Without this the PWM peripheral runs but its output never reaches the pad,
- * which is exactly what we saw: mode/period/duty all programmed correctly and
- * the panel completely unlit. Note pin 17 is NOT among the twelve pins the LCD
- * path configures, so nothing else was covering it. */
-#define ROM_GPIO_CFG1 ((void (*)(unsigned))0x7adu)   /* thumb */
-#define PWM3_OUT_PIN  0x00018a80u
+static int bl_level = DEFAULT_BRIGHTNESS_SETTING;
 
-/* The backlight pin is SHARED, and the simple path does not involve PWM at all.
- *
- * The /dev/lcd ioctl (FIRM 0xd66500) configures the very same pin - port 1
- * pin 17 - as a plain GPIO, switching only bit 6:
- *     cmd 0 -> gpio_config(0x000188c0)   func 1, bit6 = 1
- *     cmd 1 -> gpio_config(0x00018880)   func 1, bit6 = 0
- * while backlight_set (FIRM 0xd42574) re-muxes the same pin to function 5
- * (0x00018a80) to drive it from PWM channel 3 for brightness control.
- *
- * So bit 6 is the output level and function 1 is GPIO. For first light we only
- * need the GPIO form; PWM is a brightness refinement. The two are mutually
- * exclusive - whichever configures the pin last owns it. */
-#define BL_PIN_ON   0x000188c0u
-#define BL_PIN_OFF  0x00018880u
-#define PWM_MODULE    0x44u
-#define PWM_CLOCK     0x27u
-
-/* From the vendor's backlight_set at FIRM 0xd42574:
- *     cfg.mode = 3; cfg.period = 48000 (0xbb80); cfg.duty = pct * 480
- * so full brightness is period == duty == 48000. */
-#define PWM_PERIOD 48000u
-
-/* Mode word for +0x00, from the vendor open path:
- *   0xd7e394: [base+0x00] = 0x40; [base+0x00] |= cfgval
- *   0xd7e314 builds cfgval from the backlight cfg bytes 03 00 01 0f:
- *     (1<<4)&0x10 | (0<<7)&0xff | (0x0f&0x0f) | (1<<5)&0x20 == 0x3f
- * so the mode register ends up 0x7f. Setting only bit4 (0x10), as we did,
- * leaves the PWM unconfigured and it never drives the pin. */
-#define PWM_MODE 0x7fu
+/* P1 mode word for pins 16..23, 4 bits per pin (ROM 0x568); pin 17 -> [7:4].
+ * 5 = PWM, 1 = GPIO. Read-only, for the breadcrumbs. */
+#define P1_MODE_16_23 (*(volatile uint32_t *)0x40081048u)
+#define P1_IN         (*(volatile uint32_t *)0x40081050u)
 
 /* Every on/off, with the tick, the caller and what could have asked for it
  * (yp3-061: the backlight flashes for ~10 s before it stays off, and this
@@ -87,6 +90,7 @@
  * charger edge turns the backlight on through the backlight thread; anything
  * else shows up as a different caller. The first 40 of each are logged, then
  * every 100th, so a fast toggle cannot flood the ring. */
+#ifdef ROCKBOX_HAS_LOGF
 static void bl_note(const char *what, unsigned *n, void *lr)
 {
     if (*n < 40 || (*n % 100) == 0)
@@ -94,6 +98,9 @@ static void bl_note(const char *what, unsigned *n, void *lr)
              lr, (unsigned)button_status(), (int)charger_inserted());
     (*n)++;
 }
+#else   /* a probe: nothing of it in a release build */
+#define bl_note(what, n, lr) ((void)(n))
+#endif
 
 /* What the pad actually does, sampled every tick (yp3-061). The first probe
  * showed one software 'off' and no other call in the ~15 s around the
@@ -101,7 +108,14 @@ static void bl_note(const char *what, unsigned *n, void *lr)
  * back from the pad (port 1 pin 17). Edges in a second mean something is
  * driving the pin; a steady level while the light flashes puts it past the
  * pin, in the LED supply. Logs a second that had edges, and a 5 s
- * heartbeat otherwise, so a steady pad does not flood the ring. */
+ * heartbeat otherwise, so a steady pad does not flood the ring.
+ *
+ * p1m is the pad's mode nibble: 1 = GPIO, 5 = PWM channel 3's output. It is
+ * the number that tests the leading explanation [I]: until yp3-1so.1 the
+ * stock replay in pcm-yp3box.c wrote the whole P1.16..23 mode word at first
+ * play and so handed this pad to the PWM, which the old GPIO path had left
+ * half configured and running. p1m=5 on a GPIO build names the culprit. */
+#ifdef ROCKBOX_HAS_LOGF
 #define BL_PAD_PORT 1
 #define BL_PAD_BIT  17
 static int bl_pad_last = -1;
@@ -116,13 +130,92 @@ static void bl_pad_tick(void)
     if (++bl_pad_ticks < HZ)
         return;
     if (bl_pad_edges || ++bl_pad_quiet >= 5) {
-        logf("bl pad t=%ld lvl=%d edges=%u pwm0=%lx pwm10=%lx",
+        logf("bl pad t=%ld lvl=%d edges=%u p1m=%lx",
              current_tick, lvl, bl_pad_edges,
-             (unsigned long)PWMR(0x00), (unsigned long)PWMR(0x10));
+             (unsigned long)((P1_MODE_16_23 >> 4) & 0xf));
         bl_pad_quiet = 0;
     }
     bl_pad_ticks = 0;
     bl_pad_edges = 0;
+}
+#define bl_pad_probe_start() tick_add_task(bl_pad_tick)
+#else
+#define bl_pad_probe_start() ((void)0)
+#endif
+
+
+#if YP3_BL_PWM
+
+#define PWM3          0x40084080u
+#define PWMR(o)       (*(volatile uint32_t *)(PWM3 + (o)))
+#define PWM3_OUT_PIN  0x00018a80u   /* P1.17 func 5, dev[0x48] at 0xd67b4e */
+#define PWM_MODULE    0x44u
+#define PWM_CLOCK     0x27u
+#define PWM_CLK_SRC   10u           /* 0xd7e32a: cfg[4] == 0 -> 10, 24 MHz ref [I] */
+#define PWM_MODE      0x3fu         /* 0xd7e35a with cfg 01 00 01 0f */
+#define PWM_PERIOD    48000u        /* 0xd42584 */
+#define PWM_BUSY      (1u << 28)    /* 0xc48428 */
+#define PWM_SPIN      100000u
+
+static bool bl_pwm_ok;
+static bool bl_on;
+static unsigned bl_busy_timeouts;
+
+/* Module enable and clock from SRAM: clk_enable spins on an acknowledge bit
+ * and a clock change can perturb the controller we fetch from. Same order as
+ * 0xd7e314. */
+static void __attribute__((section(".icode"), noinline)) bl_pwm_bringup(void)
+{
+    volatile uint32_t d;
+
+    if (!ROM_CLK_IS_ON(PWM_MODULE))
+        ROM_CLK_ENABLE(PWM_MODULE);
+    ROM_CLK_SET_SRC(PWM_CLOCK, PWM_CLK_SRC);
+    ROM_CLK_APPLY(PWM_CLOCK);           /* ROM 0x27a0 = start, as 0x8051ec */
+    for (d = 0; d < 5000; d++) ;
+
+    PWMR(0x00) = 0x40u;                 /* 0xd7e394 */
+    PWMR(0x00) |= PWM_MODE;             /* 0xd7e398..0xd7e39c -> 0x7f */
+    /* The vendor's +0x10 write is uninitialised stack with bit 0 forced to 0
+     * (0xd67c18). Only that bit is defined, so only that bit is written. */
+    PWMR(0x10) &= ~1u;
+}
+
+/* 0xc482b8: wait for the update bit, then period:duty in one word. */
+static bool bl_pwm_set_duty(unsigned duty)
+{
+    unsigned spins = 0;
+
+    if (duty > PWM_PERIOD)
+        duty = PWM_PERIOD;
+    while ((PWMR(0x00) & PWM_BUSY) && ++spins < PWM_SPIN)
+        ;
+    if (spins >= PWM_SPIN) {
+        bl_busy_timeouts++;
+        return false;
+    }
+    PWMR(0x04) = duty | (PWM_PERIOD << 16);
+    return true;
+}
+
+static unsigned bl_duty(int level)
+{
+    if (level < MIN_BRIGHTNESS_SETTING) level = MIN_BRIGHTNESS_SETTING;
+    if (level > MAX_BRIGHTNESS_SETTING) level = MAX_BRIGHTNESS_SETTING;
+    return (unsigned)level * 10u * 480u;    /* pct * 480, 0xd4258c */
+}
+
+static void bl_log(const char *what)
+{
+    logf("bl: %s ok=%d on=%d lvl=%d mod=%d r00=%08lx r04=%08lx r10=%08lx",
+         what, bl_pwm_ok, bl_on, bl_level, ROM_CLK_IS_ON(PWM_MODULE),
+         (unsigned long)PWMR(0x00), (unsigned long)PWMR(0x04),
+         (unsigned long)PWMR(0x10));
+    logf("bl: c00=%08lx c14=%08lx p1m=%lx pad=%d busy_to=%u",
+         (unsigned long)*(volatile uint32_t *)0x40084000u,
+         (unsigned long)*(volatile uint32_t *)0x40084014u,
+         (unsigned long)((P1_MODE_16_23 >> 4) & 0xf),
+         (int)((P1_IN >> 17) & 1), bl_busy_timeouts);
 }
 
 void backlight_hw_on(void)
@@ -130,12 +223,12 @@ void backlight_hw_on(void)
     static unsigned ons;
     bl_note("on", &ons, __builtin_return_address(0));
 
-    /* PWM first, then claim the pad as a GPIO driven high. If the PWM route
-     * works the pad mux below would override it, so drive the simple path last:
-     * it is the one the LCD driver itself uses. */
-    PWMR(0x00) = 0x40u;
-    PWMR(0x00) |= (PWM_MODE & ~0x40u);
-    PWMR(0x10) |= 0x01u;        /* run */
+    lcd_enable(true);                   /* panel up before the light */
+    bl_on = true;
+    if (bl_pwm_ok && bl_pwm_set_duty(bl_duty(bl_level))) {
+        ROM_GPIO_CFG1(PWM3_OUT_PIN);    /* duty first, then hand it the pad */
+        return;
+    }
     ROM_GPIO_CFG1(BL_PIN_ON);
 }
 
@@ -144,38 +237,78 @@ void backlight_hw_off(void)
     static unsigned offs;
     bl_note("off", &offs, __builtin_return_address(0));
 
-    /* Mirrors the vendor's pwm_off (FIRM 0xd67b88): run bit first, then enable.
-     *   0xc4843c: [base+0x10] bit0 = run
-     *   0xc483fc: [base+0x00] bit4 = enable
-     * Then release the pad low via the same GPIO form /dev/lcd uses. */
-    PWMR(0x10) &= ~0x01u;
-    PWMR(0x00) &= ~0x10u;
+    bl_on = false;
+    /* Pad to GPIO low first: that off is known to work [L] whether or not the
+     * PWM does. Then duty 0, which is the vendor's own off (0xcfe532). */
     ROM_GPIO_CFG1(BL_PIN_OFF);
+    if (bl_pwm_ok)
+        bl_pwm_set_duty(0);
+    lcd_enable(false);                  /* dark first, then the panel */
+}
+
+void backlight_hw_brightness(int level)
+{
+    bl_level = level;
+    if (bl_pwm_ok && bl_on) {
+        bl_pwm_set_duty(bl_duty(level));
+        logf("bl: level %d duty %u r04=%08lx", level, bl_duty(level),
+             (unsigned long)PWMR(0x04));
+    }
 }
 
 bool backlight_hw_init(void)
 {
-    volatile uint32_t d;
+    unsigned want = bl_duty(bl_level) | (PWM_PERIOD << 16);
 
-
-    ROM_GPIO_CFG1(PWM3_OUT_PIN);        /* mux the PWM output pad */
-
-    if (!ROM_CLK_IS_ON(PWM_MODULE))
-        ROM_CLK_ENABLE(PWM_MODULE);
-    /* Through the wrapper. Source 16 needs no pre-start, so this is exactly
-     * what the raw call did - but the raw form is the one that has frozen this
-     * device twice when the source happened to be 8 or 9, so it does not stay
-     * in the tree. tools/check_clock_rules.py enforces that. */
-    ROM_CLK_SET_SRC(PWM_CLOCK, 16);
-    ROM_CLK_APPLY(PWM_CLOCK);
-    for (d = 0; d < 5000; d++) ;
-
-    PWMR(0x14) = PWM_PERIOD;            /* period, per vendor */
-    PWMR(0x18) = PWM_PERIOD;            /* duty = period -> 100% */
-
+    /* The pad stays a GPIO driven high while the PWM is brought up, so the
+     * panel is never dark for the duration. The vendor muxes first
+     * (0xd67c40 before 0xd67c4c); doing it last is a departure [I]. */
+    ROM_GPIO_CFG1(BL_PIN_ON);
+    bl_pwm_bringup();
+    bl_pwm_ok = true;
+    if (!bl_pwm_set_duty(bl_duty(bl_level)) || PWMR(0x04) != want
+        || !(PWMR(0x00) & 0x10u))
+        bl_pwm_ok = false;  /* register file did not take: stay on GPIO */
+    bl_log("init");
 
     backlight_hw_on();
-    tick_add_task(bl_pad_tick);
-
+    bl_log("on");
+    bl_pad_probe_start();
     return true;
 }
+
+#else /* !YP3_BL_PWM: GPIO only, full brightness */
+
+void backlight_hw_on(void)
+{
+    static unsigned ons;
+    bl_note("on", &ons, __builtin_return_address(0));
+    /* Panel up before the light, dark before the panel sleeps (yp3-1so.6).
+     * lcd_enable() does nothing unless the build has YP3_LCD_SLEEP. */
+    lcd_enable(true);
+    ROM_GPIO_CFG1(BL_PIN_ON);
+}
+
+void backlight_hw_off(void)
+{
+    static unsigned offs;
+    bl_note("off", &offs, __builtin_return_address(0));
+    ROM_GPIO_CFG1(BL_PIN_OFF);
+    lcd_enable(false);
+}
+
+void backlight_hw_brightness(int level)
+{
+    /* No PWM in this build: the setting is remembered and has no effect. */
+    bl_level = level;
+}
+
+bool backlight_hw_init(void)
+{
+    logf("bl: gpio only (YP3_BL_PWM=0)");
+    backlight_hw_on();
+    bl_pad_probe_start();
+    return true;
+}
+
+#endif /* YP3_BL_PWM */

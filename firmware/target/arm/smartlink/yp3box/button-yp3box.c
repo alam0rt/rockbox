@@ -9,6 +9,16 @@
 #include "lcd.h"
 #include "font.h"
 #include "system.h"
+#include "kernel.h"
+#include "power.h"
+#include "string.h"
+/* YP3_PMU_IRQ comes from here; without the include the #ifndef default wins
+ * and the build flag reaches nothing. */
+#include "yp3-buildstamp.h"
+#ifdef ROCKBOX_HAS_LOGF
+#define LOGF_ENABLE
+#endif
+#include "logf.h"
 
 #define ADC(o)       ADC_REG(o)     /* base and per-channel regs */
 #define ADC_MODULE   0x54u          /* FIRM 0xd65fac: clk_enable(0x54) */
@@ -101,13 +111,177 @@ static void key_init_pmu(void)
     (void)yp3_pmu_write(PMU_REG_KEY_ENABLE, (uint8_t)~PMU_KEY_ANY);
     if (yp3_pmu_read(PMU_REG_KEY_STATUS, &status) && (status & PMU_KEY_ANY))
         (void)yp3_pmu_write(PMU_REG_KEY_STATUS, status & PMU_KEY_ANY);
+
+    /* power_init has already logged the previous run's trace. */
+    memset(&yp3_keytrace, 0, sizeof(yp3_keytrace));
+    yp3_keytrace.odd_tick = -1;
+    yp3_keytrace.magic = YP3_KEYTRACE_MAGIC;
 }
 
+
+/* --- the PMU's interrupt line, OBSERVED, not yet used (yp3-1so.8) -----------
+ *
+ * The vendor does not poll the PMU: it raises P2.2, IRQ 3, and a bottom half
+ * reads 0x30/0x31/0x4a once per event. Here the poll below costs ~25 mailbox
+ * transactions a second at ~1.7 ms each, inside the tick. Before the poll is
+ * taken away, YP3_PMU_IRQ=1 arms the line exactly as the vendor does and
+ * COUNTS, with the poll still running and still the only thing that produces
+ * key events - so a boot answers, as numbers: does IRQ 3 fire at all, once
+ * per key edge or continuously, before the poll sees the edge or after, and
+ * which way the pin idles. NOT YET RUN ON HARDWARE.
+ *
+ * All `[C]`, each re-read from the dumps for this:
+ *   arm   FIRM 0xcf7e70: gpio_config(0x00021705) (literal 0xcf7f94: P2.2,
+ *         mode 14), then 0xc48238 -> ROM 0x842(0x00021000, 0x80000003)
+ *         (literal 0xcf7f98). ROM 0x842 with bit 31 set: 0x604 writes the
+ *         type nibble (3) at port +0x200 + 4*(pin/8), 0x648 clears pending
+ *         (+0x214, write 1) and sets the enable bit (+0x210). With bit 31
+ *         clear it is 0x660: enable bit off, pending cleared.
+ *   hook  FIRM 0xd67890: IRQ 3, priority 7.
+ *   isr   SRAM 0x80d414: if pending (ROM 0x872), DISABLE the pin (0x842 with
+ *         3), clear pending (ROM 0x896), signal the bottom half.
+ *   bh    FIRM 0xcf7c6c: read and write back 0x30/0x31/0x4a, then re-arm with
+ *         0x80000003 (literal 0xcf7cb8).
+ * Masking the pin from the ISR until the PMU status is cleared is what a
+ * level interrupt needs, so type 3 is probably a level `[I]`; polarity `[U]`.
+ *
+ * Here the "bottom half" is the existing poll: it re-arms after its own read
+ * (and clear, when a key bit was set). That bounds the interrupt rate at the
+ * poll rate even if the line turns out to be stuck asserted - which it may
+ * be, because this port only ever clears the three key bits of 0x31 and the
+ * PMU's other sources (0x30, 0x4a, and 0x31 bit 2, which has been seen set)
+ * stay latched. The arm line logs the enables and statuses that would say so.
+ * Priority 7 is below the PMU lock's BASEPRI (0x30), so the ISR can never cut
+ * a mailbox transaction in half. */
+#ifndef YP3_PMU_IRQ
+#define YP3_PMU_IRQ 0
+#endif
+#define PMU_INT_IRQ         3u
+#define PMU_NVIC_ICER       ((volatile uint32_t *)0xE000E180)
+
+#if YP3_PMU_IRQ
+#define PMU_INT_PIN         0x00021000u
+#define PMU_INT_PIN_CFG     0x00021705u
+#define PMU_INT_ARM         0x80000003u
+#define PMU_INT_DISARM      0x00000003u
+#define ROM_GPIO_INT_CFG    ((void (*)(unsigned, unsigned))0x843u)
+#define ROM_GPIO_INT_PEND   ((unsigned (*)(unsigned))0x873u)
+#define ROM_GPIO_INT_CLR    ((void (*)(unsigned))0x897u)
+#define PMU_NVIC_ISER       ((volatile uint32_t *)0xE000E100)
+#define PMU_NVIC_IPR        ((volatile uint8_t  *)0xE000E400)
+
+static struct {
+    volatile uint32_t irqs;         /* ISR entries with the pin pending       */
+    volatile uint32_t stray;        /* ISR entries without                    */
+    volatile bool     flag;         /* an interrupt since the last poll       */
+    uint32_t key_polls;             /* polls that found a key bit             */
+    uint32_t key_matched;           /* ...with the interrupt already taken    */
+    uint32_t flag_nokey;            /* interrupt taken, no key bit in 0x31    */
+    uint32_t idle_hi, idle_lo;      /* pin level on quiet polls               */
+    uint32_t ev_hi, ev_lo;          /* pin level on polls with a key bit      */
+    uint8_t  nokey_st;              /* 0x31 at the last flag_nokey            */
+    uint32_t logged_irqs;
+    unsigned polls;
+    bool     armed;
+} pmu_irq;
+
+static void pmu_irq_arm(void)
+{
+    uint8_t en19 = 0, en1a = 0, en4b = 0, st30 = 0, st31 = 0, st4a = 0;
+
+    (void)yp3_pmu_read(0x19, &en19);
+    (void)yp3_pmu_read(0x1a, &en1a);
+    (void)yp3_pmu_read(0x4b, &en4b);
+    (void)yp3_pmu_read(0x30, &st30);
+    (void)yp3_pmu_read(0x31, &st31);
+    (void)yp3_pmu_read(0x4a, &st4a);
+    logf("pmuirq: arm en 19=%02x 1a=%02x 4b=%02x st 30=%02x 31=%02x 4a=%02x pin=%d",
+         en19, en1a, en4b, st30, st31, st4a, (int)((GPIO_IN(2) >> 2) & 1u));
+
+    ROM_GPIO_CFG1(PMU_INT_PIN_CFG);
+    ROM_GPIO_INT_CFG(PMU_INT_PIN, PMU_INT_ARM);
+    PMU_NVIC_IPR[PMU_INT_IRQ] = 7u << 4;
+    PMU_NVIC_ISER[PMU_INT_IRQ >> 5] = 1u << (PMU_INT_IRQ & 31);
+    pmu_irq.armed = true;
+    logf("pmuirq: armed, pin=%d type=%lx en=%lx pend=%lx",
+         (int)((GPIO_IN(2) >> 2) & 1u),
+         (unsigned long)REG32(GPIO_PORT(2) + 0x200),
+         (unsigned long)REG32(GPIO_PORT(2) + 0x210),
+         (unsigned long)REG32(GPIO_PORT(2) + 0x214));
+}
+
+/* From the poll, after its read and clear. Tick context. */
+static void pmu_irq_observe(uint8_t status)
+{
+    bool key = (status & PMU_KEY_ANY) != 0;
+    bool hi = ((GPIO_IN(2) >> 2) & 1u) != 0;
+    bool flag = pmu_irq.flag;
+
+    if (!pmu_irq.armed)
+        return;
+    if (key) {
+        pmu_irq.key_polls++;
+        if (flag)
+            pmu_irq.key_matched++;
+        if (hi) pmu_irq.ev_hi++; else pmu_irq.ev_lo++;
+    } else {
+        if (flag) {
+            pmu_irq.flag_nokey++;
+            pmu_irq.nokey_st = status;
+        }
+        if (hi) pmu_irq.idle_hi++; else pmu_irq.idle_lo++;
+    }
+    if (flag) {
+        pmu_irq.flag = false;
+        ROM_GPIO_INT_CFG(PMU_INT_PIN, PMU_INT_ARM);     /* the bh's re-arm */
+    }
+    /* Every ~5 s, and only when the count moved, so a quiet line is quiet
+     * in the ring too. A line stuck asserted shows as irqs climbing by one
+     * per poll with nokey beside it. */
+    if (++pmu_irq.polls >= 125) {
+        pmu_irq.polls = 0;
+        if (pmu_irq.irqs != pmu_irq.logged_irqs || pmu_irq.stray) {
+            pmu_irq.logged_irqs = pmu_irq.irqs;
+            logf("pmuirq: irqs=%lu stray=%lu key=%lu matched=%lu nokey=%lu(st %02x) "
+                 "pin idle %lu/%lu ev %lu/%lu hi/lo",
+                 (unsigned long)pmu_irq.irqs, (unsigned long)pmu_irq.stray,
+                 (unsigned long)pmu_irq.key_polls,
+                 (unsigned long)pmu_irq.key_matched,
+                 (unsigned long)pmu_irq.flag_nokey, pmu_irq.nokey_st,
+                 (unsigned long)pmu_irq.idle_hi, (unsigned long)pmu_irq.idle_lo,
+                 (unsigned long)pmu_irq.ev_hi, (unsigned long)pmu_irq.ev_lo);
+        }
+    }
+}
+#endif /* YP3_PMU_IRQ */
+
+/* Vector 3 (vectors-sl6801.S). Without YP3_PMU_IRQ nothing enables it, and
+ * if it ever fired it is masked, as yp3_spurious_irq would. */
+void yp3_pmu_gpio_irq(void)
+{
+#if YP3_PMU_IRQ
+    if (ROM_GPIO_INT_PEND(PMU_INT_PIN)) {
+        ROM_GPIO_INT_CFG(PMU_INT_PIN, PMU_INT_DISARM);
+        ROM_GPIO_INT_CLR(PMU_INT_PIN);
+        pmu_irq.irqs++;
+        pmu_irq.flag = true;
+        return;
+    }
+    /* Another port-2 pin, or nothing: not ours to clear, so after a few of
+     * them stop listening rather than loop. */
+    if (++pmu_irq.stray < 8)
+        return;
+#endif
+    PMU_NVIC_ICER[PMU_INT_IRQ >> 5] = 1u << (PMU_INT_IRQ & 31);
+}
 
 void button_init_device(void)
 {
     adc_init_device();
     key_init_pmu();
+#if YP3_PMU_IRQ
+    pmu_irq_arm();
+#endif
 }
 
 /* MEASURED on hardware with the probe above, channel 1:
@@ -147,14 +321,51 @@ static bool right_held, left_held;
  * this call and the release on the next, or the tap disappears. */
 static bool play_held, play_release_pending;
 
+/* yp3-0gn.10, see struct yp3_keytrace. Tick context: plain stores only. */
+struct yp3_keytrace yp3_keytrace __attribute__((section(".yp3snap")));
+
+static void keytrace_note(bool was_held, uint8_t status)
+{
+    struct yp3_keytrace *k = &yp3_keytrace;
+
+    k->last_tick = current_tick;
+    k->seen |= status;
+    if ((status & (uint8_t)~PMU_KEY_ANY) && k->odd_tick < 0) {
+        k->odd_st = status;
+        k->odd_tick = current_tick;
+    }
+    if (play_held && !was_held) {
+        k->downs++;
+        k->down_tick = current_tick;
+        k->down_st = status;
+        k->chg_down = charger_inserted();
+    } else if (!play_held && was_held) {
+        k->ups++;
+        k->up_tick = current_tick;
+    }
+    k->held = play_held;
+}
+
 static void play_read_pmu(void)
 {
     uint8_t status;
+    bool was_held = play_held;
 
-    if (!yp3_pmu_read(PMU_REG_KEY_STATUS, &status) || !(status & PMU_KEY_ANY)) {
+    if (!yp3_pmu_read(PMU_REG_KEY_STATUS, &status))
+        status = 0;                 /* a failed read is not recorded */
+    else
+        keytrace_note(was_held, status);    /* note the raw byte first */
+
+#if YP3_PMU_IRQ
+    /* Before the clear below: the pin is sampled while the event is still
+     * latched in the PMU, which is what gives the polarity. */
+    pmu_irq_observe(status);
+#endif
+    if (!(status & PMU_KEY_ANY)) {
         if (play_release_pending) {
             play_release_pending = false;
             play_held = false;
+            keytrace_note(was_held, 0);
         }
         return;
     }
@@ -169,6 +380,7 @@ static void play_read_pmu(void)
         play_held = false;
         play_release_pending = false;
     }
+    keytrace_note(was_held, status);
 }
 
 int button_read_device(void)

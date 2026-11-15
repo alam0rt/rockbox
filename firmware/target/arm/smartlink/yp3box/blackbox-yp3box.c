@@ -54,7 +54,9 @@
  * make the next boot read the old ring at the new offset and dump convincing
  * garbage. A changed magic forces a clean cold init instead, costing exactly
  * one log - the one spanning the change, which is never the interesting one. */
-#define BLACKBOX_MAGIC      0x59503344u
+/* 0x...44 -> 0x...45: yp3_usblog (64 bytes) went in ahead of the logf ring.
+ * 0x...45 -> 0x...46: .persist moved to the start of SRAM (yp3-1so.12). */
+#define BLACKBOX_MAGIC_BASE 0x59503346u
 /* Stop a fault that reproduces immediately from rebooting for ever. */
 #define BLACKBOX_MAX_FAULTS 3
 
@@ -106,6 +108,31 @@ struct yp3_blackbox {
 /* Placed by app.lds at the head of .persist; never defined in C, so nothing
  * is emitted for it and nothing initialises it. */
 extern struct yp3_blackbox yp3_blackbox;
+
+/* The magic carries the LAYOUT, not just a hand-bumped revision.
+ *
+ * .persist now starts at the same address in every build (app.lds), so the
+ * magic is found by builds that did not write it. That is the point - the
+ * previous build's log reaches the card - but it also means a build whose
+ * ring sits somewhere else would read the old ring at the new offset and dump
+ * convincing garbage, which is what the hand-bumped nibble above was for and
+ * what a forgotten bump would not catch. So hash where the ring and its two
+ * indices actually are, relative to the start of the section, and the extent
+ * of everything a boot inherits. A logf build and a non-logf build differ in
+ * that extent, so they are cold to each other. `[C]` only: not yet run. */
+extern char _persistbegin[], _persistlogend[], _persistend[];
+
+static uint32_t bb_magic(void)
+{
+    uint32_t h = (uint32_t)(_persistlogend - _persistbegin);
+#ifdef ROCKBOX_HAS_LOGF
+    h = h * 31u + (uint32_t)((char *)logfbuffer - _persistbegin);
+    h = h * 31u + (uint32_t)((char *)&logfindex - _persistbegin);
+    h = h * 31u + (uint32_t)((char *)&logfwrap - _persistbegin);
+#endif
+    return BLACKBOX_MAGIC_BASE ^ (h * 0x01000193u);
+}
+#define BLACKBOX_MAGIC bb_magic()
 
 /* .bss, so it IS cleared every boot: it says what this boot found, not what
  * the last one left. */
@@ -213,9 +240,13 @@ void blackbox_init(void)
          * .persist, which is the header AND the logf ring behind it - the
          * ring's index and wrap flag live there too and would otherwise be
          * garbage. */
-        extern char _persistbegin[], _persistend[];
-
-        memset(_persistbegin, 0, _persistend - _persistbegin);
+        /* From the black box on, NOT from _persistbegin: yp3_bootctl is
+         * ahead of it and belongs to crt0, which has already validated it and
+         * counted this boot. Clearing its magic here made the NEXT boot's
+         * crt0 take its own cold path and drop a pending bootloader request
+         * - on exactly the first boot of a new build, which is when a rig
+         * cycle asks for one. */
+        memset(bb, 0, _persistend - (char *)bb);
         bb->magic = BLACKBOX_MAGIC;
         bb->boots = 1;
         bb_stamp_version(bb);

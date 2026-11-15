@@ -1027,9 +1027,10 @@ static void yp3_audio_supply(void)
  *     and CLEARS bit 31 of +0x138/+0x158 (this driver leaves 8000a1ff).
  *   - analogue: channels 0 and 1 only (+0x40 = a20, +0x4c ends 130030); this
  *     driver also half-raises channel 2 (0x1a20 / 0x530430).
- *   - trims 0x0b / 0x4a are written mid-sequence.
- *   - port 1 pad words +0x48/+0x54/+0x58: stock's pins 14/15 and 20/21 config.
- *     Pin 10 (LCD reset) is not in any differing field.
+ *   - trims 0x0b / 0x4a are written mid-sequence. They are THIS unit's OTP
+ *     values, so the replay writes them only under YP3_AUDIO_TRIM, like
+ *     yp3_analog_enable; with it off their 1+10 ms settle is kept as a wait.
+ *   - port 1 pads: see yp3_stock_pads below. Only P1.20/P1.21 are applied.
  * GPIO bit 29 of +0x68/+0x70 is the PA (P1.30) - both firmwares set it. */
 #define ROM_CLK_DISABLE_ ((void (*)(unsigned))0x2571u)
 struct st_rp { uint32_t addr, val; uint16_t ms; };
@@ -1054,18 +1055,77 @@ static const struct st_rp st_replay[] = {
     { 0x40009040, 0x00000210, 1 }, { 0x4000904c, 0x00020000, 1 },
     { 0x4000904c, 0x00030000, 1 }, { 0x40009040, 0x00000220, 1 },
     { 0x4000904c, 0x00130000, 1 }, { 0x40009040, 0x00000a20, 1 },
+#if YP3_AUDIO_TRIM >= 1
     { 0x40009050, 0x00028000, 1 }, { 0x40009054, 0x00028000, 5 },
-    { 0x40009064, 0x0000000b, 1 }, { 0x40009068, 0x0000004a, 10 },
+    { 0x40009064, YP3_TRIM_CH0, 1 }, { 0x40009068, YP3_TRIM_CH1, 10 },
+#else
+    /* the trims' place in stock's sequence, as a wait: 5 + 1 + 10 ms */
+    { 0x40009050, 0x00028000, 1 }, { 0x40009054, 0x00028000, 16 },
+#endif
     /* t4769..4787: power-up, settle, gain */
     { 0x40009050, 0x10028000, 1 }, { 0x40009054, 0x10028000, 1 },
     { 0x40009050, 0x30028000, 1 }, { 0x40009054, 0x30028000, 1 },
     { 0x4000904c, 0x00130030, 1 }, { 0x4000904c, 0x00130033, 1 },
     { 0x40009050, 0x30028fff, 1 }, { 0x40009054, 0x30028fff, 20 },
     { 0x4000904c, 0x00130030, 1 },
-    /* t4790..4794 and boot: port 1 pad configuration */
-    { 0x40081048, 0xff99fc5f, 1 }, { 0x40081054, 0x55455000, 1 },
-    { 0x40081058, 0x05555041, 1 },
 };
+
+/* Port 1 pads: what stock's state differs from ours in, ONE PIN AT A TIME.
+ *
+ * This table used to end with three whole-word writes, the values stock's
+ * words held at play: +0x48 = ff99fc5f (mode nibbles P1.16..23), +0x54 =
+ * 55455000 and +0x58 = 05555041 (two-bit pull fields, P1.0..15 and
+ * P1.16..31; ROM 0x5e2 `[C]`). A whole word rewrites every pin in it, and
+ * decoded field by field against stock's write trace (run2-capped, which
+ * records the value after every change `[L]`) and against what this port
+ * configures itself `[C]`, only these differ:
+ *
+ *   P1.17 mode 5, pull 0   stock, trap 572 at BOOT: its PWM backlight,
+ *                          /dev/pwm_ch3's 0x00018a80. This port drives the
+ *                          pad as mode-1 GPIO (backlight_hw_on, 0x000188c0),
+ *                          so the word handed the backlight to the PWM at
+ *                          every first play. NOT applied - backlight-yp3box.c
+ *                          owns that pin.
+ *   P1.20/P1.21 mode 9,    stock, traps 1..8 at BOOT, long before play (4717).
+ *     pull 0               The vendor bootloader configures 0x0001a480 (P1.20
+ *                          mode 9) at 0x8203d6 right before a UART init on
+ *                          module 0x4a / clock 0x24 (0x828694) `[C]`, so they
+ *                          are most likely the console UART pair `[I]`, not
+ *                          audio. Applied anyway: they were in every replay
+ *                          that has been heard (2026-11-08 `[L]`), and whether
+ *                          audio needs them is `[U]`. Reset here is mode 15,
+ *                          pull 1, alt 0 `[L]` (wtrace-rockbox-selftest).
+ *   P1.30 pull 0           stock, trap 4792 at PLAY: part of the PA's own
+ *                          gpio_config (mode 0, pull 0, alt 11 = ROM table
+ *                          0x80020002), which yp3_speaker_pa issues with the
+ *                          same 0x0001f00b `[C]`. Not applied here.
+ *
+ * Every other field already matched `[C]`: the LCD pins P1.0..5/1.18 and the
+ * panel reset P1.10 (pull 0, ours and stock's), P1.14/P1.15 (pull 1 - stock
+ * never writes them; the "14/15" difference recorded earlier was this port's
+ * own self-test pad walk), USB P1.22/23 (mode 15 pull 1, 0x0001bf90/b790), and
+ * the rest at reset. So on the normal playback path +0x54 is unchanged, and
+ * +0x48/+0x58 should read ff99fc1f / 15555041 after this, 05555041 once the
+ * PA opens `[I]` - the log line below says. The self-test's pad walk leaves P1.14/P1.15 at pull 0 now; that
+ * is its own experiment and no longer silently undone.
+ *
+ * The descriptors are ROM 0x7ac's: port [19:16], pin [15:11], mode [10:7],
+ * level [6], pull [5:4], alt [3:0]. 0x0001a480 is the vendor bootloader's
+ * literal (0x82040c) `[C]`; 0x0001ac80 is the same with pin 21 `[I]`, which
+ * matches the mode, pull and alt (unchanged, "touch") stock left on P1.21
+ * `[L]`. */
+#define ST_P1_20_MODE9  0x0001a480u
+#define ST_P1_21_MODE9  0x0001ac80u
+
+static void yp3_stock_pads(void)
+{
+    ROM_GPIO_CFG1(ST_P1_21_MODE9);              /* stock trap 1  */
+    ROM_GPIO_CFG1(ST_P1_20_MODE9);              /* stock trap 6  */
+    yp3_wait_ms(1);
+    logf("rp: p1 48=%08lx 54=%08lx 58=%08lx",
+         (unsigned long)REG32(0x40081048u), (unsigned long)REG32(0x40081054u),
+         (unsigned long)REG32(0x40081058u));
+}
 
 static void yp3_stock_play(void)
 {
@@ -1082,6 +1142,7 @@ static void yp3_stock_play(void)
                  (unsigned long)st_replay[i].val,
                  (unsigned long)REG32(st_replay[i].addr));
     }
+    yp3_stock_pads();                           /* where the words used to be */
     logf("rp: done 000=%08lx 100=%08lx 138=%08lx 040=%08lx 04c=%08lx 050=%08lx",
          (unsigned long)AUD(0x00), (unsigned long)AUD(0x100),
          (unsigned long)AUD(0x138), (unsigned long)AUD(0x40),
@@ -1092,6 +1153,35 @@ static void yp3_stock_play(void)
 }
 
 static bool tx_running;
+
+/* YP3_AUDIO_LEGACY_TX (default 1 = what has played since 2026-11-08).
+ *
+ * The start path is three layers (yp3-1so.2): yp3_audio_block_init, then
+ * yp3_tx_enable - written when the +0x200 file was believed to be playback -
+ * with yp3_analog_enable inside it, then the stock replay on top. Read
+ * against stock's own write trace (captures/stocktrace-20261107/run2-capped,
+ * which records every change to the audio block from boot to play, 188 of
+ * them) the first and third ARE stock: block init is its boot sequence, ev
+ * 183..335, and the replay its play sequence, ev 4730..4787. The middle one
+ * is not in the trace at all. Stock never writes the +0x200 file, AUD(0x08),
+ * AUD(0x20), AUD(0x410) or AUD(0xfc), and its live capture
+ * (captures/stock-20261107-101240/aud.bin) holds them at 0x00300000, 0, 0,
+ * 0 and 0x1f. yp3_tx_enable leaves the capture file enabled and RUNNING for
+ * the rest of the boot, sets output-path bits in AUD(0x08) and routing in
+ * AUD(0x20) that stock has clear, clears AUD(0xfc)[4:0] and sets
+ * AUD(0x410) bit 30. The replay writes whole words, so everything the two
+ * layers both touch already ends at stock's value; these five do not.
+ *
+ * So 0 is "stock's recorded sequence and nothing else" - what yp3-1so.2
+ * wants the driver collapsed to - and it is also the first build whose
+ * audio block state matches stock's word for word, which makes it the
+ * experiment for the distortion near 0 dB (yp3-0gn.4): that bead compared
+ * the registers the replay writes and found them identical, and did not
+ * compare these. NOT YET RUN ON HARDWARE: whether sound needs anything the
+ * legacy layer does is `[U]`, which is why it is a flag and not a deletion. */
+#ifndef YP3_AUDIO_LEGACY_TX
+#define YP3_AUDIO_LEGACY_TX 1
+#endif
 
 static void sink_init(void)
 {
@@ -1135,10 +1225,20 @@ static void sink_set_freq(uint16_t freq)
     yp3_audio_pll(rate);
     ROM_CLK_APPLY(AUDIO_MCLK);
 
+#if YP3_AUDIO_LEGACY_TX
     yp3_tx_enable(rate, true);
+#endif
     yp3_dma_open();
     yp3_stock_play();       /* the +0x100 file and the analogue stage, as
                              * stock does it: what actually makes sound */
+    /* The words the legacy layer writes and stock never does, once, so the
+     * log says which state this boot played in. Stock, read live on this
+     * unit: 08=0 20=0 fc=1f 200=00300000 208=00040000 410=0. */
+    logf("aud: legacy=%d 08=%08lx 20=%08lx fc=%08lx 200=%08lx 208=%08lx 410=%08lx",
+         YP3_AUDIO_LEGACY_TX, (unsigned long)AUD(0x08),
+         (unsigned long)AUD(0x20), (unsigned long)AUD(0xfc),
+         (unsigned long)AUD(0x200), (unsigned long)AUD(0x208),
+         (unsigned long)AUD(0x410));
     tx_running = true;
 }
 

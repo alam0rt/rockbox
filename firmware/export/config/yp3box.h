@@ -26,8 +26,25 @@
 #define HAVE_LCD_BITMAP
 
 #define HAVE_BACKLIGHT
+/* Brightness is PWM channel 3 on P1.17 (backlight-yp3box.c). The vendor's
+ * set_brightness (FIRM 0xd106a0) takes 10..100 percent in steps of 10, built
+ * as (level + 1) * 10 by its UI (0xd0ba02), so setting n is n*10 percent. The
+ * default is the 60% read out of a live vendor system (SRAM 0x824258).
+ * Defined unconditionally: the PWM itself sits behind YP3_BL_PWM in the
+ * driver, and with that off the setting is accepted and has no effect. */
+#define HAVE_BACKLIGHT_BRIGHTNESS
+#define MIN_BRIGHTNESS_SETTING      1
+#define MAX_BRIGHTNESS_SETTING      10
+#define DEFAULT_BRIGHTNESS_SETTING  6
 /* the panel can be blanked before power-off; see lcd_shutdown() */
 #define HAVE_LCD_SHUTDOWN
+/* lcd_enable()/lcd_active(), so the UI stops rendering into a dark panel
+ * (yp3-1so.6). Defined unconditionally, like the brightness setting above:
+ * the panel only really sleeps in a YP3_LCD_SLEEP build (lcd-yp3box.c), and
+ * without that flag lcd_enable() is empty and lcd_active() is always true -
+ * the behaviour before this was defined. Not HAVE_LCD_SLEEP: one sleep state
+ * is all the GC9106 sequence here has. */
+#define HAVE_LCD_ENABLE
 
 #define CONFIG_KEYPAD       YP3BOX_PAD
 
@@ -61,7 +78,13 @@
 #define BATTERY_CAPACITY_INC     0
 
 #define CONFIG_I2C          I2C_NONE
-#define CONFIG_RTC          0
+/* The SoC's own calendar RTC at 0x40085000 (rtc-yp3box.c, docs/RTC.md). The
+ * id is defined here, not in config.h's list (1..27): nothing shared switches
+ * on it, and the driver is included by system-yp3box.c, so this is the whole
+ * registration. No HAVE_RTC_ALARM - nothing shows the alarm can wake the
+ * device. `[U]` until a boot has read it and a set has read back. */
+#define RTC_SL6801          6801
+#define CONFIG_RTC          RTC_SL6801
 
 /* boot test: we only need UTF-8, not legacy codepages */
 #define MAX_CP_TABLE_SIZE 256
@@ -130,8 +153,11 @@
  *
  * 0x1b000 is 108 KB: it keeps MP3, Vorbis, WAV and WavPack with about 4.6 KB
  * of headroom over mpa, and drops cook (RealAudio), ay (ZX Spectrum) and gbs
- * (Game Boy) - see the gates in lib/rbcodec/codecs/SOURCES. FLAC, AAC and Opus
- * did not fit at 128 KB either. */
+ * (Game Boy) - see the gates in lib/rbcodec/codecs/SOURCES. The codecs that
+ * gate leaves out, measured by hand-linking each one (2026-11-09 `[C]`,
+ * docs/CODEC-MEMORY.md): Opus 129,972 plus ~107 KB of heap, MPC 160,084,
+ * APE 180,956, AAC 183,404, FLAC 196,352, WMA 284,540. Almost all of it is
+ * .bss workspace, not code. */
 
 #define PLUGIN_BUFFER_SIZE  0x2000
 
@@ -156,10 +182,13 @@
  * lc-yp3box.c: it owns lc_open(), so nothing in apps/ or lib/rbcodec knows
  * this target keeps codecs in flash.
  *
- * This is the default for this target. Known open issue: codecs linked into
- * flash slots load and enter, and the device has been seen to hard-hang inside
- * the codec entry point. The black box is the instrument for that; see
- * docs/ROADMAP.md. The two defines below turn on together. */
+ * The name is historical: HAVE_CODEC_XIP now means "codecs are delivered in
+ * flash slots and copied to SRAM", which is the opposite of execute in place.
+ * It is spelled this way in plugin.lds and config.h too, both shared, so the
+ * rename waits for a change that touches them anyway (yp3-1so.16). The hang
+ * this comment used to warn about was the XIP layout; MP3 has played through
+ * the copied path since 2026-09-29 `[L]`. The two defines below turn on
+ * together. */
 #define HAVE_CODEC_XIP
 
 /* lc-yp3box.c provides lc_open(); the stock card loader in lc-rock.c is still
@@ -259,13 +288,14 @@
 /* Debug channel. This port has no console: the breadcrumb region went away
  * with the instrumentation cleanup, and every audio and battery hypothesis
  * otherwise costs a full flash-and-boot cycle to test. Build with
- * `YP3_LOGF=1 ./tools/40_build.sh` (configure --type=nl) and the log is
+ * `YP3_LOGF=1 ./tools/40_build.sh` (configure --type=al) and the log is
  * readable on the device under Debug -> "View log" and dumpable to /logf.txt
  * with Debug -> "Dump Log File".
  *
- * 16 KB of ring is not affordable here - the entire core buffer is 79 KB - so
- * the ring is 6 KB, which holds a few hundred lines: enough for one track
- * load.
+ * 16 KB of ring is not affordable here - the audio arena is about 141 KB and
+ * the ring comes straight out of it (tools/arena_report.py prints both per
+ * build) - so the ring is 6 KB, which holds a few hundred lines: about 25 s
+ * of a playing boot `[L]`.
  *
  * Which files log is decided in tools/40_build.sh, which passes -DLOGF_ENABLE
  * per object. Rockbox's own convention is a commented-out #define at the top

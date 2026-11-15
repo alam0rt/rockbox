@@ -9,6 +9,7 @@
 #define LOGF_ENABLE
 #endif
 #include "logf.h"
+#include "kernel.h"
 /* Configure the clock tree used by the XIP image. This sequence is transcribed
  * from the vendor bootloader and must run from SRAM. */
 
@@ -431,6 +432,21 @@ static void yp3_measure_speed(void)
         logf("speed: XIP penalty = %lu.%02lux",
              (unsigned long)(flash_cyc / sram_cyc),
              (unsigned long)((flash_cyc % sram_cyc) * 100u / sram_cyc));
+
+    /* udelay against the same counter (yp3-1so.11). Nothing had ever
+     * measured it: the constant was reasoned from the disassembly to be
+     * about right (~1.1 us per us `[I]`), and sd-yp3box.c's twin about 6x
+     * long. 192,000 cycles is one millisecond; sd-yp3box.c logs its own. */
+    logf("delay: udelay(1000) = %lu cyc (192000 = 1 ms)",
+         (unsigned long)yp3_time_spin((void (*)(uint32_t))udelay, 1000u));
+
+    /* Does this Cortex-M4 have an MPU (yp3-rvo)? MPU_TYPE is architectural
+     * and reads as zero when there is none: DREGION, bits 15:8, is the region
+     * count. Neither the ROM nor FIRM ever touches the MPU registers, so the
+     * dumps cannot answer it. A read, nothing else. */
+    logf("mpu: MPU_TYPE %08lx (%lu regions)",
+         (unsigned long)REG32(0xE000ED90u),
+         (unsigned long)((REG32(0xE000ED90u) >> 8) & 0xffu));
 }
 
 void system_init(void)
@@ -503,4 +519,20 @@ void __attribute__((section(".icode"))) udelay(uint32_t us)
     while (n--) ;
 }
 
+uint32_t __attribute__((section(".icode"), noinline)) yp3_now_cyc(void)
+{
+    long t;
+    uint32_t c, rvr = SYSTICK_RVR;
+
+    do {
+        t = current_tick;
+        c = SYSTICK_CVR;
+    } while (t != current_tick);
+    return (uint32_t)t * (rvr + 1u) + (rvr - c);
+}
+
 int system_memory_guard(int newmode) { (void)newmode; return 0; }
+
+#if CONFIG_RTC
+#include "rtc-yp3box.c"
+#endif

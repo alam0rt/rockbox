@@ -347,7 +347,15 @@
  *
  * Turn this off again if 4-bit ever needs to be ruled out in one flash - the
  * rest of the ladder does not depend on it. */
-#define SD_TRY_4BIT 0
+/* 2026-11-14: YP3_SD_4BIT=1 is that experiment, and nothing else. It selects
+ * the vendor's own pad words (sd_pins below) and turns this ladder phase back
+ * on, so one boot says whether DAT1-3 carry data once the pads are the
+ * vendor's. The floor is still proved first, with the same pads, on one line.
+ * Default 0: the shipping operating point is unchanged. NOT YET RUN. */
+#ifndef YP3_SD_4BIT
+#define YP3_SD_4BIT 0
+#endif
+#define SD_TRY_4BIT YP3_SD_4BIT
 
 #define SD_CMDW_ACMD6      0x2446u   /* SET_BUS_WIDTH, R1, no data phase   */
 #define SD_CMDW_READ_MULTI 0x3352u   /* CMD18 + send_auto_stop (bit 12)    */
@@ -417,10 +425,28 @@
 /* ROM entry points only dereference handle[0]. */
 static struct { volatile uint32_t *base; } sdh;
 
-/* CLK, CMD, DAT0-3 on port 3 pins 4..9, alternate function 11. */
+/* CLK, CMD, DAT0-3 on port 3 pins 4..9, mode 11.
+ *
+ * The default table is this port's own: it has no vendor source, and it is
+ * what every sector read so far has come through, on one data line.
+ *
+ * The YP3_SD_4BIT table is the VENDOR's, word for word and in its order:
+ * FIRM 0xd67fe4, six words (od'd 2026-11-14: 00032598 0003359b 00033d9b
+ * 0003459b 00034d9b 00032d90), applied by the SD open at 0xd67f34..54
+ * through 0x8051f4 = ROM 0x7ac, which is ROM_GPIO_CFG1. The mode field
+ * [10:7] is 11 in both tables; what differs is the pad half - [5:4] is 1 on
+ * every vendor pin where ours is 0, and [3:0], which indexes ROM 0x9c4 for
+ * two more pad fields, is 8 on P3.4, 0 on P3.5 and 0xb on DAT0-3 where ours
+ * is 0xb throughout. Which field is drive strength and which are pulls is
+ * `[I]` (docs/SD.md, "The vendor's pin table"). */
 static const unsigned sd_pins[] = {
+#if YP3_SD_4BIT
+    0x00032598u, 0x0003359bu, 0x00033d9bu,
+    0x0003459bu, 0x00034d9bu, 0x00032d90u,
+#else
     0x0003258bu, 0x00032d8bu, 0x0003358bu,
     0x00033d8bu, 0x0003458bu, 0x00034d8bu,
+#endif
 };
 
 static uint32_t sd_fifoth_id;        /* FIFOTH as identification left it */
@@ -1032,6 +1058,21 @@ static void sd_benchmark(void)
 
 int sd_init(void)
 {
+#ifdef ROCKBOX_HAS_LOGF
+    {
+        /* sd_udelay against the cycle counter, once (yp3-1so.11): read off
+         * the disassembly it is about 6x long `[I]`, which would make
+         * sd_wait_ready's 200 x 1 ms a 1.2 s bound, not 200 ms. */
+        static bool sd_delay_logged;
+        if (!sd_delay_logged) {
+            uint32_t c0 = yp3_now_cyc();
+            sd_udelay(1000);
+            logf("delay: sd_udelay(1000) = %lu cyc (192000 = 1 ms)",
+                 (unsigned long)(yp3_now_cyc() - c0));
+            sd_delay_logged = true;
+        }
+    }
+#endif
     unsigned i;
     uint32_t err;
 

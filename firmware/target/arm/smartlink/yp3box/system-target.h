@@ -14,6 +14,12 @@ void udelay(uint32_t us);
  * here because the power-down path needs it as much as system_init does. */
 void yp3_mask_all_irqs(void);
 static inline void mdelay(unsigned int ms) { udelay(ms * 1000); }
+/* Core-clock cycles since tick_start, from current_tick and SysTick. For
+ * timing a stretch of code on the device once the kernel tick is running
+ * (yp3-1so.11): it wraps after 22 s, which is far longer than anything worth
+ * timing this way, and it is in .icode so the read itself costs nothing
+ * measurable. */
+uint32_t yp3_now_cyc(void);
 
 /* The rig - rig-yp3box.c. Getting the device through a flash/boot/observe
  * cycle with no buttons pressed. yp3_rig_tick() runs from systick_handler,

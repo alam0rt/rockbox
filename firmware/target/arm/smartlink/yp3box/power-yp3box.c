@@ -21,6 +21,7 @@
 #include "config.h"
 #include "power.h"
 #include "system.h"
+#include "kernel.h"
 #include "backlight.h"
 #include "backlight-target.h"
 #include "sl6801-regs.h"
@@ -205,7 +206,7 @@ yp3_pmu_write(unsigned reg, uint8_t value)
  * failed power-off it survives [L]; after a real one SRAM is lost [L] and the
  * next boot says "no snapshot (cold SRAM)" - which is itself the evidence
  * that the power really went off. */
-#define PWRLOG_MAGIC  0x504f4646u      /* "POFF" */
+#define PWRLOG_MAGIC  0x504f4632u      /* "POF2": +caller/ipsr/tick */
 #define PMU_INT0_STOCK_ENABLE  0x1au   /* SRAM 0x81b034 +17 [L] */
 #define PMU_INT2_STOCK_ENABLE  0x00u   /* SRAM 0x81b034 +19 [L] */
 #define PWR_WIN_N  16
@@ -224,6 +225,9 @@ struct yp3_pwrlog {
     uint8_t r20;          /* PMU reg 0x20, the source of +0xbc        */
     uint32_t win[PWR_WIN_N];          /* PMU_REG window before arming */
     uint32_t arm_b0, arm_b8, arm_d0;  /* sequencer after arming     */
+    uint32_t caller;      /* power_off()'s return address (yp3-0gn.10) */
+    uint32_t ipsr;        /* 0: a thread; 15: the tick (SysTick)       */
+    int32_t tick;         /* current_tick at power_off()               */
 };
 static struct yp3_pwrlog yp3_pwrlog __attribute__((section(".yp3snap")));
 
@@ -400,12 +404,38 @@ static void yp3_power_reasons(void)
         logf("poff st %02x %02x %02x en %02x %02x %02x after %02x %02x %02x",
              p->st[0], p->st[1], p->st[2], p->en[0], p->en[1], p->en[2],
              p->after[0], p->after[1], p->after[2]);
+        /* Who called power_off, by elimination from the core
+         * (yp3-0gn.10): ipsr 15 is the tick, which is only
+         * firmware/drivers/button.c's POWEROFF_BUTTON safety net; ipsr 0
+         * is a thread - shutdown_hw (the clean path) or power_thread's
+         * 20-second shutdown_timeout. Name the caller with nm. */
+        logf("poff caller %08lx ipsr %lu t=%ld",
+             (unsigned long)p->caller, (unsigned long)p->ipsr, (long)p->tick);
         logf("poff r00 %02x r21 %02x arm b0=%08lx b8=%08lx d0=%08lx",
              p->r00, p->r21, (unsigned long)p->arm_b0,
              (unsigned long)p->arm_b8, (unsigned long)p->arm_d0);
         pwr_log_window("pwin off", p->win);
         p->fresh = 0;
     }
+}
+
+/* The previous run's centre-key record (struct yp3_keytrace), before
+ * button_init clears it: power_init runs first (apps/main.c). */
+static void yp3_key_reasons(void)
+{
+    const struct yp3_keytrace *k = &yp3_keytrace;
+
+    if (k->magic != YP3_KEYTRACE_MAGIC) {
+        logf("key prev: none (cold SRAM)");
+        return;
+    }
+    logf("key prev: held %u downs %lu ups %lu last t=%ld",
+         k->held, (unsigned long)k->downs, (unsigned long)k->ups,
+         (long)k->last_tick);
+    logf("key prev: down t=%ld st %02x chg %u up t=%ld",
+         (long)k->down_tick, k->down_st, k->chg_down, (long)k->up_tick);
+    logf("key prev: seen %02x odd %02x t=%ld",
+         k->seen, k->odd_st, (long)k->odd_tick);
 }
 
 /* Enable the PMU's voltage measurement.
@@ -432,6 +462,7 @@ void power_init(void)
     uint8_t before = 0, after = 0;
 
     yp3_power_reasons();
+    yp3_key_reasons();
 
     if (yp3_pmu_read(PMU_REG_VOLTAGE_CONFIG, &before)
             && yp3_pmu_write(PMU_REG_VOLTAGE_CONFIG, (uint8_t)(before | 1u)))
@@ -570,6 +601,16 @@ yp3_power_down(void)
 
 void power_off(void)
 {
+    /* yp3-0gn.10: record the caller before anything else. pwr_log_begin
+     * validates the record, so these land in it. A REAL power-off loses
+     * SRAM [L], so this is read back only when the off fails or a reset
+     * comes first. */
+    uint32_t ipsr;
+    __asm__ volatile ("mrs %0, ipsr" : "=r"(ipsr));
+    yp3_pwrlog.caller = (uint32_t)__builtin_return_address(0);
+    yp3_pwrlog.ipsr = ipsr;
+    yp3_pwrlog.tick = current_tick;
+
     /* Rockbox does not blank the panel for us unless the target says it can,
      * and a device that "powers off" with the shutdown splash still lit looks
      * exactly like the hang this used to be. lcd_shutdown() is the upstream
