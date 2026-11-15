@@ -1164,10 +1164,12 @@ static void sink_init(void)
 #if YP3_AUDIO_SELFTEST
     yp3_audio_selftest();
 #endif
+    logf("sink: init done");
 }
 
 static void sink_postinit(void)
 {
+    logf("sink: postinit");
     /* Empty, and two traps worth recording for whoever fills it.
      *
      * Do NOT start playback here. pcm_postinit() sets pcm_is_ready[] only
@@ -1189,6 +1191,7 @@ static void sink_set_freq(uint16_t freq)
      * here, and the rate code in yp3_tx_enable. */
     unsigned long rate = SAMPR_44;
     (void)freq;
+    logf("sink: set_freq");
 
     if (!audio_block_up)
         yp3_audio_block_init();
@@ -1201,6 +1204,7 @@ static void sink_set_freq(uint16_t freq)
     yp3_stock_play();       /* the +0x100 file and the analogue stage, as
                              * stock does it: what actually makes sound */
     tx_running = true;
+    logf("sink: set_freq done tx=%d", (int)tx_running);
 }
 
 static void sink_lock(void)
