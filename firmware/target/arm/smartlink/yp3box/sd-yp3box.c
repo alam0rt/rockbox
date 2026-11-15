@@ -365,7 +365,9 @@
 #define SD_MULTI_MAX 8
 
 /* Boot ROM SD HAL. All of these take a handle whose first word is the base. */
-#define ROM_SD_CMD      ((void     (*)(void *, unsigned, uint32_t))0x40c5u)
+/* The two sends are reached only through the gated macros further down:
+ * both end in ROM 0x40a2, whose first act is an UNBOUNDED wait. */
+#define ROM_SD_CMD_UNGATED ((void  (*)(void *, unsigned, uint32_t))0x40c5u)
 #define ROM_SD_RESP     ((uint32_t (*)(void *, unsigned))0x4187u)
 #define ROM_SD_RESPCMD  ((uint32_t (*)(void *))0x4191u)
 #define ROM_SD_WAIT     ((uint32_t (*)(void *, unsigned))0x4bc1u)
@@ -393,7 +395,33 @@
  * what the vendor's own send wrapper at SRAM 0x823092 tail-calls once it has
  * picked a command word, and it is the way in for the two auto-stop words the
  * ROM's table (0x40c4) does not carry. */
-#define ROM_SD_SEND_RAW ((void (*)(volatile uint32_t *, const uint32_t *))0x40a3u)
+#define ROM_SD_SEND_RAW_UNGATED \
+    ((void (*)(volatile uint32_t *, const uint32_t *))0x40a3u)
+
+/* THE COMMAND GATE. ROM 0x40a2 is
+ *
+ *     40a2: ldr r3,[r1]; str r3,[r0,#8]        ARG
+ *     40a6: ldr r3,[r0,#4]; cmp r3,#0; blt 40a6   while (CMD & start) ;
+ *     40ac: ... orr #0x80000000; str r3,[r0,#4]   CMD | start
+ *
+ * and that middle line has no bound. dw_mmc clears the start bit when the
+ * card interface takes the command, and it does not take one while it still
+ * owes the previous one - so a command that is never taken turns the NEXT
+ * send into an endless loop in mask ROM. Threads are cooperative, so that is
+ * the whole player frozen on whatever was on the screen, tick alive, nothing
+ * in the log: card E6D2-8879, five boots out of five on 2026-11-15, found by
+ * the stall watch as "slot 0 pc=000040a8 lr=000040f5" under sd_read_one <-
+ * fat <- playlist_resume [L].
+ *
+ * Every send in this driver now waits for the bit itself, bounded, and skips
+ * the send when it does not clear. The bounded response wait that follows
+ * every send then fails in the ordinary way, and sd_recover() rebuilds the
+ * controller (sd_unstick) instead of sending CMD12 into the same wall. */
+static bool sd_cmd_gate(void);    /* SDICODE, defined below */
+#define ROM_SD_CMD(h, i, a) \
+    do { if (sd_cmd_gate()) ROM_SD_CMD_UNGATED((h), (i), (a)); } while (0)
+#define ROM_SD_SEND_RAW(b, c) \
+    do { if (sd_cmd_gate()) ROM_SD_SEND_RAW_UNGATED((b), (c)); } while (0)
 #define ROM_UDELAY      ((void (*)(unsigned))0xb765u)
 #define ROM_CLK_STOP    ((void (*)(unsigned))0x2a7du)
 #define ROM_CLK_DIV     ((void (*)(unsigned, unsigned))0x2d59u)
@@ -477,6 +505,32 @@ static void SDICODE sd_busywait(uint32_t n)
 }
 static void SDICODE sd_udelay(unsigned us) { sd_busywait(us * SPIN_PER_US); }
 static void SDICODE sd_mdelay(unsigned ms) { while (ms--) sd_udelay(1000); }
+
+/* See THE COMMAND GATE above. One SD_SPIN of this loop measured ~90 ms on
+ * hardware (SD_SPIN * 100 held the boot for 9 s, 2026-11-15 [L]), so * 8 is
+ * about 0.7 s: longer than any busy the SD specification allows a card (500 ms
+ * for a write on SDXC), so a healthy card never reaches the bound. */
+#define SD_CMDREG   0x004
+static bool     sd_stuck;           /* a send found the start bit set for ever */
+static uint32_t sd_stuck_regs[4];   /* CMD, STATUS, RINTSTS, CTRL at that time */
+static bool SDICODE sd_cmd_gate(void)
+{
+    uint32_t t = 0;
+
+    if (sd_stuck)
+        return false;               /* already known; do not pay a second each */
+    while (R(SD_CMDREG) & 0x80000000u) {
+        if (++t > SD_SPIN * 8u) {
+            sd_stuck_regs[0] = R(SD_CMDREG);
+            sd_stuck_regs[1] = R(SD_FIFOSTA);
+            sd_stuck_regs[2] = R(SD_STA);
+            sd_stuck_regs[3] = R(SD_CTRL);
+            sd_stuck = true;
+            return false;
+        }
+    }
+    return true;
+}
 
 /* clk_stop / set divider / settle / apply - vendor callback at SRAM 0x8223c8 */
 static void SDICODE sd_module_reset(void)
@@ -1409,6 +1463,59 @@ static bool sd_dma_ok(const void *buf)
     return sd_dma_on && a < 0x00c00000u && (a & 3u) == 0;
 }
 
+/* THE BOUNCE SECTOR. While the engine is on (CTRL use_internal_dmac, BMOD
+ * DE) the FIFO belongs to it: a PIO drain of a transfer started in that mode
+ * gets nothing, the FIFO fills, the data state machine stays busy for ever
+ * and the NEXT command is never taken. Measured 2026-11-15 [L] on card
+ * E6D2-8879: "sd: STUCK cmd=8000254d status=00208d09 rint=00001430
+ * ctrl=c2000010" - CMD13 held by wait_prvdata_complete, STATUS fifo_full and
+ * data_state_mc_busy, RINTSTS host-timeout and hardware-locked-write, CTRL
+ * with the IDMAC bit set.
+ *
+ * sd_dma_ok() used to send every buffer the engine cannot take down that PIO
+ * path. "The buffers the filesystem hands sd_read_sectors are aligned" is
+ * true of the sector cache and false of a direct read: read() of two or more
+ * whole sectors goes straight to the caller, and playlist_resume() reads
+ * .playlist_control into a buffer at an odd address. A 1393-byte control file
+ * is enough, which is why one card hung every boot and another never did.
+ *
+ * So a buffer the engine cannot take goes through this sector instead, one
+ * block at a time, and the engine does every transfer it is switched on for.
+ * .bss (never const: a DMA source in flash wedges the bus), 8-aligned like
+ * the descriptor. */
+static uint8_t sd_bounce[512] __attribute__((aligned(8)));
+static bool sd_needs_bounce(const void *buf)
+{
+    return sd_dma_on && !sd_dma_ok(buf);
+}
+
+/* Let another thread run once a request is COMPLETE (yp3-0gn.13, yp3-1so.10).
+ *
+ * The kernel is cooperative and this driver never sleeps, so a thread doing
+ * storage work - main walking a directory, reading a bitmap, loading a skin -
+ * held the CPU from its first sector to its last, and the codec, which has a
+ * quarter second of PCM in hand, went silent meanwhile: the profile's worst
+ * runs while scrolling are main in fat_readdir and read_bmp_fd [L].
+ *
+ * Yielding here is safe where yielding inside a transfer is not: the command,
+ * the data phase and the bounce copy are all finished, so nothing of this
+ * request is left in the controller or in sd_bounce/sd_desc for another
+ * thread's request to trample. The caller may hold the filesystem's locks;
+ * that is what they are for, and every other Rockbox storage driver sleeps
+ * with them held. Never from a handler (the USB MSC hook, the tick), never
+ * with interrupts masked (the panic dump), never before the scheduler runs,
+ * and not inside a controller rebuild. */
+static bool sd_unsticking;
+static void sd_breathe(void)
+{
+    uint32_t ipsr, primask;
+
+    __asm__ volatile ("mrs %0, ipsr" : "=r"(ipsr));
+    __asm__ volatile ("mrs %0, primask" : "=r"(primask));
+    if (ipsr == 0 && primask == 0 && current_tick > HZ && !sd_unsticking)
+        yield();
+}
+
 /* SRAM 0x816124, the <= 8 block form exactly. */
 static void SDICODE sd_desc_build(const void *buf, uint32_t nblocks)
 {
@@ -1548,8 +1655,15 @@ static uint32_t SDICODE sd_wait_dataend(void)
  * ready again. Both results are ignored deliberately - this is a best-effort
  * cleanup on a path that has already failed, and the caller's retry is what
  * decides the outcome. */
+static void sd_unstick(void);
 static void SDICODE sd_recover(void)
 {
+    if (sd_stuck) {
+        /* The controller is not taking commands at all, so a CMD12 cannot
+         * reach the card either. Rebuild it from the module reset up. */
+        sd_unstick();
+        return;
+    }
     R(SD_STA) = STA_ALLFLAGS;
     ROM_SD_CMD(&sdh, 12, 0);                 /* STOP_TRANSMISSION */
     (void)sd_wait_data(12);
@@ -1658,8 +1772,10 @@ int SDICODE sd_read_sectors(IF_MD(int drive,)
     while (count > 0) {
         uint32_t err;
         int n = 1;
+        bool bounce = sd_needs_bounce(p);
+        uint8_t *dst = bounce ? sd_bounce : p;
 
-        if (sd_multi && count > 1) {
+        if (!bounce && sd_multi && count > 1) {
             n = (count > SD_MULTI_MAX) ? SD_MULTI_MAX : count;
             err = sd_read_multi(start, n, p);
             if (err) {
@@ -1680,7 +1796,7 @@ int SDICODE sd_read_sectors(IF_MD(int drive,)
             int try;
 
             for (try = 0; ; try++) {
-                err = sd_read_one(start, p);
+                err = sd_read_one(start, dst);
                 if (!err)
                     break;
                 sd_recover();
@@ -1693,12 +1809,49 @@ int SDICODE sd_read_sectors(IF_MD(int drive,)
                 logf("sd: read lba=%lu ok after %d retries",
                      (unsigned long)start, try);
         }
+        if (bounce) {
+            unsigned i;
+            for (i = 0; i < 512u; i++)
+                p[i] = sd_bounce[i];
+        }
 
         p     += (uint32_t)n * 512u;
         start += n;
         count -= n;
     }
+    sd_breathe();
     return 0;
+}
+
+/* The way out of a stuck command gate: the whole of sd_init again, which is a
+ * module reset, CMD0, identification and the ladder - the same thing the USB
+ * eject path already runs on every disconnect. Flash code, deliberately: it is
+ * a path that has already lost seconds. Three per boot, then the card is
+ * reported gone, so a controller that will not come back fails every request
+ * at once instead of costing a second each for ever.
+ *
+ * STATUS (+0x48) bit 9 is data_busy - the card holding DAT0 low - and bit 10
+ * is the data state machine; the log line is there so the next reader knows
+ * which of the two held the command. */
+static void sd_unstick(void)
+{
+    static uint8_t n;
+
+    if (sd_unsticking)
+        return;
+    logf("sd: STUCK cmd=%08lx status=%08lx rint=%08lx ctrl=%08lx",
+         (unsigned long)sd_stuck_regs[0], (unsigned long)sd_stuck_regs[1],
+         (unsigned long)sd_stuck_regs[2], (unsigned long)sd_stuck_regs[3]);
+    sd_stuck = false;
+    if (++n > 3) {
+        logf("sd: stuck %u times - reporting the card gone", (unsigned)n);
+        sd_ok = false;
+        return;
+    }
+    sd_unsticking = true;
+    sd_init();
+    sd_unsticking = false;
+    logf("sd: re-init #%u after a stuck command: ok=%d", (unsigned)n, (int)sd_ok);
 }
 
 /* Wait for the card to finish PROGRAMMING the block it was just given.
@@ -1860,11 +2013,21 @@ int SDICODE sd_write_sectors(IF_MD(int drive,)
         uint32_t err;
         int n = 1;
 
+        bool bounce = sd_needs_bounce(p);
+        const uint8_t *src = p;
+
+        if (bounce) {
+            unsigned i;
+            for (i = 0; i < 512u; i++)
+                sd_bounce[i] = p[i];
+            src = sd_bounce;
+        }
+
         /* The card may still be committing the previous block. */
         if (sd_wait_ready() != 0)
             return -4;
 
-        if (sd_multi && count > 1) {
+        if (!bounce && sd_multi && count > 1) {
             n = (count > SD_MULTI_MAX) ? SD_MULTI_MAX : count;
             err = sd_write_multi(start, n, p);
             if (err) {
@@ -1881,7 +2044,7 @@ int SDICODE sd_write_sectors(IF_MD(int drive,)
              * write that fails reaches dc_writeback_callback, which panics
              * with "Could not write sector". */
             for (try = 0; ; try++) {
-                err = sd_write_one(start, p);
+                err = sd_write_one(start, src);
                 if (!err)
                     break;
                 sd_recover();
@@ -1904,5 +2067,6 @@ int SDICODE sd_write_sectors(IF_MD(int drive,)
     if (sd_wait_ready() != 0)
         return -5;
 
+    sd_breathe();
     return 0;
 }
