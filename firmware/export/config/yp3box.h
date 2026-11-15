@@ -131,6 +131,19 @@
  * leaves room for a launcher stub; raise it again in the same commit that
  * makes plugins build.
  *
+ * Do not shrink it further on the grounds that no plugins are built: this is
+ * also the skin engine's buffer. skin_data_load() parses every .wps and .sbs
+ * out of plugin_get_buffer() (apps/gui/skin_engine/skin_parser.c), and a parse
+ * that does not fit leaves that screen blank - the WPS area empty while the
+ * inbuilt statusbar still draws, because that one is a 40-byte generated skin.
+ * Measured 2026-11-15 with checkwps (tools/checkwps, this target's config):
+ * the card's cabbiev2.wps needs 22,296 bytes of parse tree after its 1,415-byte
+ * source, and the built-in failsafe WPS 5,784. Both numbers are upper bounds -
+ * checkwps builds as a host program, where OFFSETTYPE is a pointer, and on the
+ * target it is a 4-byte long, so expect about 0.65x. 0x800 fails on both;
+ * 0x2000 runs the failsafe with room to spare. cabbiev2 has never fitted a
+ * buffer this port can afford and always falls back.
+ *
  * CODEC_SIZE. A codec's .bss is sized by this and a codec that overflows fails
  * to LINK, so the number is a real gate, not a hint. Measured need, from the
  * built .elf files (bss end minus codecbuf):
@@ -148,20 +161,17 @@
  * btpack.py, docs/BLUETOOTH.md); app.lds leaves a 54.5 KB hole in SRAM for it
  * and bt-yp3box.c is the Rockbox side. NOT YET RUN ON HARDWARE (2026-11-15).
  *
- * The hole comes straight out of the audio arena, so this branch also gives
- * back what it can: no plugins are built, so the plugin buffer shrinks to a
- * stub. The vendor's strings sit where two codec slots are, so those two are
- * built and refused rather than packed. Four more kernel threads: the
- * monitor, the host, btc and the interrupt bottom half. */
+ * The hole comes straight out of the audio arena. It is not bought back from
+ * the plugin buffer: that is the skin engine's buffer too, and halving it to a
+ * stub is what left the playback screen blank (see PLUGIN_BUFFER_SIZE above).
+ * The vendor's strings sit where two codec slots are, so those two are built
+ * and refused rather than packed. Four more kernel threads: the monitor, the
+ * host, btc and the interrupt bottom half. */
 #define YP3_BT_BLOB 1
 #define YP3_NOPACK_CODECS "a52_rm atrac3_oma"
 #define TARGET_EXTRA_THREADS 4
 
-#ifdef YP3_BT_BLOB
-#define PLUGIN_BUFFER_SIZE  0x800
-#else
 #define PLUGIN_BUFFER_SIZE  0x2000
-#endif
 
 /* Codec slots in flash, COPIED TO SRAM AT LOAD. Each codec's whole image is
  * linked into a per-codec slot in SPI NOR; lc_open() memcpys it into codecbuf
@@ -184,10 +194,11 @@
  * lc-yp3box.c: it owns lc_open(), so nothing in apps/ or lib/rbcodec knows
  * this target keeps codecs in flash.
  *
- * This is the default for this target. Known open issue: codecs linked into
- * flash slots load and enter, and the device has been seen to hard-hang inside
- * the codec entry point. The black box is the instrument for that; see
- * docs/ROADMAP.md. The two defines below turn on together. */
+ * The guard's name is historical: HAVE_CODEC_XIP here selects codecs delivered
+ * in flash slots and copied to SRAM, not executed in place. Renaming this
+ * shared guard also requires updating config.h and this linker script. The old
+ * warning referred to the abandoned XIP layout; MP3 has played through the
+ * copied path since 2026-09-29 [L]. Both defines below turn on together. */
 #define HAVE_CODEC_XIP
 
 /* lc-yp3box.c provides lc_open(); the stock card loader in lc-rock.c is still

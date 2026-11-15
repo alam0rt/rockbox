@@ -136,16 +136,10 @@ OUTPUT_FORMAT(elf32-littlemips)
 #define DRAMORIG 0x00806000
 #define DRAMSIZE (512 * 1024) - 0x6000 - PLUGIN_BUFFER_SIZE - CODEC_SIZE
 
-/* Codec text and rodata execute in place from SPI NOR, so codecbuf only has to
- * hold what is actually writable - .data and .bss.
- *
- * codecbuf is a fixed cut off the top of a 512 KB SRAM and is sized by the
- * WORST codec, so read-only bytes sitting in it are pure loss: mpa is 105,784
- * bytes of which 24,032 is .text and 43,464 .rodata, and rq_table - libmad's
- * x^(4/3) requantisation lookup - is 32,828 on its own. The application has
- * always run this way (app.lds sends .text and .rodata to FLASH); codecs did
- * not, only because this script declared a single region and there was
- * nowhere else to put them.
+/* Codec images are linked into flash slots for delivery, but execution is from
+ * codecbuf: lc-yp3box.c copies the complete image (text, rodata, data and bss)
+ * into SRAM before calling it. CODEC_SIZE must reserve room for the largest
+ * complete codec image.
  *
  * Each codec is linked at its own slot in the flash region above the
  * application image. The slot base arrives as a link-time symbol so one
