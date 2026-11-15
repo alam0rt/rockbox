@@ -55,7 +55,10 @@
  * garbage. A changed magic forces a clean cold init instead, costing exactly
  * one log - the one spanning the change, which is never the interesting one. */
 /* 0x...44 -> 0x...45: yp3_usblog (64 bytes) went in ahead of the logf ring. */
-#define BLACKBOX_MAGIC      0x59503345u
+/* 0x...45 -> 0x...46: yp3_flashlog 16 -> 32 bytes for the flash clock
+ * (yp3-0gn.14), which moves the ring by another 16. Without this bump a boot
+ * that spans the change reads the previous ring at the new offset. */
+#define BLACKBOX_MAGIC      0x59503346u
 /* Stop a fault that reproduces immediately from rebooting for ever. */
 #define BLACKBOX_MAX_FAULTS 3
 
