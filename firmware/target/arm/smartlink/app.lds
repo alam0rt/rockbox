@@ -142,7 +142,8 @@ SECTIONS
         yp3_blackbox = .;
         . += 192;                       /* struct yp3_blackbox */
         yp3_flashlog = .;
-        . += 16;                        /* quad switch stages, see system-yp3box.c */
+        . += 32;                        /* quad switch and flash clock stages,
+                                           see system-yp3box.c */
         yp3_usblog = .;
         . += 64;                        /* USB MSC stage words, see usb-yp3box.c */
         *logf.o(.bss* COMMON);

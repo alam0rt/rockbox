@@ -82,7 +82,7 @@ static uint32_t yp3_flash_ref[FLASH_REF_WORDS];
 #define XIP_CMD_1BIT    0x02a09503u
 #define XIP_CMD_QUAD    0x02a6bdebu
 
-extern volatile uint32_t yp3_flashlog[4];   /* app.lds, in .persist */
+extern volatile uint32_t yp3_flashlog[8];   /* app.lds, in .persist */
 
 #if YP3_FLASH_QUAD
 static int __attribute__((section(".icode"), noinline)) yp3_flash_quad(void)
@@ -238,6 +238,133 @@ yp3_flash_clock_ladder(void)
     yp3_flash_div = 12u;
 }
 
+/* --- the vendor's flash clock ----------------------------------------------
+ *
+ * STOCK RUNS THIS FLASH AT 64 MHz, AND THIS PORT AT 32. All [C], every address
+ * checked with objdump:
+ *
+ *   FIRM 0xc0ea48  builds the boot config {05, 02, 02, ...} and 0xc0eb84
+ *                  reorders its first three bytes into the flash config
+ *                  {speed 2, mode 2 (quad), window 5} for 0xc0f080 -> 0xc0ef4c
+ *   FIRM 0xc0ef4c  speed -> rate through the table at 0xc0f05c/0xc0f070:
+ *                  0 32 MHz, 1 48, 2 64, 3 96, 4 128; divider =
+ *                  get_clock_freq(2) / rate = 384 / 64 = 6; then ROM 0x8294
+ *                  with {div, mode, ..., window << 4, ..., 0x100}
+ *   ROM 0x8294     control word = 0x41 when the byte at +0x25 is set (FIRM's
+ *                  0x100; the bootloader passes 0 and gets 0x01), then
+ *   ROM 0x7ff8     cpsid; clk_stop(0x2b) 0x2a7c; clk_set_divider(0x2b, div)
+ *                  0x2d58; clk_start(0x2b) 0x27a0; cpsie; +0x00 = control;
+ *                  +0x20 = read word | 1<<25; 0x30000204 |= 0x100; +0x24 =
+ *                  the window field
+ *
+ * and the same numbers sit in dumps/sram_live.bin, taken from this unit while
+ * stock ran: the ROM's flash context at 0x800938 has control 0x41 at +0x04,
+ * mode 2 at +0x20 and DIVIDER 6 at +0x2c, and FIRM's own copy at 0x81e56c
+ * starts with 6. The vendor BOOTLOADER asks for 32 MHz (0x820914 with config
+ * bytes 0, 0), which is the number this port copied.
+ *
+ * Every instruction outside .icode comes over this link, so this is a factor
+ * of two on the UI, the tick tasks and anything else not yet in SRAM - which
+ * is what silences playback while a menu redraws (yp3-0gn.13).
+ *
+ * YP3_FLASH_DIV picks the divider; 12 is what has always booted and compiles
+ * none of this. Anything else is applied AFTER the quad switch, in the
+ * vendor's own order, with control bit 6 as FIRM has it, verified by content
+ * and backed out on a mismatch. NOT YET RUN ON HARDWARE.
+ *
+ * A clock the part cannot take may not return garbage; it may wedge the
+ * fetch, and then nothing comes back to be compared (the ladder below found
+ * that out). So the attempt is written into .persist BEFORE it is made. A
+ * boot that dies in here leaves FDIV_TRY behind, the next reset sees it, marks
+ * the divider FDIV_DEAD and stays at 12 - one press of the pinhole, no
+ * reflash - until a power-off clears SRAM. yp3_flashlog[4..7]: state, the old
+ * control word, the rate the ROM reports afterwards, mismatches counted. */
+#ifndef YP3_FLASH_DIV
+#define YP3_FLASH_DIV 12
+#endif
+#define FDIV_TRY    (0xf1a50000u | (YP3_FLASH_DIV))    /* attempt in progress */
+#define FDIV_OK     (0xf1a60000u | (YP3_FLASH_DIV))    /* verified, in use    */
+#define FDIV_BAD    (0xf1a70000u | (YP3_FLASH_DIV))    /* read back wrong     */
+#define FDIV_DEAD   (0xf1a80000u | (YP3_FLASH_DIV))    /* never returned      */
+#define FDIV_SUM_BASE   0x00c0e000u     /* the start of this image */
+#define FDIV_SUM_WORDS  8192u           /* 32 KB */
+
+#if YP3_FLASH_DIV != 12
+static uint32_t __attribute__((section(".icode"), noinline)) yp3_flash_sum(void)
+{
+    const volatile uint32_t *p = (const volatile uint32_t *)FDIV_SUM_BASE;
+    uint32_t s = 0;
+    unsigned i;
+
+    for (i = 0; i < FDIV_SUM_WORDS; i++)
+        s = ((s << 1) | (s >> 31)) ^ p[i];
+    return s;
+}
+
+/* ROM 0x7ff8's clock half, in its order. */
+static void __attribute__((section(".icode"), noinline))
+yp3_flash_vendor_div(unsigned div)
+{
+    volatile uint32_t d;
+
+    ROM_2A7C(NORF_CLOCK);
+    ROM_CLK_DIV2(NORF_CLOCK, div);
+    ROM_CLK_APPLY2(NORF_CLOCK);
+    for (d = 0; d < 20000u; d++) ;
+    __asm__ volatile ("dsb\n isb" ::: "memory");
+}
+
+static void __attribute__((section(".icode"), noinline)) yp3_flash_fast(void)
+{
+    const volatile uint32_t *p = (const volatile uint32_t *)0x00c10000u;
+    uint32_t prev = yp3_flashlog[4], ctl, sum, primask, bad = 0;
+    unsigned i, pass;
+
+    if (prev == FDIV_TRY || prev == FDIV_DEAD) {
+        yp3_flashlog[4] = FDIV_DEAD;
+        return;
+    }
+
+    __asm__ volatile ("mrs %0, primask\n cpsid i" : "=r"(primask) :: "memory");
+    ctl = XIPC(0x00);
+    for (i = 0; i < FLASH_REF_WORDS; i++)       /* at the divider that works */
+        yp3_flash_ref[i] = p[i];
+    sum = yp3_flash_sum();
+
+    yp3_flashlog[5] = ctl;
+    yp3_flashlog[6] = 0;
+    yp3_flashlog[7] = 0;
+    yp3_flashlog[4] = FDIV_TRY;                 /* before, not after */
+
+    yp3_flash_vendor_div(YP3_FLASH_DIV);
+    XIPC(0x00) = ctl | 0x40u;                   /* FIRM's 0x41, ROM 0x82c8 */
+    __asm__ volatile ("dsb\n isb" ::: "memory");
+
+    for (pass = 0; pass < 8u; pass++)
+        for (i = 0; i < FLASH_REF_WORDS; i++)
+            if (p[i] != yp3_flash_ref[i])
+                bad++;
+    for (pass = 0; pass < 4u; pass++)
+        if (yp3_flash_sum() != sum)
+            bad += 0x10000u;
+
+    if (bad) {
+        XIPC(0x00) = ctl;
+        yp3_flash_vendor_div(12u);
+        yp3_flashlog[7] = bad;
+        yp3_flashlog[6] = ROM_CLK_FREQ(NORF_CLOCK);
+        yp3_flashlog[4] = FDIV_BAD;
+    } else {
+        FLASH_CTX(0x2c) = YP3_FLASH_DIV;        /* what the ROM's own flash  */
+        FLASH_CTX(0x04) = ctl | 0x40u;          /* context holds under stock */
+        yp3_flash_div = YP3_FLASH_DIV;
+        yp3_flashlog[6] = ROM_CLK_FREQ(NORF_CLOCK);
+        yp3_flashlog[4] = FDIV_OK;
+    }
+    __asm__ volatile ("msr primask, %0" :: "r"(primask) : "memory");
+}
+#endif /* YP3_FLASH_DIV != 12 */
+
 static void __attribute__((section(".icode"), noinline)) yp3_clock_init(void)
 {
     volatile uint32_t d;
@@ -299,6 +426,9 @@ static void __attribute__((section(".icode"), noinline)) yp3_clock_init(void)
 #endif
 #if YP3_FLASH_QUAD
     yp3_flash_quad();
+#endif
+#if YP3_FLASH_DIV != 12
+    yp3_flash_fast();           /* after quad: the vendor's operating point */
 #endif
 
     /* The clock tree is now configured for the 192 MHz core clock used by
@@ -402,6 +532,14 @@ static void yp3_measure_speed(void)
              (unsigned long)ROM_CLK_FREQ(ids[i]));
     logf("flash: divider %lu held (12 = the 32 MHz floor)",
          (unsigned long)yp3_flash_div);
+#if YP3_FLASH_DIV != 12
+    /* f1a6 = verified and in use, f1a7 = read back wrong and backed out,
+     * f1a8 = a previous boot never came back from it, so not tried again. */
+    logf("flash: wanted div %u: state %08lx ctl %08lx -> %08lx norf %lu Hz bad %08lx",
+         (unsigned)YP3_FLASH_DIV, (unsigned long)yp3_flashlog[4],
+         (unsigned long)yp3_flashlog[5], (unsigned long)XIPC(0x00),
+         (unsigned long)yp3_flashlog[6], (unsigned long)yp3_flashlog[7]);
+#endif
     logf("flash: read cmd %08lx (%s) gpio0 %08lx, quad stage %08lx ok=%lu",
          (unsigned long)XIPC(0x20),
          XIPC(0x20) == XIP_CMD_QUAD ? "quad" :
