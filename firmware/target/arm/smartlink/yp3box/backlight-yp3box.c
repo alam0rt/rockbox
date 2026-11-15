@@ -67,6 +67,7 @@
 #include "kernel.h"
 #include "button.h"
 #include "power.h"
+#include "lcd.h"
 #ifdef ROCKBOX_HAS_LOGF
 #define LOGF_ENABLE
 #endif
@@ -213,6 +214,7 @@ void backlight_hw_on(void)
     static unsigned ons;
 
     bl_note("on", &ons, __builtin_return_address(0));
+    lcd_enable(true);                   /* panel up before the light */
     bl_on = true;
     if (bl_pwm_ok && bl_pwm_set_duty(bl_duty(bl_level))) {
         ROM_GPIO_CFG1(PWM3_OUT_PIN);    /* duty first, then hand it the pad */
@@ -232,6 +234,7 @@ void backlight_hw_off(void)
     ROM_GPIO_CFG1(BL_PIN_OFF);
     if (bl_pwm_ok)
         bl_pwm_set_duty(0);
+    lcd_enable(false);                  /* dark first, then the panel */
 }
 
 void backlight_hw_brightness(int level)
@@ -272,6 +275,9 @@ void backlight_hw_on(void)
     static unsigned ons;
 
     bl_note("on", &ons, __builtin_return_address(0));
+    /* Panel up before the light, dark before the panel sleeps (yp3-1so.6).
+     * lcd_enable() does nothing unless the build has YP3_LCD_SLEEP. */
+    lcd_enable(true);
     ROM_GPIO_CFG1(BL_PIN_ON);
 }
 
@@ -281,6 +287,7 @@ void backlight_hw_off(void)
 
     bl_note("off", &offs, __builtin_return_address(0));
     ROM_GPIO_CFG1(BL_PIN_OFF);
+    lcd_enable(false);
 }
 
 void backlight_hw_brightness(int level)

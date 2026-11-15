@@ -531,6 +531,7 @@ static int decode_frame(FLACContext *s,
 static int flac_downmix(FLACContext *s) ICODE_ATTR_FLAC;
 static int flac_downmix(FLACContext *s)
 {
+#if MAX_CHANNELS > 2    /* FLAC_STEREO_ONLY has no decoded[2..6] to mix */
     int32_t *FL, *FR, *FC, *SB, *RL, *RR, *RC;
     int32_t *outL = s->decoded[0];
     int32_t *outR = s->decoded[1];
@@ -623,6 +624,10 @@ static int flac_downmix(FLACContext *s)
             break;
     }
     return 0;
+#else
+    (void)s;
+    return -501;
+#endif /* MAX_CHANNELS > 2 */
 }
 
 int flac_decode_frame(FLACContext *s,

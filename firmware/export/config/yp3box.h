@@ -38,6 +38,13 @@
 #define DEFAULT_BRIGHTNESS_SETTING  6
 /* the panel can be blanked before power-off; see lcd_shutdown() */
 #define HAVE_LCD_SHUTDOWN
+/* lcd_enable()/lcd_active(), so the UI stops rendering into a dark panel
+ * (yp3-1so.6). Defined unconditionally, like the brightness setting above:
+ * the panel only really sleeps in a YP3_LCD_SLEEP build (lcd-yp3box.c), and
+ * without that flag lcd_enable() is empty and lcd_active() is always true -
+ * the behaviour before this was defined. Not HAVE_LCD_SLEEP: one sleep state
+ * is all the GC9106 sequence here has. */
+#define HAVE_LCD_ENABLE
 
 #define CONFIG_KEYPAD       YP3BOX_PAD
 
@@ -189,6 +196,30 @@
  * this board streams from SD by design. A 148 KB arena is still far more than
  * the hardware was built around. */
 #define CODEC_SIZE          0x1b000
+
+/* FLAC, in the same 0x1b000 (yp3-1so.13, yp3-7fx). Unmodified it needs
+ * 196,352 bytes of codec buffer - 189 KB of that is .bss: seven 18,432-byte
+ * channel buffers and a 60,000-byte seek table - and it asks the file buffer
+ * for 65,552 contiguous bytes per frame, which bufgetdata() waits for in
+ * full. The compressed ring here is ~37 KB, so that read never returned
+ * (docs/CODEC-MEMORY.md). Two knobs in lib/rbcodec, both inert unless
+ * defined (shared-core ledger, CLAUDE.md):
+ *
+ *   FLAC_STEREO_ONLY        two channel buffers instead of seven: the codec
+ *                           links at ~104 KB, under mpa's 105,840. A file
+ *                           with more than two channels is refused at init.
+ *   FLAC_INPUT_REQUEST_MAX  per-frame read = what a frame of this stream can
+ *                           need, capped here. 0x7000 holds the worst frame
+ *                           of anything this decoder accepts in stereo:
+ *                           4608 samples x (24 + 25 bits) / 8 = 28,224 + 64.
+ *                           CD audio at blocksize 4096 asks for 17,472.
+ *
+ * FLAC sits in the 0x48000 group of lib/rbcodec/codecs/SOURCES, so
+ * tools/40_build.sh builds it from YP3_EXTRA_CODECS; its flash slot is in
+ * tools/codec_slots.txt. NOT YET RUN ON HARDWARE. */
+#define FLAC_STEREO_ONLY
+#define FLAC_INPUT_REQUEST_MAX  0x7000
+#define YP3_EXTRA_CODECS    "flac"
 
 /* The tree cache is allocated before playback. The generic 1,000-entry default
  * consumes 52 KiB (40-byte names plus 12-byte entries) from the small core

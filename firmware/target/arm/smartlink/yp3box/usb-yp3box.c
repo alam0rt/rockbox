@@ -57,10 +57,25 @@
 #ifndef YP3_USB_WRITE_FIX
 #define YP3_USB_WRITE_FIX 1
 #endif
+/* YP3_USB_WRITE_DMA=1 receives WRITE(10) data with the MUSB DMA, a run at a
+ * time, instead of the ROM's one-64-byte-packet pump. See usb_msc_dma_cb. */
+#ifndef YP3_USB_WRITE_DMA
+#define YP3_USB_WRITE_DMA 1
+#endif
 #ifdef ROCKBOX_HAS_LOGF
 #define LOGF_ENABLE
 #endif
 #include "logf.h"
+
+/* The mass-storage hook runs once per 64-byte packet on a write and once per
+ * sector on a read, inside the USB interrupt. From flash that cost 148 us a
+ * packet on top of the SD time (2026-11-15 [L]: 357 us in the hook per
+ * data-out packet, 209 of it the amortised SD write) - every instruction
+ * fetched from flash is its own SPI transaction. So the hot path lives in
+ * SRAM, like every other per-transfer path on this port: 228 us a packet
+ * afterwards, and a 2 MB write went from 32 s to 11.8 s [L]. It costs about
+ * 960 bytes of SRAM. */
+#define USBHOT __attribute__((section(".icode"), noinline))
 
 /* --- the ROM's mass-storage state block -----------------------------------
  *
@@ -307,7 +322,7 @@ static int usb_msc_capacity(uint32_t *block_count, uint32_t *block_size)
 }
 
 /* +0x08, medium present and ready. Non-zero is ready (ROM 0x5cee, 0x5fa6). */
-static int usb_msc_ready(void)
+static USBHOT int usb_msc_ready(void)
 {
     tCardInfo *card = card_get_info_target(0);
 
@@ -316,11 +331,12 @@ static int usb_msc_ready(void)
 
 /* +0x0c, write protect. 1 means protected: ROM 0x5fb0 turns that into sense
  * 0x27, WRITE PROTECTED. */
-static int usb_msc_write_protected(void)
+static USBHOT int usb_msc_write_protected(void)
 {
-    /* A rig-USB build exposes the card read-only as well: the write half is
-     * the riskier one (docs/USB.md, "What is still unverified"). */
-    return (YP3_RIG_USB || !YP3_USB_WRITABLE) ? 1 : 0;
+    /* A rig-USB build is read-only by the same switch as any other: it used
+     * to be forced read-only, until writes were proven on 2026-11-15 and the
+     * rig became the way to change the card without moving it. */
+    return YP3_USB_WRITABLE ? 0 : 1;
 }
 
 /* The ROM's MODE SENSE never reports write protection: 0x1a at ROM 0x59e4
@@ -330,7 +346,7 @@ static int usb_msc_write_protected(void)
  * the ROM does, same lengths and layout, with WP set: byte 2 bit 7 of the
  * 6-byte form's header, byte 3 bit 7 of the 10-byte form's. Returns 1 when
  * handled, which the dispatcher at ROM 0x6328 takes as "done". */
-static int usb_msc_mode_sense_wp(unsigned opcode)
+static USBHOT int usb_msc_mode_sense_wp(unsigned opcode)
 {
     uint8_t *b = (uint8_t *)MSC_BUF;
     unsigned i;
@@ -417,7 +433,7 @@ static long msc_t0;
  * at ROM 0x5ce4, out of range is sense 5/21 at 0x5ca6 - without ever reaching
  * the ramp, which is downstream of both checks. The vendor's hook delegates
  * the not-ready case the same way (SRAM 0x813404). */
-static bool usb_msc_begin(void)
+static USBHOT bool usb_msc_begin(void)
 {
     const uint8_t *cdb = MSC_CDB;
     tCardInfo *card = card_get_info_target(0);
@@ -442,65 +458,290 @@ static bool usb_msc_begin(void)
     return true;
 }
 
-/* One 512-byte chunk per call, which is what the ROM's pump does and what the
- * single staging buffer allows.
+/* The read path is a per-chunk state machine. usb_msc_hook only calls
+ * usb_msc_begin() when the state is IDLE and otherwise falls straight through
+ * to usb_msc_read_chunk, so a re-dispatch that arrives with the command
+ * already finished must find "nothing left" and send the CSW - a counter
+ * decremented past zero there once streamed sectors for ever, which was the
+ * `cat` that never returned.
  *
- * The guard is not paranoia. usb_msc_hook only calls usb_msc_begin() when the
- * state is IDLE and otherwise falls straight through to here, so any
- * re-dispatch that arrives with the command already finished would decrement
- * zero to 0xffffffff. The state would then never reach MSC_ST_LAST, the CSW
- * would never be sent, and this would stream sectors for ever - a transfer
- * the host waits on indefinitely, which is precisely the `cat` that never
- * returned. Finish the command instead and let the ROM send the CSW. */
-static void usb_msc_read_chunk(void)
+ * The send does not copy: 0x4e1c -> 0x53b8 points the MUSB DMA at the buffer
+ * (TXCSR |= 0x9400, AUTOSET | DMAReqMode | DMAReqEnab), so the bytes leave
+ * memory packet by packet and a buffer may not be touched until its
+ * completion has really arrived. Two buffers alternated WITHOUT the
+ * early-completion test hid a corrupted last packet for 13 clean 8 MB reads
+ * [L] and then a read hung, because the channel was re-armed under a running
+ * transfer. */
+
+/* What the MUSB DMA channel looks like each time the data-in completion
+ * re-enters the hook (yp3-0gn read corruption / read hang, 2026-11-15).
+ * Channel 1: INTR 0x40040200, CNTL +0x204, ADDR +0x208, COUNT +0x20c (ROM
+ * 0x53b8 literals 0x5460/0x5464, IRQ 42 handler 0x54e4). The first
+ * continuation's values are kept as the reference; any later entry that
+ * differs is counted in `odd` with its values, so "the completion came
+ * before the channel had finished" is a number. `stall_*` is filled from
+ * thread context (usb_detect) when a read chunk has been out for 3 s with no
+ * completion. Plain .bss, read post-mortem by nm address: .bss survives the
+ * reset. Not static, so the symbol is easy to find.
+ *
+ * Logf builds only: tools/usbdma_read.py reads it, and a daily build pays
+ * nothing for it. The early-completion test itself is not part of this. */
+#ifdef ROCKBOX_HAS_LOGF
+#define YP3_USB_STATS 1
+#else
+#define YP3_USB_STATS 0
+#endif
+
+#define USB_DMA_CNTL        REG16(0x40040204)
+#define USB_DMA_ADDR        REG32(0x40040208)
+#define USB_DMA_COUNT       REG32(0x4004020c)
+#define USB_TXCSR_IDX       REG16(0x40040012)
+#define USB_INDEX           REG8(0x4004000e)
+
+/* A chunk has been handed to ROM_MSC_SEND and its completion not yet taken. */
+static bool msc_rd_inflight;
+
+#if YP3_USB_STATS
+struct yp3_usbdma {
+    uint32_t n, odd;
+    uint32_t ref_cntl, ref_adv, ref_count, ref_txcsr;
+    uint32_t odd_cntl, odd_adv, odd_count, odd_txcsr, odd_lba;
+    uint32_t last_cntl, last_adv, last_count, last_txcsr;
+    uint32_t stalls, stall_cntl, stall_addr, stall_count, stall_txcsr,
+             stall_state, stall_tick, stall_buf;
+    uint32_t early;         /* completions refused: the channel was not done */
+    uint32_t fifo_busy;     /* channel done, but a packet still in the FIFO */
+    /* SD time per sector as the USB path sees it, in SysTick counts / 256
+     * (the tick's reload is one 10 ms period, so a call longer than that
+     * reads short; max says whether any came close). Where a USB transfer's
+     * time goes is otherwise an argument, not a number. */
+    uint32_t rd_n, rd_cyc, rd_max, wr_n, wr_cyc, wr_max, syst_rvr;
+    uint32_t wr_polls;      /* busy polls the SD driver made during writes */
+    /* A data-out packet's cost, split: time inside the hook, and the gap
+     * from leaving the hook to being entered for the next packet (the ROM,
+     * the bus and the host). SysTick counts / 256, as above. */
+    uint32_t pk_n, pk_in, pk_gap, pk_gap_max;
+    /* DMA receive: runs completed, completions that were not one (channel
+     * still enabled or bytes left), hook entries during a DMA write, the
+     * longest wait for the next packet in spins, waits that gave up. */
+    uint32_t wd_n, wd_odd, wd_spur, wd_wait_max, wd_wait_to;
+    uint32_t wd_odd_cntl, wd_odd_count, wd_odd_rxcsr;
+} yp3_usbdma;
+static void *msc_rd_prev;
+static unsigned msc_rd_sent;        /* bytes in the run on the wire */
+#define USBSTAT(x)          do { x; } while (0)
+/* Time a region: USBSTAT_T0 before it, USBSTAT_T1 after, adding to the
+ * struct's <f>_n, <f>_cyc and <f>_max. */
+#define USBSTAT_T0(t)       uint32_t t = usb_syst()
+#define USBSTAT_T1(t, f)    do { uint32_t dt_ = usb_syst_since(t);          \
+                                 yp3_usbdma.f##_n++;                       \
+                                 yp3_usbdma.f##_cyc += dt_ >> 8;           \
+                                 if (dt_ > yp3_usbdma.f##_max)             \
+                                     yp3_usbdma.f##_max = dt_;             \
+                                 yp3_usbdma.syst_rvr =                     \
+                                     REG32(0xE000E014) & 0xffffffu; } while (0)
+
+static inline uint32_t usb_syst(void) { return REG32(0xE000E018) & 0xffffffu; }
+static inline uint32_t usb_syst_since(uint32_t t0)
 {
-    if (msc_blocks_left == 0) {
-        msc_runaways++;
-        MSC_STATE = MSC_ST_LAST;
-        return;
+    uint32_t t1 = usb_syst(), rvr = REG32(0xE000E014) & 0xffffffu;
+    return (t0 >= t1) ? t0 - t1 : t0 + rvr + 1 - t1;   /* it counts DOWN */
+}
+
+static USBHOT void usb_dma_note(void)
+{
+    struct yp3_usbdma *d = &yp3_usbdma;
+    uint32_t cntl = USB_DMA_CNTL, adv = USB_DMA_ADDR - (uint32_t)msc_rd_prev,
+             count = USB_DMA_COUNT, txcsr = USB_TXCSR_IDX;
+
+    d->last_cntl = cntl; d->last_adv = adv;
+    d->last_count = count; d->last_txcsr = txcsr;
+    if (d->n++ == 0) {
+        d->ref_cntl = cntl; d->ref_adv = adv;
+        d->ref_count = count; d->ref_txcsr = txcsr;
     }
+    /* Measured 2026-11-15 [L], 3,500 completions: the normal picture is
+     * cntl 021e (enable clear), address advanced 512, count 0, TXCSR 9404
+     * (TxPktRdy and FIFONotEmpty both clear - everything already sent).
+     * Anything else is the event being hunted. */
+    if ((cntl & 1) || adv != msc_rd_sent || count != 0 || (txcsr & 3)) {
+        d->odd++;
+        d->odd_cntl = cntl; d->odd_adv = adv;
+        d->odd_count = count; d->odd_txcsr = txcsr;
+        d->odd_lba = msc_lba;
+    }
+}
+#else
+#define USBSTAT(x)          do { } while (0)
+#define USBSTAT_T0(t)       do { } while (0)
+#define USBSTAT_T1(t, f)    do { } while (0)
+#endif /* YP3_USB_STATS */
+
+/* READS GO OUT IN RUNS OF UP TO EIGHT SECTORS, WITH THE NEXT RUN READ FROM
+ * THE CARD WHILE THE CURRENT ONE IS ON THE WIRE (yp3-0gn.18).
+ *
+ * One sector per chunk cost 430 us of SD time and then ~560 us of USB time,
+ * strictly one after the other: 517 KB/s measured 2026-11-15 [L] on a link
+ * good for about twice that. Two things change:
+ *
+ * - The chunk is MSC_RD_RUN sectors. ROM_MSC_SEND (0x5930) cannot do that:
+ *   it stores 512 in the endpoint context's per-call limit ([ctx+0x3a], ctx =
+ *   *(0x804634) = 0x804658 in the stock capture) and 0x4e1c then moves
+ *   min(limit, len). So usb_msc_send() stores its own limit and enters
+ *   0x4e1c directly, which is all 0x5930 does. 0x53b8 takes the length as a
+ *   32-bit DMA count; the context's remaining-length field is 16 bits and
+ *   ends up 0. One CMD18 for the run also costs less than eight CMD17s.
+ *
+ * - There are two run buffers. A run is handed to the DMA and the hook then
+ *   reads the following run into the other buffer before it returns; the
+ *   completion interrupt is pending by then and is taken at once. The early
+ *   completion is still refused first (below), so the channel is never
+ *   re-armed while it is moving.
+ *
+ * THE BUFFERS ARE THE CODEC BUFFER. Two runs are 8 KB, and the arena has no
+ * 8 KB to give (docs/CODEC-MEMORY.md). codecbuf is 110 KB that nothing uses
+ * in USB mode: usb.c waits for the audio thread's SYS_USB_CONNECTED ack
+ * before usb_enable(true), that ack is sent after audio_stop_playback(), and
+ * every later codec load copies the whole image in again (lc-yp3box.c), so
+ * nothing in it has to survive. It is SRAM and word-aligned, which is what
+ * the SD IDMAC and the MUSB DMA both need. */
+#define MSC_RD_RUN          8u              /* sectors; SD_MULTI_MAX */
+extern unsigned char codecbuf[];
+#define MSC_RD_BUF(i)       ((void *)((((uint32_t)codecbuf + 7u) & ~7u)       \
+                                      + (i) * (MSC_RD_RUN * 512u)))
+#define ROM_EP_CTX          REG32(0x00804634)       /* ROM 0x4e94 */
+#define ROM_EP_SEND         ((void (*)(const void *, unsigned, unsigned))0x4e1du)
+
+static unsigned msc_rd_cur;         /* which buffer went out last */
+static unsigned msc_rd_ahead;       /* sectors waiting in the other one */
+
+static USBHOT void usb_msc_send(const void *buf, unsigned len)
+{
+    REG16(ROM_EP_CTX + 0x3a) = len;         /* what 0x5930 sets to 512 */
+    ROM_EP_SEND(buf, len, 1);
+}
+
+/* Read the next run off the card into buffer `i`. Returns its length in
+ * sectors, 0 when the command has no more. */
+static USBHOT unsigned usb_msc_read_run(unsigned i)
+{
+    unsigned n = msc_blocks_left < MSC_RD_RUN ? msc_blocks_left : MSC_RD_RUN;
+    void *buf = MSC_RD_BUF(i);
+
+    if (n == 0)
+        return 0;
 
     usblog_stage(UL_R_SD);
-    yp3_usblog.sd_rc = (uint32_t)sd_read_sectors(IF_MD(0,) msc_lba, 1, MSC_BUF);
+    {
+        USBSTAT_T0(t0);
+        yp3_usblog.sd_rc = (uint32_t)sd_read_sectors(IF_MD(0,) msc_lba, n, buf);
+        USBSTAT_T1(t0, rd);
+        USBSTAT(yp3_usbdma.rd_n += n - 1);  /* the mean is per sector */
+    }
     usblog_stage(UL_R_SD_DONE);
     if (yp3_usblog.sd_rc != 0) {
         msc_sderrs++;
-        /* Nothing here can fail the command either: by this point the data
-         * phase is in flight and the only paths out of ROM 0x6380 are "send
-         * the next chunk" and "send the CSW". Sending a zeroed block keeps
-         * the transfer counted and the bus alive; wedging it would need the
-         * host to time out. The log line is the real report. */
+        /* Nothing here can fail the command: by this point the data phase
+         * is in flight and the only ways out are "send the next chunk" and
+         * "send the CSW". A zeroed run keeps the transfer counted and the
+         * bus alive; wedging it would need the host to time out. The log
+         * line is the real report. */
         logf("usb: read error at lba %lu", (unsigned long)msc_lba);
-        memset(MSC_BUF, 0, 512);
+        memset(buf, 0, n * 512u);
     }
 
-    msc_last_lba = msc_lba;
-    msc_chunks++;
-    msc_lba++;
-    msc_blocks_left--;
-
-    /* Account for the block, or the CSW will claim it never went. */
-    MSC_RESIDUE -= 512;
-
-    /* State 3 tells the ROM this is the last chunk: when it completes, ROM
-     * 0x6380 falls into its state 3..4 arm and sends the CSW itself. */
-    MSC_STATE = msc_blocks_left ? MSC_ST_DATA_IN : MSC_ST_LAST;
-    MSC_XFER_LEN = 512;
-    usblog_stage(UL_R_SEND);
-    ROM_MSC_SEND(MSC_BUF, 512);
-    usblog_stage(UL_R_SENT);
+    msc_last_lba = msc_lba + n - 1;
+    msc_chunks += n;
+    msc_lba += n;
+    msc_blocks_left -= n;
+    return n;
 }
 
-/* One sector through the SD driver, with its breadcrumbs. Shared by both
- * write paths so the old one can be compared on hardware like for like. */
-static int usb_msc_write_sector(uint32_t lba, const void *buf)
+static USBHOT void usb_msc_read_chunk(void)
+{
+    unsigned n;
+
+    /* THE COMPLETION CAN COME EARLY. Two things re-dispatch a data-in
+     * command: the DMA channel's interrupt (IRQ 42, ROM 0x54e4) and endpoint
+     * 1's own TX interrupt (IRQ 41, ROM 0x5694 -> table +8), and the second
+     * one sometimes fires while the channel is still moving this chunk.
+     * Measured 2026-11-15 [L]: 280 of 135,969 completions arrived with
+     * CNTL 021f (still enabled), 64 bytes moved and 448 to go, TxPktRdy set.
+     * Taking one as real read the next sector under a running transfer -
+     * which is the corrupted last packet - and then re-armed a channel that
+     * had not finished, which is the likeliest cause of the read that hung.
+     * So an early one is refused: the channel is still running with its
+     * interrupt enabled, and its real completion follows. */
+    if (msc_rd_inflight) {
+        USBSTAT(usb_dma_note());
+        if ((USB_DMA_CNTL & 1) || USB_DMA_COUNT != 0) {
+            USBSTAT(yp3_usbdma.early++);
+            return;
+        }
+        USBSTAT(if (USB_TXCSR_IDX & 3) yp3_usbdma.fifo_busy++);
+        msc_rd_inflight = false;
+    }
+
+    /* The run to send: the one read ahead, or - first chunk of a command -
+     * one read now. */
+    if (msc_rd_ahead) {
+        msc_rd_cur ^= 1;
+        n = msc_rd_ahead;
+        msc_rd_ahead = 0;
+    } else {
+        n = usb_msc_read_run(msc_rd_cur);
+    }
+
+    /* The data phase is over and its last chunk has really gone: send the
+     * CSW from here (ROM 0x5e70, as the write path does). The old way was to
+     * mark the last chunk MSC_ST_LAST and let ROM 0x6380 send the CSW at its
+     * completion - but 0x6380 does that without calling the hook, so an
+     * early completion on the last chunk would have put a CSW on the wire in
+     * the middle of the data, and nothing here could refuse it. The state
+     * therefore stays DATA_IN until this point. Run 2026-11-15 [L]: 36 of 36
+     * reads of an 8 MB file clean where 5 of 10 had been bad, and the
+     * READ(10) DID_ERROR that used to follow every attach is gone ([I] that
+     * the misplaced CSW was its cause). */
+    if (n == 0) {
+        ROM_MSC_CSW(0);
+        return;
+    }
+
+    /* Account for the run, or the CSW will claim it never went. */
+    MSC_RESIDUE -= n * 512u;
+
+    MSC_STATE = MSC_ST_DATA_IN;         /* never LAST: see above */
+    MSC_XFER_LEN = n * 512u;
+    USBSTAT(msc_rd_prev = MSC_RD_BUF(msc_rd_cur));
+    USBSTAT(msc_rd_sent = n * 512u);
+    usblog_stage(UL_R_SEND);
+    usb_msc_send(MSC_RD_BUF(msc_rd_cur), n * 512u);
+    msc_rd_inflight = true;
+    usblog_stage(UL_R_SENT);
+
+    /* And while that is on the wire, fetch the one after it. */
+    msc_rd_ahead = usb_msc_read_run(msc_rd_cur ^ 1);
+}
+
+/* A run of sectors through the SD driver, with its breadcrumbs. Shared by
+ * both write paths so the old one can be compared on hardware like for like. */
+static USBHOT int usb_msc_write_run(uint32_t lba, unsigned n, const void *buf)
 {
     int rc;
 
     yp3_usblog.sd_lba = lba;
     yp3_usblog.sd_calls++;
     usblog_stage(UL_W_SD);
-    rc = sd_write_sectors(IF_MD(0,) lba, 1, buf);
+    {
+        extern uint32_t yp3_sd_ready_polls;
+        uint32_t p0 = yp3_sd_ready_polls;
+        USBSTAT_T0(t0);
+        rc = sd_write_sectors(IF_MD(0,) lba, n, buf);
+        USBSTAT_T1(t0, wr);
+        USBSTAT(yp3_usbdma.wr_n += n - 1);  /* the mean is per sector */
+        USBSTAT(yp3_usbdma.wr_polls += yp3_sd_ready_polls - p0);
+        (void)p0;
+    }
     yp3_usblog.sd_rc = (uint32_t)rc;
     usblog_stage(UL_W_SD_DONE);
     if (rc != 0) {
@@ -550,17 +791,21 @@ static int usb_msc_write_sector(uint32_t lba, const void *buf)
  * 0x813371) to skip the PIO copy; that is faster and is NOT what this does -
  * it needs the callback table patched and a DMA path nobody here has run.
  *
- * Packets are gathered into msc_sector, which is .bss (SRAM, so the SD
- * IDMAC may read it), and written one sector at a time, after which the next
- * packet is armed - the same order as 0x5eb4 (write op, then 0x5944). Nothing
- * here waits: everything between packets is the host's problem. */
-static uint8_t  msc_sector[512] __attribute__((aligned(4)));
+ * Packets are gathered into a run of up to MSC_RD_RUN sectors in the third
+ * 4 KB of the codec buffer (see usb_msc_read_chunk for why that is free and
+ * why the SD IDMAC may read it) and committed with ONE sd_write_sectors call
+ * - one CMD25 instead of eight CMD24s, each of which waited out its own
+ * card-busy period (1,670 us a sector measured 2026-11-15 [L]). The next
+ * packet is armed after the write, the same order as 0x5eb4 (write op, then
+ * 0x5944). Nothing here waits: everything between packets is the host's
+ * problem. */
+#define MSC_WR_BUF          ((uint8_t *)MSC_RD_BUF(2))
 static uint32_t msc_wr_bytes;           /* data-out bytes still to arrive */
-static uint32_t msc_wr_fill;            /* bytes of msc_sector filled */
+static uint32_t msc_wr_fill;            /* bytes of MSC_WR_BUF filled */
 static bool     msc_wr_err;             /* a sector failed this command */
 static unsigned msc_wr_armed;           /* length the last 0x5944 asked for */
 
-static void usb_msc_write_arm(void)
+static USBHOT void usb_msc_write_arm(void)
 {
     unsigned n = msc_wr_bytes < MSC_PACKET ? msc_wr_bytes : MSC_PACKET;
 
@@ -574,18 +819,25 @@ static void usb_msc_write_arm(void)
 
 /* First pass, from the CBW handler 0x63b8 with the state byte 0: what the
  * ROM's WRITE(10) does at 0x602e..0x6034 - state 1, arm the first packet. */
-static void usb_msc_write_start(void)
+#if YP3_USB_WRITE_DMA
+static USBHOT void usb_msc_write_dma_start(void);
+#endif
+static USBHOT void usb_msc_write_start(void)
 {
     msc_wr_bytes = msc_blocks_left * 512u;
     msc_wr_fill = 0;
     msc_wr_err = false;
     MSC_STATE = MSC_ST_DATA_OUT;
+#if YP3_USB_WRITE_DMA
+    usb_msc_write_dma_start();
+#else
     usb_msc_write_arm();
+#endif
 }
 
 /* Every later pass, from 0x6454 with the state byte 1: the packet armed last
  * time is in MSC_BUF. */
-static void usb_msc_write_packet(void)
+static USBHOT void usb_msc_write_packet(void)
 {
     const uint32_t *src = (const uint32_t *)MSC_BUF;
     uint32_t *dst;
@@ -609,7 +861,7 @@ static void usb_msc_write_packet(void)
 
     /* n is 64 or a multiple of 4 below it, and both buffers are aligned:
      * MSC_BUF is 0x800df0. Open-coded - this is the per-packet path. */
-    dst = (uint32_t *)(msc_sector + msc_wr_fill);
+    dst = (uint32_t *)(MSC_WR_BUF + msc_wr_fill);
     for (i = 0; i < n / 4; i++)
         dst[i] = src[i];
 
@@ -617,15 +869,19 @@ static void usb_msc_write_packet(void)
     msc_wr_bytes -= n;
     MSC_RESIDUE  -= n;                      /* 0x5f34: residue -= len */
 
-    if (msc_wr_fill >= 512) {
-        if (usb_msc_write_sector(msc_lba, msc_sector) != 0)
+    /* A full run, or the end of the command (its length is a whole number
+     * of sectors - the hook delegated anything else). */
+    if (msc_wr_fill >= MSC_RD_RUN * 512u || msc_wr_bytes == 0) {
+        unsigned secs = msc_wr_fill / 512u;
+
+        if (secs && usb_msc_write_run(msc_lba, secs, MSC_WR_BUF) != 0)
             msc_wr_err = true;
-        msc_last_lba = msc_lba;
-        msc_chunks++;
-        msc_lba++;
-        msc_blocks_left--;
+        msc_last_lba = msc_lba + secs - 1;
+        msc_chunks += secs;
+        msc_lba += secs;
+        msc_blocks_left -= secs;
         msc_wr_fill = 0;
-        yp3_usblog.secs++;
+        yp3_usblog.secs += secs;
     }
 
     if (msc_wr_bytes == 0) {
@@ -649,18 +905,155 @@ static void usb_msc_write_packet(void)
 
     usb_msc_write_arm();                    /* 0x5f5e */
 }
+
+#if YP3_USB_WRITE_DMA
+/* ==== WRITE(10) BY DMA (yp3-0gn.18) ========================================
+ *
+ * The 0x5944 pump above takes one 64-byte packet per interrupt and the host's
+ * next OUT is NAKed until the hook has returned and re-armed: 206 us from
+ * leaving the hook to the next packet, measured 2026-11-16 [L], which is
+ * 1.65 ms of every 2.15 ms sector once the SD side was batched. The vendor
+ * does not use that pump. Its hook (SRAM 0x813550) receives with the MUSB
+ * DMA, and this is that sequence:
+ *
+ *   first pass, 0x8135b8..0x8135f0
+ *       state = 1; INDEX = 1; RXCSR &= ~1          ack the CBW's packet
+ *       dma_start(buf, min(512, left), ep 1, rx, mode 1)
+ *   dma_start, FIRM 0xd7eda4 with r3 = 0 (receive), [sp] = 1
+ *       INDEX = ep; RXCSR = (RXCSR & ~0x800) | 0xa000   AUTOCLEAR|DMAReqEnab
+ *       ctx[0x4a] = 0                               "last DMA was a receive"
+ *       ADDR (0x40040208) = buf; COUNT (0x4004020c) = len
+ *       CNTL (0x40040204) = (CNTL & ~0xf6) | 4 | 8 | ep << 4 | 1
+ *   completion: DMA interrupt, ROM 0x54e4 -> [*(0x80464c) + 0x20]
+ *       the ROM's entry there is 0x58cc: ctx[0x4a] ? 0x6380 : 0x6454, and
+ *       0x6454 would PIO-read a FIFO the DMA has already emptied. The vendor
+ *       replaces the entry (0x8004e0 + 0x20 -> 0x813371), which keeps 0x6380
+ *       for a transmit and for a receive goes straight back to its hook.
+ *   later passes, 0x8135f6..0x813738
+ *       write the sector; residue -= n; if none left, CSW
+ *       else: while (!(RXCSR & 1)) ;   INDEX = 1;   dma_start(next)
+ *
+ * The table is SRAM (0x8004e0, read off this device in ROM mode 2026-11-16:
+ * +0x20 = 0x58cd), so the entry is replaced the same way. ROM 0x53b8 is the
+ * same routine as 0xd7eda4 except that it never sets the mode bit (it ORs
+ * mode << 4 and then clears 0xf0), so the start is written out here rather
+ * than called.
+ *
+ * Three departures from the vendor, each marked [C] until run:
+ * - a run is up to MSC_RD_RUN sectors, not 512 bytes, into the codec buffer
+ *   (the read side already sends 4 KB per DMA [L]);
+ * - the wait for RxPktRdy is bounded. The vendor's is not, and it runs in
+ *   the interrupt: a host that stopped mid-command would hang the device.
+ *   On timeout the channel is started anyway and takes the packet when it
+ *   comes;
+ * - the CSW goes through ROM 0x5e70 as everywhere else in this file, whose
+ *   re-arm of the CBW receive (0x5944 -> 0x5044) clears AUTOCLEAR and
+ *   DMAReqEnab again. */
+#define ROM_USB_CB_TABLE_ENTRY REG32(REG32(0x0080464c) + 0x20)  /* ROM 0x5514 */
+#define ROM_DATA_IN_DONE    ((void (*)(void))0x6381u)
+#define USB_RXCSR_IDX       REG16(0x40040016)
+#define MSC_WR_WAIT_SPINS   200000u         /* tens of ms; a packet is 50 us */
+
+static USBHOT void usb_msc_write_dma_arm(void)
+{
+    unsigned n = msc_wr_bytes < MSC_RD_RUN * 512u ? msc_wr_bytes
+                                                   : MSC_RD_RUN * 512u;
+
+    msc_wr_armed = n;
+    yp3_usblog.left = msc_wr_bytes;
+    usblog_stage(UL_W_ARM);
+    USB_INDEX = 1;
+    USB_RXCSR_IDX = (USB_RXCSR_IDX & ~0x0800u) | 0xa000u;
+    REG8(ROM_EP_CTX + 0x4a) = 0;
+    USB_DMA_ADDR  = (uint32_t)MSC_WR_BUF;
+    USB_DMA_COUNT = n;
+    USB_DMA_CNTL  = (USB_DMA_CNTL & ~0x00f6u) | 0x04u | 0x08u | (1u << 4) | 1u;
+    usblog_stage(UL_W_ARMED);
+}
+
+/* The DMA channel's completion, in place of ROM 0x58cc. */
+static USBHOT void usb_msc_dma_cb(void)
+{
+    unsigned n, secs, index;
+
+    if (REG8(ROM_EP_CTX + 0x4a)) {          /* a transmit: the ROM's own */
+        ROM_DATA_IN_DONE();
+        return;
+    }
+    if (MSC_STATE != MSC_ST_DATA_OUT || msc_wr_bytes == 0) {
+        USBSTAT(yp3_usbdma.wd_spur++);
+        return;
+    }
+    index = USB_INDEX;
+    USB_INDEX = 1;
+    if ((USB_DMA_CNTL & 1) || USB_DMA_COUNT != 0) {
+        /* Not a completion. Leave the channel to finish; say so. */
+        USBSTAT(yp3_usbdma.wd_odd++);
+        USBSTAT(yp3_usbdma.wd_odd_cntl = USB_DMA_CNTL);
+        USBSTAT(yp3_usbdma.wd_odd_count = USB_DMA_COUNT);
+        USBSTAT(yp3_usbdma.wd_odd_rxcsr = USB_RXCSR_IDX);
+        USB_INDEX = index;
+        return;
+    }
+    USBSTAT(yp3_usbdma.wd_n++);
+
+    n = msc_wr_armed;
+    secs = n / 512u;
+    yp3_usblog.pkts += n / MSC_PACKET;
+    usblog_stage(UL_W_PKT);
+    msc_wr_bytes -= n;
+    MSC_RESIDUE  -= n;
+
+    if (usb_msc_write_run(msc_lba, secs, MSC_WR_BUF) != 0)
+        msc_wr_err = true;
+    msc_last_lba = msc_lba + secs - 1;
+    msc_chunks += secs;
+    msc_lba += secs;
+    msc_blocks_left -= secs;
+    yp3_usblog.secs += secs;
+
+    if (msc_wr_bytes == 0) {
+        yp3_usblog.left = 0;
+        usblog_stage(UL_W_CSW);
+        if (msc_wr_err)
+            ROM_MSC_SENSE(3, 0x0c);
+        ROM_MSC_CSW(msc_wr_err ? 1 : 0);
+        yp3_usblog.wr_done++;
+        usblog_stage(UL_W_IDLE);
+    } else {
+        unsigned spins = 0;
+
+        USB_INDEX = 1;
+        while (!(USB_RXCSR_IDX & 1) && spins < MSC_WR_WAIT_SPINS)
+            spins++;
+        USBSTAT(if (spins > yp3_usbdma.wd_wait_max)
+                    yp3_usbdma.wd_wait_max = spins);
+        USBSTAT(if (spins >= MSC_WR_WAIT_SPINS) yp3_usbdma.wd_wait_to++);
+        usb_msc_write_dma_arm();
+    }
+    USB_INDEX = index;
+}
+
+static USBHOT void usb_msc_write_dma_start(void)
+{
+    ROM_USB_CB_TABLE_ENTRY = (uint32_t)usb_msc_dma_cb | 1u;
+    USB_INDEX = 1;
+    USB_RXCSR_IDX &= ~1u;                   /* 0x8135ce: ack the CBW */
+    usb_msc_write_dma_arm();
+}
+#endif /* YP3_USB_WRITE_DMA */
 /* ==== end of THE FIX ====================================================== */
 #else
 /* The OLD path, kept only behind YP3_USB_WRITE_FIX=0 so the diagnosis can be
  * confirmed on hardware with the same breadcrumbs. Predicted result: stage
  * W_OLD_WAIT, pkts=0, and nothing after it until the host gives up. */
-static void usb_msc_write_start(void)
+static USBHOT void usb_msc_write_start(void)
 {
     MSC_STATE = MSC_ST_DATA_OUT;
     usblog_stage(UL_W_OLD_WAIT);
 }
 
-static void usb_msc_write_packet(void)
+static USBHOT void usb_msc_write_packet(void)
 {
     if (msc_blocks_left == 0) {         /* see usb_msc_read_chunk */
         msc_runaways++;
@@ -673,7 +1066,7 @@ static void usb_msc_write_packet(void)
     yp3_usblog.pkts++;
     usblog_stage(UL_W_PKT);
 
-    if (usb_msc_write_sector(msc_lba, MSC_BUF) != 0)
+    if (usb_msc_write_run(msc_lba, 1, MSC_BUF) != 0)
         logf("usb: write error at lba %lu", (unsigned long)msc_lba);
 
     msc_lba++;
@@ -686,7 +1079,7 @@ static void usb_msc_write_packet(void)
 }
 #endif /* YP3_USB_WRITE_FIX */
 
-static int usb_msc_hook(unsigned opcode)
+static USBHOT int usb_msc_hook(unsigned opcode)
 {
     if (usb_msc_mode_sense_wp(opcode))
         return 1;
@@ -737,12 +1130,41 @@ static int usb_msc_hook(unsigned opcode)
 
         usblog_stage(UL_R_CBW);
         MSC_STATE = MSC_ST_DATA_IN;
+        msc_rd_inflight = false;
+        msc_rd_ahead = 0;
+        msc_rd_cur = 0;
     }
 
-    if (opcode == 0x28)
+    if (opcode == 0x28) {
         usb_msc_read_chunk();
-    else
+#if YP3_USB_WRITE_FIX && YP3_USB_WRITE_DMA
+    } else if (1) {
+        /* The data comes through usb_msc_dma_cb, not through here: this
+         * is 0x6454 after an endpoint interrupt nobody asked for. */
+        USBSTAT(yp3_usbdma.wd_spur++);
+#endif
+    } else {
+#if YP3_USB_WRITE_FIX && YP3_USB_STATS
+        static uint32_t t_exit;
+        static bool have_exit;
+        uint32_t t_in = usb_syst();
+
+        if (have_exit && msc_wr_bytes != 0) {
+            uint32_t gap = (t_exit >= t_in) ? t_exit - t_in
+                         : t_exit + (REG32(0xE000E014) & 0xffffffu) + 1 - t_in;
+            yp3_usbdma.pk_gap += gap >> 8;
+            if (gap > yp3_usbdma.pk_gap_max)
+                yp3_usbdma.pk_gap_max = gap;
+        }
         usb_msc_write_packet();
+        yp3_usbdma.pk_n++;
+        yp3_usbdma.pk_in += usb_syst_since(t_in) >> 8;
+        t_exit = usb_syst();
+        have_exit = (msc_wr_bytes != 0);
+#else
+        usb_msc_write_packet();
+#endif
+    }
 
     return 1;
 }
@@ -980,6 +1402,41 @@ void usb_enable(bool on)
             (void)itx; (void)irx; (void)iusb;   /* reads ARE the clear */
         }
 
+        /* And endpoint 0 itself. Measured 2026-11-15 on an exec boot [L]:
+         * attach never returned, and the stall watch put the thread in ROM
+         * 0x4d06 with lr 0x4d3d - the first call of the endpoint sweep at
+         * 0x4d34, `INDEX = 0; CSR |= 8; while (CSR & 1) ;`. On endpoint 0
+         * bit 0 of the CSR is RxPktRdy, and nothing in that loop can clear
+         * it: the exec request that started this image is still sitting in
+         * the FIFO, because the ROM's handler for it never returned to
+         * acknowledge it. Acknowledge it here (ServicedRxPktRdy, bit 6), and
+         * flush (bit 8) if that is not enough. Bounded; a normal boot has
+         * bit 0 clear and skips all of it. Run 2026-11-15 [L]: "ep0 csr0 was
+         * 0001, now 0000 (0 spins)", and attach has returned on every exec
+         * boot since. */
+        {
+            uint8_t idx = USBC(0x0e);
+            uint16_t csr0;
+            unsigned spins = 0;
+
+            USBC(0x0e) = 0;
+            csr0 = REG16(0x40040012);
+            if (csr0 & 1) {
+                REG16(0x40040012) = 0x0040;
+                while ((REG16(0x40040012) & 1) && ++spins < 100000)
+                    ;
+                if (REG16(0x40040012) & 1) {
+                    REG16(0x40040012) = 0x0100;
+                    spins = 0;
+                    while ((REG16(0x40040012) & 1) && ++spins < 100000)
+                        ;
+                }
+                logf("usb: ep0 csr0 was %04x, now %04x (%u spins)", csr0,
+                     REG16(0x40040012), spins);
+            }
+            USBC(0x0e) = idx;
+        }
+
         usb_exposed = true;
         ROM_USB_SET_USERFN(&usb_msc_ops);
         logf("usb: attach...");
@@ -1006,8 +1463,8 @@ void usb_enable(bool on)
              (unsigned long)WDOG_CTRL, (unsigned long)WDOG_LOAD);
         WDOG_CTRL = 0;
         usblog_stage(UL_ATTACHED);
-        logf("usb: write path %s", YP3_USB_WRITE_FIX ? "0x5944 pump (fix)"
-                                                     : "OLD (no arm)");
+        logf("usb: write path %s", !YP3_USB_WRITE_FIX ? "OLD (no arm)"
+             : YP3_USB_WRITE_DMA ? "DMA receive" : "0x5944 pump");
     } else {
         if (!usb_exposed)
             return;
@@ -1069,6 +1526,34 @@ int usb_detect(void)
 
     if (TIME_AFTER(current_tick, next_poll)) {
         next_poll = current_tick + HZ / 10;
+#if YP3_USB_STATS
+        /* A read chunk handed to the ROM 3 s ago and no completion since:
+         * take the channel's registers once, from here, because the hook
+         * will never run again to do it. */
+        if (yp3_usblog.stage == (USBLOG_MAGIC | UL_R_SENT)
+                && MSC_STATE != MSC_ST_IDLE     /* idle = the CSW went out */
+                && TIME_AFTER(current_tick, (long)yp3_usblog.tick + 3 * HZ)
+                && yp3_usbdma.stall_tick != yp3_usblog.tick) {
+            struct yp3_usbdma *d = &yp3_usbdma;
+            int old = disable_irq_save();
+            uint8_t idx = USB_INDEX;
+            USB_INDEX = 1;
+            d->stall_txcsr = USB_TXCSR_IDX;
+            USB_INDEX = idx;
+            d->stall_cntl = USB_DMA_CNTL;
+            d->stall_addr = USB_DMA_ADDR;
+            d->stall_count = USB_DMA_COUNT;
+            restore_irq(old);
+            d->stall_state = MSC_STATE;
+            d->stall_buf = (uint32_t)msc_rd_prev;
+            d->stall_tick = yp3_usblog.tick;
+            d->stalls++;
+            logf("usb: READ STALL cntl=%04lx addr=%08lx cnt=%lu txcsr=%04lx st=%lu",
+                 (unsigned long)d->stall_cntl, (unsigned long)d->stall_addr,
+                 (unsigned long)d->stall_count, (unsigned long)d->stall_txcsr,
+                 (unsigned long)d->stall_state);
+        }
+#endif
         detected = (power_input_status() != POWER_INPUT_NONE)
                  ? USB_INSERTED : USB_EXTRACTED;
     }

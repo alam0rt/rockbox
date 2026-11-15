@@ -1862,11 +1862,18 @@ static void sd_unstick(void)
  * The ROM polls CMD13 (SEND_STATUS) up to 200 times at 1 ms, and takes bit 8 of
  * the R1 status - READY_FOR_DATA - as the all clear.
  */
+/* Measured 2026-11-15 [L]: with the ROM's 1 ms poll a single-sector write
+ * cost the USB path 5,214 us EVERY time (mean 5,214, max 5,222 over 4,110
+ * sectors) - a number that constant is the poll interval, not the card. So
+ * the poll is now 100 us nominal with the same ~200 ms bound, and the polls
+ * are counted (yp3_sd_ready_polls) so the next run says both how long the
+ * card really takes and how long sd_udelay(100) really is. */
+uint32_t yp3_sd_ready_polls;
 static uint32_t SDICODE sd_wait_ready(void)
 {
     unsigned tries;
 
-    for (tries = 0; tries < 200; tries++) {
+    for (tries = 0; tries < 2000; tries++) {
         uint32_t t = 0;
 
         ROM_SD_CMD(&sdh, 13, sd_rca << 16);
@@ -1877,7 +1884,8 @@ static uint32_t SDICODE sd_wait_ready(void)
 
         if (ROM_SD_RESP(&sdh, 0) & (1u << 8))
             return 0;
-        sd_mdelay(1);
+        yp3_sd_ready_polls++;
+        sd_udelay(100);
     }
     return 0x29;                               /* the ROM's own timeout code */
 }

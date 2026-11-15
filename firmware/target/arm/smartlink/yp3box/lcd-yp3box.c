@@ -543,6 +543,105 @@ static bool lcd_update_rect_dma(int x, int y, int w, int h, bool yield_ok)
  * a second one waits (yielding) for the first to finish. */
 static volatile bool lcd_xfer_busy;
 
+/* --- panel sleep (HAVE_LCD_ENABLE, yp3-1so.6) ------------------------------
+ *
+ * With no lcd_active() the WPS and the status bar kept rendering, and every
+ * lcd_update kept running DMA chunks and LCDC kicks, into a panel nobody
+ * could see: a player spends most of its life with the backlight off. The
+ * GC9106 also keeps scanning its GRAM out.
+ *
+ * YP3_LCD_SLEEP makes lcd_enable() real (the build scripts turn it on; ran
+ * 2026-11-16 `[L]`: the panel sleeps with the backlight and wakes with a
+ * correct picture):
+ *   off  DISPOFF 0x28, SLPIN 0x10    - the pair lcd_shutdown() has sent at
+ *                                      every power-off `[L]`
+ *   on   SLPOUT 0x11, 120 ms, DISPON 0x29 - the tail of lcd_panel_init_seq,
+ *                                      which is the vendor's gc9106_lcd_init
+ * and then a full repaint and LCD_EVENT_ACTIVATION, as lcd-fuze.c does. With
+ * the flag off lcd_enable() does nothing and lcd_active() is always true,
+ * which is exactly the behaviour before HAVE_LCD_ENABLE was defined.
+ *
+ * `[U]`, and what the first boot has to show: that GRAM and the init
+ * registers survive SLPIN (the datasheet says sleep keeps both; if the
+ * picture comes back wrong, on has to rerun lcd_panel_init_seq instead), and
+ * that nothing else needs the LCDC kept busy. `lcd: sleep`/`lcd: wake` log
+ * the first few of each with the time the wake took. */
+#ifndef YP3_LCD_SLEEP
+#define YP3_LCD_SLEEP 0
+#endif
+
+static bool lcd_is_on = true;
+
+#if YP3_LCD_SLEEP
+#include "events.h"
+
+static long lcd_slpin_tick;
+static unsigned lcd_sleeps, lcd_wakes;
+
+static void lcd_xfer_take(bool yield_ok)
+{
+    if (yield_ok)
+        while (lcd_xfer_busy)
+            yield();
+    lcd_xfer_busy = true;
+}
+
+static void lcd_panel_wake(bool yield_ok)
+{
+    long t0 = current_tick;
+
+    lcd_xfer_take(yield_ok);
+    /* SLPIN to SLPOUT wants 120 ms too; a key right after the timeout would
+     * otherwise land inside it. */
+    if (yield_ok)
+        while (TIME_BEFORE(current_tick, lcd_slpin_tick + HZ / 8))
+            sleep(1);
+    lcd_write_cmd(0x11);                        /* SLPOUT */
+    if (yield_ok)
+        sleep(HZ / 8 + 1);                      /* 120 ms, rounded up */
+    else
+        udelay(120000);
+    lcd_write_cmd(0x29);                        /* DISPON */
+    lcd_is_on = true;
+    lcd_xfer_busy = false;
+    if (lcd_wakes++ < 8)
+        logf("lcd: wake #%u took %ld ticks", lcd_wakes, current_tick - t0);
+}
+
+void lcd_enable(bool on)
+{
+    bool yield_ok = lcd_may_yield();
+
+    if (on == lcd_is_on)
+        return;
+    if (!on) {
+        lcd_xfer_take(yield_ok);
+        lcd_is_on = false;              /* before the commands: no new frame */
+        lcd_write_cmd(0x28);                    /* DISPOFF */
+        lcd_write_cmd(0x10);                    /* SLPIN */
+        lcd_slpin_tick = current_tick;
+        lcd_xfer_busy = false;
+        if (lcd_sleeps++ < 8)
+            logf("lcd: sleep #%u t=%ld", lcd_sleeps, current_tick);
+        return;
+    }
+    lcd_panel_wake(yield_ok);
+    lcd_update();                       /* whatever was drawn while dark */
+    if (yield_ok)
+        send_event(LCD_EVENT_ACTIVATION, NULL);
+}
+#else
+void lcd_enable(bool on)
+{
+    (void)on;
+}
+#endif /* YP3_LCD_SLEEP */
+
+bool lcd_active(void)
+{
+    return lcd_is_on;
+}
+
 static void LCDICODE lcd_update_rect_pio(int x, int y, int width, int height,
                                          bool yield_ok)
 {
@@ -572,6 +671,21 @@ void lcd_update_rect(int x, int y, int width, int height)
     if (x + width > LCD_WIDTH) width = LCD_WIDTH - x;
     if (y + height > LCD_HEIGHT) height = LCD_HEIGHT - y;
     if (width <= 0 || height <= 0) return;
+
+#if YP3_LCD_SLEEP
+    if (!lcd_is_on) {
+        /* Asleep: the framebuffer is current and lcd_enable(true) repaints
+         * it. The exception is a caller that cannot yield - panicf(), a
+         * fault - whose frame is the last thing this boot will ever draw:
+         * wake the panel and light it, so a panic with the backlight timed
+         * out does not look like a hang. */
+        if (lcd_may_yield() || current_tick <= HZ)
+            return;
+        lcd_xfer_busy = false;
+        lcd_panel_wake(false);
+        ROM_GPIO_CFG1(BL_PIN_ON_FROM_LCD);
+    }
+#endif
 
     /* Full-frame timings, one number per path: the first 32 of each. */
     full = (width == LCD_WIDTH && height == LCD_HEIGHT);
