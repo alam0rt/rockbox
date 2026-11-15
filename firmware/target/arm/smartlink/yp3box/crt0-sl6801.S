@@ -209,14 +209,6 @@ reset_handler:
     strlo   r0, [r2], #4
     blo     2b
 
-    /* and the .bss placed in the ROM's dead stack window (app.lds .romwin).
-       SP left that window at "set up the stack" above. */
-    ldr     r2, =_romwinbegin
-    ldr     r3, =_romwinend
-3:  cmp     r2, r3
-    it      lo
-    strlo   r0, [r2], #4
-    blo     3b
 
     /* The vector table has to live at 0x800000 - not in flash - because the
        boot ROM writes into it.

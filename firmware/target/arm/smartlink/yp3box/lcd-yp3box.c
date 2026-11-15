@@ -331,12 +331,7 @@ static void lcd_set_window(int x, int y, int w, int h)
 #define LCD_DMA_CFG         0x00080002u     /* +0x20: (32 << 14) | 2, +0 == 0 */
 #define LCDC_WFIFO          (LCDC_BASE + 0x30)
 #define LCDC_CFG10_TXDMA    (1u << 19)
-/* 4096 bytes is the vendor cap, not a requirement. 1024 pixels makes the two
- * bounce buffers 4 KB together, which fits the boot ROM's dead stack window
- * where app.lds puts this file's .bss (yp3-1bw): 20 DMA chunks a frame
- * instead of 10, and 8 KB of SRAM back. Each chunk is still a whole number
- * of 32-bit FIFO words. */
-#define LCD_CHUNK_PIX       1024
+#define LCD_CHUNK_PIX       2048                /* 4096 bytes, the vendor cap */
 
 #if YP3_LCD_DMA
 static uint16_t lcd_bounce[2][LCD_CHUNK_PIX] __attribute__((aligned(4)));
