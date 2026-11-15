@@ -97,6 +97,21 @@ uint16_t yp3_prof_thread[32];
 uint32_t yp3_prof_total;
 uint16_t yp3_prof_flash[(PROF_FLASH_END - PROF_FLASH_BASE) >> PROF_FLASH_SHIFT];
 uint16_t yp3_prof_codec[PROF_CODEC_SPAN >> PROF_CODEC_SHIFT];
+/* Who holds the CPU without letting go (yp3-0gn.13). Threads are cooperative,
+ * so a thread that computes for longer than the PCM lookahead (a quarter
+ * second) silences playback however little CPU the codec needs. run_max is
+ * the longest run of consecutive ticks that found the same slot running, and
+ * yp3_prof_hog is the flash histogram again, but only of samples taken once
+ * a run is already PROF_HOG_TICKS long: the code a thread is in WHILE it
+ * hogs, which is what is worth moving to SRAM or breaking up. A thread that
+ * yields and is rescheduled inside one tick is not seen as a break, so this
+ * overstates a run; it never understates one. */
+#define PROF_HOG_TICKS 5
+uint16_t yp3_prof_run_max[32];
+uint16_t yp3_prof_hog_thread[32];
+uint16_t yp3_prof_hog[(PROF_FLASH_END - PROF_FLASH_BASE) >> PROF_FLASH_SHIFT];
+static uint8_t prof_run_slot = 0xff;
+static uint16_t prof_run;
 
 void __attribute__((section(".icode"), used)) yp3_prof_sample(uint32_t pc)
 {
@@ -106,6 +121,23 @@ void __attribute__((section(".icode"), used)) yp3_prof_sample(uint32_t pc)
     i = thread_self() & 0xffu;
     if (i < 32 && yp3_prof_thread[i] != 0xffffu)
         yp3_prof_thread[i]++;
+    if (i != prof_run_slot) {
+        prof_run_slot = i;
+        prof_run = 0;
+    }
+    if (prof_run != 0xffffu)
+        prof_run++;
+    if (i < 32 && prof_run > yp3_prof_run_max[i])
+        yp3_prof_run_max[i] = prof_run;
+    if (prof_run >= PROF_HOG_TICKS) {
+        if (i < 32 && yp3_prof_hog_thread[i] != 0xffffu)
+            yp3_prof_hog_thread[i]++;
+        if (pc >= PROF_FLASH_BASE && pc < PROF_FLASH_END) {
+            uint32_t b = (pc - PROF_FLASH_BASE) >> PROF_FLASH_SHIFT;
+            if (yp3_prof_hog[b] != 0xffffu)
+                yp3_prof_hog[b]++;
+        }
+    }
     if (pc >= PROF_FLASH_BASE && pc < PROF_FLASH_END) {
         yp3_prof_region[0]++;
         i = (pc - PROF_FLASH_BASE) >> PROF_FLASH_SHIFT;

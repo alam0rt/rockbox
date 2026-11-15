@@ -28,11 +28,34 @@ static FLACContext fc IBSS_ATTR_FLAC;
 /* The output buffers containing the decoded samples (channels 0 and 1) */
 static int32_t decoded0[MAX_BLOCKSIZE] IBSS_ATTR_FLAC;
 static int32_t decoded1[MAX_BLOCKSIZE] IBSS_ATTR_FLAC;
+#if MAX_CHANNELS > 2    /* not with FLAC_STEREO_ONLY, see decoder.h */
 static int32_t decoded2[MAX_BLOCKSIZE] IBSS_ATTR_FLAC_LARGE_IRAM;
 static int32_t decoded3[MAX_BLOCKSIZE] IBSS_ATTR_FLAC_LARGE_IRAM;
 static int32_t decoded4[MAX_BLOCKSIZE] IBSS_ATTR_FLAC_XLARGE_IRAM;
 static int32_t decoded5[MAX_BLOCKSIZE] IBSS_ATTR_FLAC_XLARGE_IRAM;
 static int32_t decoded6[MAX_BLOCKSIZE] IBSS_ATTR_FLAC_XXLARGE_IRAM;
+#endif
+
+/* How much compressed data to ask the buffer for when a frame is wanted.
+ *
+ * MAX_FRAMESIZE is the largest frame this decoder accepts, and asking for it
+ * every time is free on a target whose file buffer is megabytes. But the
+ * request is satisfied only once ALL of it is buffered (or the file ends), so
+ * a file buffer smaller than MAX_FRAMESIZE can never satisfy it and the codec
+ * waits for ever on its first read.
+ *
+ * A target with such a buffer defines FLAC_INPUT_REQUEST_MAX, in bytes. The
+ * request is then what a frame of THIS stream can need - a frame header, one
+ * verbatim subframe per channel (a side channel is one bit wider) and the
+ * CRC, or STREAMINFO's own maximum frame size if that is larger - and never
+ * more than FLAC_INPUT_REQUEST_MAX. A frame that does not fit is a decode
+ * error, not a hang. */
+#ifdef FLAC_INPUT_REQUEST_MAX
+static size_t frame_request = FLAC_INPUT_REQUEST_MAX;
+#define FRAME_REQUEST frame_request
+#else
+#define FRAME_REQUEST MAX_FRAMESIZE
+#endif
 
 #define MAX_SUPPORTED_SEEKTABLE_SIZE 5000
 
@@ -95,20 +118,24 @@ static bool flac_init(FLACContext* fc, int first_frame_offset)
     /* Reset sample buffers */
     ci->memset(decoded0, 0, sizeof(decoded0));
     ci->memset(decoded1, 0, sizeof(decoded1));
+#if MAX_CHANNELS > 2
     ci->memset(decoded2, 0, sizeof(decoded2));
     ci->memset(decoded3, 0, sizeof(decoded3));
     ci->memset(decoded4, 0, sizeof(decoded4));
     ci->memset(decoded5, 0, sizeof(decoded5));
     ci->memset(decoded6, 0, sizeof(decoded5));
+#endif
 
     /* Set sample buffers in decoder structure */
     fc->decoded[0] = decoded0;
     fc->decoded[1] = decoded1;
+#if MAX_CHANNELS > 2
     fc->decoded[2] = decoded2;
     fc->decoded[3] = decoded3;
     fc->decoded[4] = decoded4;
     fc->decoded[5] = decoded5;
     fc->decoded[6] = decoded6;
+#endif
 
     /* Skip any foreign tags at start of file */
     ci->seek_buffer(first_frame_offset);
@@ -162,6 +189,15 @@ static bool flac_init(FLACContext* fc, int first_frame_offset)
                          fc->channels, MAX_CHANNELS);
                     return false;
             }
+
+#ifdef FLAC_INPUT_REQUEST_MAX
+            frame_request = (size_t)fc->max_blocksize * fc->channels
+                            * (fc->bps + 1) / 8 + 64;
+            if (frame_request < (size_t)fc->max_framesize + 16)
+                frame_request = fc->max_framesize + 16;
+            if (frame_request > FLAC_INPUT_REQUEST_MAX)
+                frame_request = FLAC_INPUT_REQUEST_MAX;
+#endif
 
             /* totalsamples is a 36-bit field, but we assume <= 32 bits are
                used */
@@ -255,7 +291,7 @@ static bool frame_sync(FLACContext* fc) {
 
     /* Advance and init bit buffer to the new frame. */
     ci->advance_buffer((get_bits_count(&fc->gb)-16)>>3); /* consumed bytes */
-    bit_buffer = ci->request_buffer(&buff_size, MAX_FRAMESIZE+16);
+    bit_buffer = ci->request_buffer(&buff_size, FRAME_REQUEST+16);
     init_get_bits(&fc->gb, bit_buffer, buff_size*8);
 
     /* Decode the frame to verify the frame crc and
@@ -343,7 +379,7 @@ static bool flac_seek(FLACContext* fc, uint32_t target_sample) {
         if(!ci->seek_buffer(pos))
             return false;
 
-        bit_buffer = ci->request_buffer(&buff_size, MAX_FRAMESIZE+16);
+        bit_buffer = ci->request_buffer(&buff_size, FRAME_REQUEST+16);
         init_get_bits(&fc->gb, bit_buffer, buff_size*8);
 
         /* Now we need to get a frame.  It is possible for our seek
@@ -430,7 +466,7 @@ static bool flac_seek_offset(FLACContext* fc, uint32_t offset) {
     if(!ci->seek_buffer(offset))
         return false;
 
-    bit_buffer = ci->request_buffer(&buff_size, MAX_FRAMESIZE);
+    bit_buffer = ci->request_buffer(&buff_size, FRAME_REQUEST);
     init_get_bits(&fc->gb, bit_buffer, buff_size*8);
 
     for(unparseable_count = 0; !got_a_frame
@@ -502,7 +538,7 @@ enum codec_status codec_run(void)
     ci->set_elapsed(elapsedtime);
 
     /* The main decoding loop */
-    buf = ci->request_buffer(&bytesleft, MAX_FRAMESIZE);
+    buf = ci->request_buffer(&bytesleft, FRAME_REQUEST);
     while (bytesleft) {
         long action = ci->get_command(&param);
 
@@ -514,7 +550,7 @@ enum codec_status codec_run(void)
             if (flac_seek(&fc,(uint32_t)(((uint64_t)param
                 *ci->id3->frequency)/1000))) {
                 /* Refill the input buffer */
-                buf = ci->request_buffer(&bytesleft, MAX_FRAMESIZE);
+                buf = ci->request_buffer(&bytesleft, FRAME_REQUEST);
             }
 
             ci->set_elapsed(param);
@@ -544,7 +580,7 @@ enum codec_status codec_run(void)
 
         ci->advance_buffer(consumed);
 
-        buf = ci->request_buffer(&bytesleft, MAX_FRAMESIZE);
+        buf = ci->request_buffer(&bytesleft, FRAME_REQUEST);
     }
 
     LOGF("FLAC: Decoded %lu samples\n",(unsigned long)samplesdone);

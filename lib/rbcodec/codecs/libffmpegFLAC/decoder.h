@@ -3,7 +3,17 @@
 
 #include "bitstream.h"
 
+/* Maximum supported channels, only left/right will be played back.
+ *
+ * Every channel costs MAX_BLOCKSIZE * 4 bytes of codec .bss whether or not a
+ * file uses it. A target whose codec buffer cannot hold seven may define
+ * FLAC_STEREO_ONLY in its config: streams with more than two channels are
+ * then refused when STREAMINFO is read (flac.c), instead of downmixed. */
+#ifdef FLAC_STEREO_ONLY
+#define MAX_CHANNELS   2
+#else
 #define MAX_CHANNELS   7      /* Maximum supported channels, only left/right will be played back */
+#endif
 #ifndef MAX_BLOCKSIZE
 #define MAX_BLOCKSIZE  4608   /* Maxsize in samples of one uncompressed frame */
 #endif
