@@ -57,7 +57,14 @@ static size_t frame_request = FLAC_INPUT_REQUEST_MAX;
 #define FRAME_REQUEST MAX_FRAMESIZE
 #endif
 
+/* 12 bytes of .bss per point. A target short of codec buffer defines
+   FLAC_SEEKPOINTS_MAX; points past it are skipped, as they always were past
+   5000, and a seek beyond the last one kept falls back to bisection. */
+#ifdef FLAC_SEEKPOINTS_MAX
+#define MAX_SUPPORTED_SEEKTABLE_SIZE FLAC_SEEKPOINTS_MAX
+#else
 #define MAX_SUPPORTED_SEEKTABLE_SIZE 5000
+#endif
 
 /* Notes about seeking:
 

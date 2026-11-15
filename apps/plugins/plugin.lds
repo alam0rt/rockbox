@@ -245,6 +245,27 @@ SECTIONS
      * LOADADDR(prev) + SIZEOF(prev) - silently breaks the moment any section
      * needs more than 4-byte alignment, because alignment padding lands in the
      * VMA and not in SIZEOF. One section has one LMA and cannot drift. */
+#ifdef CODEC_COLD_RODATA
+    /* Read-only tables the target config names as COLD stay in the flash slot,
+     * behind the image, and are read in place: VMA = LMA, nothing copied.
+     * codecbuf is sized by the worst codec, and mpa's rq_table alone is
+     * 32,828 bytes that libmad reads only on a requantisation-cache miss.
+     * Each read is a SPI transaction, so only a table that is rarely read
+     * belongs here - never code, never a table in an inner loop.
+     *
+     * Written BEFORE .codecimg although it is placed after it: the first
+     * statement that matches an input section gets it, and .codecimg's
+     * *(.rodata*) would. The names need -fdata-sections on the objects that
+     * define them (tools/40_build.sh, YP3_DATA_SECTION_OBJS). */
+    .codeccold ALIGN(_codec_xip_load + SIZEOF(.codecimg), 32) :
+    {
+        _codec_cold_start = .;
+        CODEC_COLD_RODATA
+        . = ALIGN(4);
+        _codec_cold_end = .;
+    }
+#endif
+
     .codecimg : AT(_codec_xip_load)
     {
         _codec_xip_start = .;

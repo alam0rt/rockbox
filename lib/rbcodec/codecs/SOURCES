@@ -27,8 +27,11 @@ alac.c
 cook.c
 #endif
 a52_rm.c
+/* atrac3 is 98-100 KB, 68 KB of it .bss. */
+#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x19000
 atrac3_rm.c
 atrac3_oma.c
+#endif
 spc.c
 mod.c
 shorten.c

@@ -32,6 +32,14 @@
    language! */
 #include "max_language_size.h"
 
+/* A target that ships only the built-in language can give the buffer back:
+   it is written by lang_load() alone, and a file larger than the override
+   is refused there as "too large" with the built-in strings left in place. */
+#ifdef MAX_LANGUAGE_SIZE_OVERRIDE
+#undef MAX_LANGUAGE_SIZE
+#define MAX_LANGUAGE_SIZE MAX_LANGUAGE_SIZE_OVERRIDE
+#endif
+
 /* These defines must match the initial bytes in the binary lang file */
 /* See tools/genlang (TODO: Use common include for both) */
 #define LANGUAGE_COOKIE   0x1a

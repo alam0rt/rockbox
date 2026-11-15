@@ -195,7 +195,29 @@
  * decodes with an 18 KB working buffer and NO file readahead at all, because
  * this board streams from SD by design. A 148 KB arena is still far more than
  * the hardware was built around. */
-#define CODEC_SIZE          0x1b000
+#define CODEC_SIZE          0x15c00
+
+/* 0x15c00 is 89,088 (yp3-1bw, 2026-11-16; NOT YET RUN on hardware). What made
+ * the codec buffer 110,592 was mostly read-only: 32,828 bytes of mpa are
+ * rq_table, which libmad reads only when its 16-entry requantisation cache
+ * misses or a value needs linbits (layer3.c). The tables named here stay in
+ * the codec's flash slot and are read in place (apps/plugins/plugin.lds,
+ * .codeccold); everything else still runs from SRAM. vwin8192/vwin4096 are
+ * Vorbis windows for block sizes encoders almost never choose; a file that
+ * does use one still plays, reading its window over SPI.
+ *
+ * With them out: spc 88,284 is the floor, vorbis ~66 KB plus the tlsf heap
+ * it takes from the rest of the buffer (22.7 KB now, 20.2 KB before), mpa
+ * ~73 KB. atrac3 (100 KB) is gated out in lib/rbcodec/codecs/SOURCES. */
+#define CODEC_COLD_RODATA \
+    *(.rodata.rq_table) *(.rodata.vwin8192) *(.rodata.vwin4096)
+/* Objects tools/40_build.sh compiles with -fdata-sections so those names
+ * exist as input sections, relative to lib/rbcodec/codecs in the build. */
+#define YP3_DATA_SECTION_OBJS "libmad/layer3.o libtremor/window.o"
+
+/* English is built in and is the only language this target ships, so the
+ * buffer a loaded .lng would go into (12,393 bytes of .bss) is not kept. */
+#define MAX_LANGUAGE_SIZE_OVERRIDE 16
 
 /* FLAC, in the same 0x1b000 (yp3-1so.13, yp3-7fx). Unmodified it needs
  * 196,352 bytes of codec buffer - 189 KB of that is .bss: seven 18,432-byte
@@ -219,6 +241,9 @@
  * tools/codec_slots.txt. NOT YET RUN ON HARDWARE. */
 #define FLAC_STEREO_ONLY
 #define FLAC_INPUT_REQUEST_MAX  0x7000
+/* 1024 seek points, 12,288 bytes, instead of 5000 and 60,000: FLAC must fit
+ * the 0x15c00 codec buffer too. An encoder's default is one point per 10 s. */
+#define FLAC_SEEKPOINTS_MAX     1024
 #define YP3_EXTRA_CODECS    "flac"
 
 /* The tree cache is allocated before playback. The generic 1,000-entry default
