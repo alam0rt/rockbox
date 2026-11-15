@@ -251,11 +251,7 @@
  * arena, leaving only 444 bytes for the first audio allocation after the rest
  * of startup. Keep the browser useful while guaranteeing room for PCM and the
  * compressed-input reserve. Existing settings are clamped at tree init. */
-#define MAX_FILES_IN_DIR_LIMIT 100
-
-/* 100, was 200 (yp3-1bw, 2026-11-16): the cache measured 10,432 bytes at 200
- * entries (tools/sram_census.py), so this returns about 5.2 KB. A folder
- * with more than 100 entries shows its first 100. */
+#define MAX_FILES_IN_DIR_LIMIT 200
 
 /* A QUARTER of a second of decoded-PCM lookahead. A whole one is 172 KB at
  * 44.1 kHz stereo and the entire audio arena here is about 151 KB.
@@ -281,15 +277,7 @@
  * never reach a watermark still sized against the full-rate ring. The fraction
  * below is stated once and pcmbuf.c derives the watermark from it, so the two
  * cannot drift apart again. */
-#define PCMBUF_LOOKAHEAD_DEN   7
-
-/* 7, not 4 (yp3-1bw, 2026-11-16): 25,200 bytes of lookahead rounds to THREE
- * 8 KB chunks where a quarter second was five, and gives 16,384 bytes to the
- * compressed ring. Two chunks deadlock (a write needs free >= request + one
- * chunk, pcmbuf.c); three hold two committed chunks, and playback starts at
- * a 6,300-byte watermark that one chunk passes. The price is slack: about
- * 90 ms of decoded audio in hand instead of about 230 ms, so anything that
- * holds the CPU longer than that is heard. Back to 4 if menus stutter. */
+#define PCMBUF_LOOKAHEAD_DEN   4
 
 /* The software-volume double buffer (pcm_sw_volume.c) at the size the mixer
  * actually fills. It defaults to 1024 samples a half, 8 KB in all, but it only
