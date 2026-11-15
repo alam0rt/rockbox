@@ -591,6 +591,11 @@ int bt_v_queue_create(void **h, const char *name, int item, int *total)
     return 0;
 }
 
+/* The vendor's handle word for the bottom-half queue (literal at SRAM
+ * 0x8193ac and 0x819310). */
+#define BT_BH_QUEUE ((void **)0x0081ec8cu)
+static volatile uint32_t bh_stat, bh_have, bh_runs, bh_max_us;
+
 /* SRAM 0x81727a: send(handle*, item, timeout). Called from the BT interrupt
  * for the bottom-half queue, so it is in .icode and calls nothing in flash. */
 int ICODE_ATTR bt_v_queue_send(void **h, const void *item, int timeout)
@@ -598,6 +603,14 @@ int ICODE_ATTR bt_v_queue_send(void **h, const void *item, int timeout)
     if (!h || !*h)
         return -3;
     struct bt_queue *q = *h;
+    if (h == BT_BH_QUEUE && !is_thread_context()) {
+        /* Not queued: bt_irq() runs the bottom half as soon as the vendor
+         * ISR returns. See bt_bh_run(). */
+        bh_stat = *(const uint32_t *)item;
+        bh_have = 1;
+        q->sent++;
+        return 0;
+    }
     int tries = is_thread_context() ? ms_to_ticks(timeout) : 0;
     for (;;) {
         int old = disable_irq_save();
@@ -793,7 +806,98 @@ uint32_t bt_v_efuse_rf_trim(void)
 static void (*vendor_isr)(void);
 #define BT_IRQ_STORM 600                /* per 10 ms tick; a slot is 625 us */
 
-static void ICODE_ATTR bt_irq(void)
+/* d0-d7 and FPSCR, for code that runs in the interrupt and may use the FPU:
+ * ASPEN is off, so nothing stacks them. Hand-encoded like bt_fp_save. */
+static void __attribute__((naked, noinline)) ICODE_ATTR bt_fp_isr_save(uint32_t *buf)
+{
+    (void)buf;
+    __asm__ volatile (".short 0xec80, 0x0b10\n"     /* vstmia r0, {d0-d7} */
+                      ".short 0xeef1, 0x1a10\n"     /* vmrs r1, fpscr */
+                      "str r1, [r0, #64]\n"
+                      "bx lr\n");
+}
+static void __attribute__((naked, noinline)) ICODE_ATTR bt_fp_isr_restore(const uint32_t *buf)
+{
+    (void)buf;
+    __asm__ volatile ("ldr r1, [r0, #64]\n"
+                      ".short 0xeee1, 0x1a10\n"     /* vmsr fpscr, r1 */
+                      ".short 0xec90, 0x0b10\n"     /* vldmia r0, {d0-d7} */
+                      "bx lr\n");
+}
+
+/* The vendor's bottom half, the body of the loop at SRAM 0x819320,
+ * transcribed. The vendor runs it as a FreeRTOS task of priority 19 that
+ * preempts everything the moment the ISR posts to its 3-deep queue. A
+ * Rockbox thread cannot preempt, and the first hardware run (2026-11-16 [L])
+ * showed what that costs: the baseband interrupts every slot, the queue
+ * filled before the thread ran once, and the ISR's "Err isr" printf on every
+ * full queue then took longer than a slot, so the interrupt never let go
+ * (625 interrupts inside one tick, 593 dropped).
+ *
+ * So it runs here, in the interrupt, straight after the vendor ISR. That
+ * keeps the vendor's ordering (the bottom half preempts btc and the host and
+ * is held off by their critical sections, BASEPRI 0x50 against priority
+ * 0x70). What it calls is mask ROM and SRAM glue, never flash. NOT YET RUN.
+ * Risk [U]: ROM 0x2f3a4 opens with an unbounded wait on 0x4002001c, and a
+ * hang in here also stops the tick, so the dead-man cannot see it. */
+#define VCALL0(a)    (((void (*)(void))((a) | 1u))())
+#define VCALL1(a, x) (((void (*)(int))((a) | 1u))(x))
+static void ICODE_ATTR bt_bh_run(uint32_t st)
+{
+    uint32_t fp[17];
+    uint32_t t0 = bt_now_us();
+    bt_fp_isr_save(fp);
+    (*(volatile uint32_t *)0x0081ec88u)++;
+    if (st & 0x0001) { VCALL0(0x00817514u); VCALL0(0x0002f3a4u); }
+    if (st & 0x0002) VCALL0(0x0002f388u);
+    if (st & 0x1000) {
+        REG32(0x40020030u) |= 0x10;
+        *(volatile uint32_t *)0x0081a550u = 0xefef0003u;
+    }
+    if (st & 0x0004) {
+        VCALL0(0x00817504u);
+        *(volatile uint32_t *)0x0081a550u = 0xefef0005u;
+        VCALL1(0x00817328u, 0x40);
+    }
+    if (st & 0x0400) VCALL1(0x00030dc0u, 1);
+    bt_fp_isr_restore(fp);
+    uint32_t dt = bt_now_us() - t0;
+    if (dt < 0x40000000u && dt > bh_max_us) bh_max_us = dt;
+    bh_runs++;
+}
+
+/* Threads in this port run on MSP, so a handler runs on whatever thread it
+ * interrupted. With the bottom half in the interrupt that is the ROM's
+ * controller code on a 512-byte stack: the second hardware run panicked with
+ * "Stkov power" (2026-11-16 [L]). The interrupt therefore moves to a stack
+ * of its own. Higher-priority handlers that nest land on it too. */
+#define BT_IRQ_STACK 2048
+static uint32_t bt_irq_stack[BT_IRQ_STACK / 4] __attribute__((aligned(8)));
+static void bt_irq_body(void);
+
+static unsigned bt_irq_stack_used(void)
+{
+    unsigned i = 0;
+    while (i < BT_IRQ_STACK / 4 && bt_irq_stack[i] == 0xdeadbeefu)
+        i++;
+    return BT_IRQ_STACK - i * 4;
+}
+
+static void __attribute__((naked)) ICODE_ATTR bt_irq(void)
+{
+    __asm__ volatile (
+        "push   {r4, lr}            \n"
+        "mov    r4, sp              \n"
+        "ldr    r0, =bt_irq_stack   \n"
+        "add    r0, r0, #2048       \n"
+        "mov    sp, r0              \n"
+        "bl     bt_irq_body         \n"
+        "mov    sp, r4              \n"
+        "pop    {r4, pc}            \n"
+        ".ltorg                     \n");
+}
+
+static void __attribute__((used)) ICODE_ATTR bt_irq_body(void)
 {
     irq_count++;
     if (++irq_burst > BT_IRQ_STORM) {
@@ -803,6 +907,10 @@ static void ICODE_ATTR bt_irq(void)
     }
     if (vendor_isr)
         vendor_isr();
+    if (bh_have) {
+        bh_have = 0;
+        bt_bh_run(bh_stat);
+    }
 }
 
 /* ROM 0x2348 writes the RAM vector table at 0x800000. Do the same, with a
@@ -813,6 +921,8 @@ void bt_v_irq_register(unsigned irq, void (*handler)(void))
     if (irq != BT_IRQ)
         return;
     vendor_isr = handler;
+    for (unsigned i = 0; i < BT_IRQ_STACK / 4; i++)
+        bt_irq_stack[i] = 0xdeadbeefu;
     ((uint32_t *)0x00800000u)[16 + irq] = (uint32_t)bt_irq;
 }
 
@@ -1273,6 +1383,10 @@ static void bt_app_event(uint32_t ev, const uint8_t *d)
 {
     ev_count++;
     btlogf("event %lu data %08lx", (unsigned long)ev, (unsigned long)(uintptr_t)d);
+    if (ev >= 5 && d)                   /* 7 and up are not decoded yet */
+        btlogf("event %lu: %02x %02x %02x %02x %02x %02x %02x %02x "
+               "%02x %02x %02x %02x", (unsigned long)ev, d[0], d[1], d[2],
+               d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11]);
     switch (ev) {
     case 1: ev_open = d ? (int8_t)d[0] : 0; break;
     case 3: ev_inq_done = 1; break;
@@ -1350,6 +1464,12 @@ static void bt_service(void)
                (unsigned long)irq_count, (unsigned long)heap_used,
                (unsigned long)heap_high, (unsigned long)heap_fail,
                (unsigned long)heap_bigfail, btlog_lost);
+        btlogf("bh in irq: runs=%lu max=%lu us stack %u/%u",
+               (unsigned long)bh_runs, (unsigned long)bh_max_us,
+               bt_irq_stack_used(), BT_IRQ_STACK);
+        logf("bt: bh irq runs=%lu max=%luus stk=%u", (unsigned long)bh_runs,
+             (unsigned long)bh_max_us, bt_irq_stack_used());
+        bh_max_us = 0;
         for (int i = 0; i < BT_QUEUES; i++)
             if (queues[i].used)
                 btlogf("q%d %s sent=%lu drop=%lu lat max=%lu avg=%lu us", i,
@@ -1567,6 +1687,15 @@ static void bt_main(void)
     MILESTONE("bt: connection result %d (0 = connected)", ev_conn);
     V_DISP_A2DP();
     V_DISP_KEY();
+    /* Watch the link settle: the first S5 run (2026-11-16 [L]) reported
+     * "connected", then two event 7s and silence, and the headset never
+     * chimed. Observation only. */
+    for (int i = 0; i < 6 && !ev_disc; i++) {
+        bt_wait_for(&ev_disc, 0, 4);
+        btlogf("bt: watch %d disc=%d events=%d", i, ev_disc, ev_count);
+        V_DISP_HCI();
+        V_DISP_A2DP();
+    }
     STAGE_END(5);
 
 done:

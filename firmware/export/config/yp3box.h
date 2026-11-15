@@ -306,14 +306,11 @@
  * never reach a watermark still sized against the full-rate ring. The fraction
  * below is stated once and pcmbuf.c derives the watermark from it, so the two
  * cannot drift apart again. */
-#ifdef YP3_BT_BLOB
-/* yp3-bt bring-up only, NOT YET RUN: three chunks instead of five. This
- * build cannot play music anyway (docs/BLUETOOTH.md); the 16 KB is margin
- * against audio_reset_buffer's EOM panic, which would cost the whole boot. */
-#define PCMBUF_LOOKAHEAD_DEN   6
-#else
+/* The Bluetooth build keeps the same five chunks. Its first draft cut the
+ * ring to three (DEN 6) for boot margin; a three-chunk ring was one of three
+ * changes in the 2026-11-16 flash that stopped playback [L], cause [U], and
+ * the arena no longer needs the 16 KB. */
 #define PCMBUF_LOOKAHEAD_DEN   4
-#endif
 
 /* The software-volume double buffer (pcm_sw_volume.c) at the size the mixer
  * actually fills. It defaults to 1024 samples a half, 8 KB in all, but it only
