@@ -137,18 +137,6 @@ static void bb_stamp_version(struct yp3_blackbox *bb)
     strlcat(bb->version, YP3_BUILD_STAMP, sizeof(bb->version));
 }
 
-unsigned blackbox_probe_idx(void)
-{
-    return yp3_blackbox.magic == BLACKBOX_MAGIC ? yp3_blackbox.probe_idx : 0;
-}
-
-void blackbox_set_probe_idx(unsigned idx)
-{
-    if (yp3_blackbox.magic == BLACKBOX_MAGIC)
-        yp3_blackbox.probe_idx = idx;
-}
-
-
 /* A clock in the log.
  *
  * The ring records the ORDER of events and nothing about their spacing, so a

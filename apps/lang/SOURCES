@@ -5,11 +5,12 @@
  *
  * yp3box is the only 512 KB target in the tree and needs that memory for the
  * PCM ring, so it builds English only. Every other target is unaffected -
- * this list is preprocessed with the target defines, and only YP3BOX takes
+ * this list is preprocessed with the target defines, and only a target that defines
+ * HAVE_LANG_ENGLISH_ONLY takes
  * the reduced branch. Loading a .lng from the card still works; there just
  * are not any others shipped in the zip. */
 english.lang
-#ifndef YP3BOX
+#ifndef HAVE_LANG_ENGLISH_ONLY
 basque.lang
 bulgarian.lang
 catala.lang

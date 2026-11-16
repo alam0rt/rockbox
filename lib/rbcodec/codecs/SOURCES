@@ -10,7 +10,7 @@
    2456 bytes on ARM. The 0x48000 group is not a per-codec measurement: those
    codecs need between 155 KB and 285 KB and are excluded together. */
 
-#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x21000
+#if !defined(CODEC_SIZE) || CODEC_SIZE == 0 || CODEC_SIZE >= 0x21000
 opus.c
 #endif
 vorbis.c
@@ -23,12 +23,12 @@ alac.c
 #endif
 /* cook, ay and gbs need 110-128 KB and do not fit a 108 KB codec buffer;
    measured from their .elf bss ends. See firmware/export/config/yp3box.h. */
-#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x20000
+#if !defined(CODEC_SIZE) || CODEC_SIZE == 0 || CODEC_SIZE >= 0x20000
 cook.c
 #endif
 a52_rm.c
 /* atrac3 is 98-100 KB, 68 KB of it .bss. */
-#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x19000
+#if !defined(CODEC_SIZE) || CODEC_SIZE == 0 || CODEC_SIZE >= 0x19000
 atrac3_rm.c
 atrac3_oma.c
 #endif
@@ -43,13 +43,13 @@ au.c
 vox.c
 wav64.c
 tta.c
-#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x20000
+#if !defined(CODEC_SIZE) || CODEC_SIZE == 0 || CODEC_SIZE >= 0x20000
 ay.c
 #endif
 #ifdef HAVE_FPU
 vtx.c
 #endif
-#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x20000
+#if !defined(CODEC_SIZE) || CODEC_SIZE == 0 || CODEC_SIZE >= 0x20000
 gbs.c
 #endif
 #if MEMORYSIZE > 2
@@ -58,7 +58,7 @@ kss.c
 #endif
 
 /* need a full-size codec buffer, see above */
-#if !defined(CODEC_SIZE) || CODEC_SIZE >= 0x48000
+#if !defined(CODEC_SIZE) || CODEC_SIZE == 0 || CODEC_SIZE >= 0x48000
 flac.c
 aac.c
 aac_bsf.c

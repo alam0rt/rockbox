@@ -62,7 +62,7 @@
 #endif
 #include "logf.h"
 
-#ifdef HAVE_CODEC_XIP
+#ifdef HAVE_CODEC_FLASH_SLOTS
 #include "codec-slots.h"   /* generated; see tools/gen_codec_slots.py */
 
 /* Written into the slot base by plugin.lds, so the firmware needs to know
@@ -182,11 +182,11 @@ static void * lc_open_resident(const char *name, unsigned char *buf,
 
     return NULL;
 }
-#endif /* HAVE_CODEC_XIP */
+#endif /* HAVE_CODEC_FLASH_SLOTS */
 
 void * lc_open(const char *filename, unsigned char *buf, size_t buf_size)
 {
-#ifdef HAVE_CODEC_XIP
+#ifdef HAVE_CODEC_FLASH_SLOTS
     char name[16];
     const char *codec = slot_name_of(filename, name, sizeof(name));
 
