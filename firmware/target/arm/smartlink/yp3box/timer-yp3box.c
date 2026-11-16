@@ -273,6 +273,8 @@ yp3_stall_sample(const uint32_t *frame)
     stall_lines++;
     yp3_stall_report(frame, s);
 }
+/* The stall watch's private stack; see systick_handler. */
+uint32_t yp3_stall_stack[1024 / 4] __attribute__((aligned(8), used));
 #endif /* YP3_STALLWATCH */
 
 /* The vector table (vectors-arm-micro.S, shared) names this. Naked so the
@@ -286,18 +288,27 @@ void __attribute__((naked)) systick_handler(void)
         "ite    eq                  \n"
         "mrseq  r0, msp             \n"
         "mrsne  r0, psp             \n"
-        "push   {r4, lr}            \n"
+        "push   {r4, r5, r6, lr}    \n"
 #if YP3_STALLWATCH
+        /* On its own stack: yp3_stall_sample logs, logf is vsnprintf, and a
+         * handler here runs on whichever THREAD stack it interrupted. The
+         * `hog:` line landed on the power thread's 512 bytes on 2026-11-17
+         * and the device panicked "Stkov power" as playback started [L]. */
         "mov    r4, r0              \n"
+        "mov    r5, sp              \n"
+        "ldr    r1, =yp3_stall_stack + 1024 \n"
+        "mov    sp, r1              \n"
         "bl     yp3_stall_sample    \n"
+        "mov    sp, r5              \n"
         "mov    r0, r4              \n"
 #endif
 #if YP3_PROFILE
         "ldr    r0, [r0, #24]       \n"    /* stacked PC */
         "bl     yp3_prof_sample     \n"
 #endif
-        "pop    {r4, lr}            \n"
-        "b      yp3_systick_body    \n");
+        "pop    {r4, r5, r6, lr}    \n"
+        "b      yp3_systick_body    \n"
+        ".ltorg                     \n");
 #else
     __asm__ volatile ("b yp3_systick_body\n");
 #endif
