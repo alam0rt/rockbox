@@ -87,7 +87,6 @@ static const char bt_stage_tag[] __attribute__((used)) =
     "yp3-bt-stage=" BT_STR(YP3_BT_STAGE) " verbose=" BT_STR(YP3_BT_VERBOSE);
 #define BT_START_DELAY  (12 * HZ)   /* after boot: card mounted, UI drawn */
 #define BT_HANG_TICKS   (20 * HZ)   /* no BT progress for this long: reboot */
-#define BT_HEAP_EXTRA   (24 * 1024) /* from the core arena, on top of the gaps */
 #define BT_DIR          "/.rockbox/bt"
 #define LATCH_RUN       BT_DIR "/attempt"
 #define LATCH_CENSUS    BT_DIR "/census"
@@ -1311,13 +1310,12 @@ static bool bt_install(void)
     /* The unused tail of the low region, below the hole (app.lds). */
     extern char _bssloend[];
     heap_add((uintptr_t)_bssloend, BT_HOLE_LO);
-    /* Best effort: audio took the arena at boot and its shrink callback
-     * refuses below AUDIO_BUFFER_RESERVE, so expect "extra NO" [I]. */
-    int extra = core_alloc_ex(BT_HEAP_EXTRA, &buflib_ops_locked);
-    if (extra > 0) {
-        uintptr_t p = (uintptr_t)core_get_data(extra);
-        heap_add(p, p + BT_HEAP_EXTRA);
-    }
+    /* No block from the core arena. The first draft asked for 24 KB on top
+     * of the gaps; once the arena grew it was granted, and four hardware runs
+     * (2026-11-16 [L], open, inquiry, A2DP connect) peaked at 8,224 bytes of
+     * the 31 KB the gaps give. Streaming is unmeasured: the log's "fail=" and
+     * "big=" counters say so if this is ever too little. */
+    int extra = 0;
     bt_fpu_on();
     /* ROM printf context at 0x80082c: device, lock fn, unlock fn. The ROM
      * skips the two functions when they are NULL (0x2be, 0x2ce). */
