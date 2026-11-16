@@ -390,7 +390,6 @@
 #define ROM_SD_RESET    ((void     (*)(void *))0x3d59u)
 #define ROM_SD_CFG      ((void (*)(void *, uint32_t, uint32_t, uint32_t, \
                                    uint32_t, uint32_t, uint32_t))0x3d6bu)
-#define ROM_SD_RD512    ((uint32_t (*)(void *, void *))0x4795u)
 /* Raw send: takes the BASE, not the handle, and a {arg, cmdword} pair. It is
  * what the vendor's own send wrapper at SRAM 0x823092 tail-calls once it has
  * picked a command word, and it is the way in for the two auto-stop words the
@@ -455,24 +454,10 @@ static uint32_t sd_fifoth_id;        /* FIFOTH as identification left it */
 static bool     sd_ok;
 static bool     sd_wide;             /* CTYPE bit 0: the bus is 4 data lines */
 static bool     sd_multi;            /* CMD18/CMD25 with hardware auto-stop */
-/* Which FIFO drain a single aligned block uses. FALSE, always, and this is the
- * default rather than an accident.
- *
- * ROM 0x4794's waits have no bound. It spins on the FIFO with no escape, so a
- * transfer that never delivers hangs the boot with nothing in the log and no
- * timeout to report - and that is exactly what happened the one time the ROM
- * drain became reachable. It became reachable by ACCIDENT: sd_probe_buf was
- * unaligned, so `aligned` was false and every rung labelled "rom" had quietly
- * been running the open-coded loop. Aligning the buffer - correct in itself,
- * because real filesystem buffers ARE aligned - flipped the whole driver onto
- * an unbounded ROM routine that had never actually executed here, and the
- * device hung on the Rockbox logo.
- *
- * The open-coded loop is what has genuinely been reading this card, at 24 MHz
- * with multi-block, for every successful boot. It is bounded everywhere. Use
- * it. The ROM path stays behind this flag because it is a faithful transcript
- * of the vendor's own drain and may matter later, but nothing sets the flag. */
-static bool     sd_rom_drain;
+/* The ROM's own single-block drain (ROM 0x4794) is not used and its hook is
+ * gone: its waits have no bound, and the one time it ran - when sd_probe_buf
+ * was first aligned - it hung the boot on the Rockbox logo with nothing in
+ * the log. The open-coded loop in sd_read_fifo is the only PIO drain. */
 /* True once the ladder has proved the controller's own DMA on this card. */
 static bool     sd_dma_on;
 /* Has an ACMD6 ever gone out this boot? Until one has, the card is on one data
@@ -836,7 +821,6 @@ static void SDICODE sd_cfg_transfer(bool wide)
  * floor reads. */
 static bool SDICODE sd_floor(void)
 {
-    sd_rom_drain = false;
     sd_multi     = false;
     sd_wide      = false;
     R(SD_FIFOTH) = sd_fifoth_id;
@@ -897,7 +881,6 @@ static uint32_t sd_reidentify(void)
     sd_wide         = false;
     sd_multi        = false;
     sd_width_touched = false;
-    sd_rom_drain    = false;
     sd_controller_reset();
 
     if ((err = sd_power_on()) != 0) { logf("sd: reinit power_on=%lu",
@@ -1098,7 +1081,6 @@ int sd_init(void)
     sd_width_touched = false;
     /* The drain with hardware evidence behind it, until a rung proves the
      * open-coded one on this card. */
-    sd_rom_drain = false;
     sd_controller_reset();
 
     err = sd_power_on();
@@ -1248,7 +1230,6 @@ int sd_init(void)
             static const unsigned divs4[] = { 1u, 2u, 8u, SD_DIV_ID };
 
             for (i = 0; i < sizeof(divs4) / sizeof(divs4[0]); i++) {
-                sd_rom_drain = false;
                 sd_set_clock(divs4[i]);
                 sd_cfg_transfer(true);
 
@@ -1288,7 +1269,6 @@ int sd_init(void)
 
         /* Phase 3: the rate, on one data line. */
         for (i = 0; i < sizeof(divs) / sizeof(divs[0]); i++) {
-            sd_rom_drain = false;
             sd_set_clock(divs[i]);
             sd_cfg_transfer(false);
 
@@ -1402,15 +1382,6 @@ static uint32_t SDICODE sd_read_fifo(void *buf, uint32_t len)
     uint8_t *p = buf;
     uint32_t left = len;
     bool aligned = (((uintptr_t)buf & 3u) == 0);
-
-    /* The ROM's drain, when the ladder picks it - which by default it never
-     * does. See sd_rom_drain.
-     *
-     * It handles exactly one aligned 512-byte block: it computes its end as
-     * buf + 512 and cannot be told a different length, so a multi-block
-     * transfer goes through the loop below whatever this flag says. */
-    if (sd_rom_drain && aligned && len == 512)
-        return ROM_SD_RD512(&sdh, buf);
 
     while (left) {
         uint32_t sta, t = 0, n;
