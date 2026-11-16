@@ -1640,6 +1640,37 @@ static void SDICODE sd_recover(void)
     (void)sd_wait_data(12);
     R(SD_STA) = STA_ALLFLAGS;
     (void)sd_wait_ready();
+
+    /* A transfer that failed part-way leaves its unsent words in the FIFO,
+     * and nothing above empties it: the next transfer then starts with them,
+     * so every later sector is shifted. 2026-11-17 [L]: a CMD25 failed with
+     * rc=0x79 during a USB copy, STATUS read 001e8d01 (fifo_count, bits
+     * 29:17, = 15 words), and every sector written afterwards landed 60
+     * bytes late - FSINFO's "RRaA" at offset 60 of its own sector. The card's
+     * filesystem did not survive. The only FIFO reset this driver has seen
+     * work is the module reset inside sd_init (CTRL bit 2, which the ROM
+     * sets at 0x46f4, is dw_mmc's DMA reset, not the FIFO one [I]), so use
+     * that. Bounded, because each rebuild costs about two seconds. */
+    {
+        static uint8_t rebuilds;
+        uint32_t left = (R(SD_FIFOSTA) >> 17) & 0x1fffu;
+
+        if (left != 0 && sd_ok && !sd_unsticking) {
+            logf("sd: %lu words left in the FIFO after a failed transfer",
+                 (unsigned long)left);
+            if (++rebuilds > 8) {
+                logf("sd: FIFO residue %u times - reporting the card gone",
+                     (unsigned)rebuilds);
+                sd_ok = false;
+                return;
+            }
+            sd_unsticking = true;
+            sd_init();
+            sd_unsticking = false;
+            logf("sd: re-init after FIFO residue: ok=%d left=%lu", (int)sd_ok,
+                 (unsigned long)((R(SD_FIFOSTA) >> 17) & 0x1fffu));
+        }
+    }
 }
 
 static uint32_t SDICODE sd_read_one(sector_t start, void *buf)
@@ -1759,8 +1790,8 @@ int SDICODE sd_read_sectors(IF_MD(int drive,)
                  * from a card going away. */
                 SD_LOG_FAIL("read multi", start, n, (int)err);
                 logf("sd: multi-block off, one CMD17 per sector from here");
+                sd_recover();           /* may re-run sd_init, which sets it */
                 sd_multi = false;
-                sd_recover();
                 continue;
             }
         } else {
@@ -2012,8 +2043,8 @@ int SDICODE sd_write_sectors(IF_MD(int drive,)
             if (err) {
                 SD_LOG_FAIL("write multi", start, n, (int)err);
                 logf("sd: multi-block off, one CMD24 per sector from here");
+                sd_recover();           /* may re-run sd_init, which sets it */
                 sd_multi = false;
-                sd_recover();
                 continue;
             }
         } else {
