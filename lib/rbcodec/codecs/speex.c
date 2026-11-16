@@ -497,13 +497,17 @@ next_page:
                                          &samplerate, &nframes, &channels,
                                          stereo, &extra_headers);
 
-                    speex_decoder_ctl(st, SPEEX_GET_LOOKAHEAD, &lookahead);
                     if (!nframes)
                         nframes=1;
 
+                    /* Before the first use of st: speex_decoder_ctl() calls
+                       through (*st)->mode, so a failed header jumped to
+                       whatever address 0 holds. */
                     if (!st){
                         goto done;
                     }
+
+                    speex_decoder_ctl(st, SPEEX_GET_LOOKAHEAD, &lookahead);
 
                     ci->configure(DSP_SET_FREQUENCY, ci->id3->frequency);
                     ci->configure(DSP_SET_SAMPLE_DEPTH, 16);
