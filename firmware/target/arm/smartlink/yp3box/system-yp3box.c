@@ -1,5 +1,7 @@
 #include "system.h"
 #include "blackbox.h"
+#include "lcd.h"
+#include "backlight-target.h"
 #include "system-target.h"
 #include "sl6801-regs.h"
 /* YP3_FLASH_QUAD comes from here; without it the #ifndef default wins and
@@ -627,6 +629,13 @@ void system_reboot(void)
  * held would do it - the record is still in SRAM, and a reset recovers it. */
 void system_exception_wait(void)
 {
+    /* The panic or fault text is already in the framebuffer, but with the
+     * panel asleep nobody sees it: on 2026-11-17 a hard fault left a dark,
+     * dead device [L]. Interrupts off first so the wake cannot yield. Built,
+     * not yet seen on hardware [C]. */
+    __asm__ volatile ("cpsid i");
+    lcd_enable(true);
+    backlight_hw_on();
     blackbox_dump();
     while (1) ;
 }
