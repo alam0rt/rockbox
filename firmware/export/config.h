@@ -658,7 +658,7 @@ Lyre prototype 1 */
  * when the codecs are already resident and execute in place: there is nothing
  * to load, so buffering the file only spends audio buffer on a copy that the
  * loader will reject and then ignore. */
-#if defined(HAVE_LC_OPEN_FROM_MEM) && !defined(HAVE_CODEC_XIP)
+#if defined(HAVE_LC_OPEN_FROM_MEM) && !defined(HAVE_CODEC_FLASH_SLOTS)
 # define HAVE_CODEC_BUFFERING
 #endif
 

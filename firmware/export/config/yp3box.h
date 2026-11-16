@@ -173,16 +173,15 @@
  * lc-yp3box.c: it owns lc_open(), so nothing in apps/ or lib/rbcodec knows
  * this target keeps codecs in flash.
  *
- * This is the default for this target. Known open issue: codecs linked into
- * flash slots load and enter, and the device has been seen to hard-hang inside
- * the codec entry point. The black box is the instrument for that; see
- * docs/ROADMAP.md. The two defines below turn on together. */
-#define HAVE_CODEC_XIP
+ * The guard used to be called HAVE_CODEC_XIP, from the abandoned layout that
+ * executed codecs in place. MP3 has played through the copied path since
+ * 2026-09-29 [L]. The two defines below turn on together. */
+#define HAVE_CODEC_FLASH_SLOTS
 
 /* lc-yp3box.c provides lc_open(); the stock card loader in lc-rock.c is still
  * built, as lc_open_from_file(), and every PLUGIN falls through to it. Codecs
  * do not: see the note on the fallback in lc-yp3box.c. Only meaningful
- * together with HAVE_CODEC_XIP. */
+ * together with HAVE_CODEC_FLASH_SLOTS. */
 #define HAVE_LC_OPEN_TARGET
 
 /* 0x1b000 is 110,592, sized by mpa's 105,840-byte total (text 67,552, data 4,
@@ -218,6 +217,8 @@
 /* English is built in and is the only language this target ships, so the
  * buffer a loaded .lng would go into (12,393 bytes of .bss) is not kept. */
 #define MAX_LANGUAGE_SIZE_OVERRIDE 16
+/* apps/lang/SOURCES: build english.lang only. */
+#define HAVE_LANG_ENGLISH_ONLY
 
 /* FLAC, in the same 0x1b000 (yp3-1so.13, yp3-7fx). Unmodified it needs
  * 196,352 bytes of codec buffer - 189 KB of that is .bss: seven 18,432-byte
