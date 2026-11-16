@@ -842,9 +842,16 @@ void yp3_dma2_irq(void)
      * pre-walk GPIO dump, which was one of the two things that boot existed to
      * capture. The ring has no locking; the fix is not to write from both
      * sides at once. */
+    /* Self-test builds only since 2026-11-17 [L]: an interrupt runs on the
+     * stack of whichever thread it interrupted, logf is vsnprintf, and on the
+     * power thread's 512 bytes this line panicked "Stkov power" twice, both
+     * times within the first eight interrupts of a playback start. The 1 Hz
+     * pcmb beacon reports the count from a thread. */
+#if YP3_AUDIO_SELFTEST
     if (pcm_irqs <= 8 && !st_active)
         logf("dma irq #%lu st=%08lx", (unsigned long)pcm_irqs,
              (unsigned long)status);
+#endif
 
 #if YP3_AUDIO_SELFTEST
     /* The self-test drives the hardware directly and must not reach into the
